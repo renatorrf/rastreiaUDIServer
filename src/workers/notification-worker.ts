@@ -1,0 +1,78 @@
+import { getEnv } from '../config/env.js';
+import { loadLocalEnv } from '../config/load-env.js';
+import { createPool } from '../database/pool.js';
+import { createRedisRuntime } from '../infrastructure/redis/redis-runtime.js';
+import { processNotificationBatch } from './notification-worker.service.js';
+import { releaseMissedCheckins } from '../modules/shifts/shift.service.js';
+import { materializeActiveShiftTemplates } from '../modules/shifts/shift-template.service.js';
+import { advanceEmergencySearches } from '../modules/shifts/shift-search.service.js';
+import { createDueShiftConfirmations, sendDueShiftReminders } from '../modules/shifts/shift-change.service.js';
+import { expireDeliveryOffers } from '../modules/offers/offer.service.js';
+import { enforceRetentionPolicies } from './retention.service.js';
+
+loadLocalEnv();
+const env = getEnv();
+const database = createPool(env);
+const redis = await createRedisRuntime(env, (level, message, details) => {
+  const line = JSON.stringify({ level, message, ...details });
+  if (level === 'warn') process.stderr.write(`${line}\n`);
+  else process.stdout.write(`${line}\n`);
+});
+const workerId = `${process.pid}:${crypto.randomUUID()}`;
+let running = false;
+
+async function tick(): Promise<void> {
+  if (running) return;
+  running = true;
+  try {
+    const releaseLease = await redis.acquireLease(
+      'notification-worker:maintenance', Math.max(30_000, env.NOTIFICATION_WORKER_INTERVAL_MS * 3),
+    );
+    const runMaintenance = redis.status !== 'ready' || releaseLease !== null;
+    let recurring = { generatedSlots: 0 };
+    let confirmations = { created: 0 };
+    let reminders = { reminded: 0 };
+    let offers = { expired: 0 };
+    let maintenance = { released: 0 };
+    let searches = { advanced: 0 };
+    let retention = { ran: false };
+    try {
+      if (runMaintenance) {
+        recurring = await materializeActiveShiftTemplates(database);
+        confirmations = await createDueShiftConfirmations(database);
+        reminders = await sendDueShiftReminders(database);
+        offers = await expireDeliveryOffers(database);
+        maintenance = await releaseMissedCheckins(database);
+        searches = await advanceEmergencySearches(database);
+        retention = await enforceRetentionPolicies(database, env);
+      }
+    } finally {
+      await releaseLease?.();
+    }
+    const result = await processNotificationBatch(database, env, 25, workerId);
+    if (recurring.generatedSlots || confirmations.created || reminders.reminded || offers.expired
+        || maintenance.released || searches.advanced || retention.ran
+        || result.processed || result.retried || result.deadLettered) {
+      process.stdout.write(`${JSON.stringify({ ...recurring, confirmations: confirmations.created,
+        reminders: reminders.reminded, offersExpired: offers.expired, ...maintenance, ...searches,
+        retention, ...result })}\n`);
+    }
+  } catch (error) {
+    process.stderr.write(`notification worker: ${(error as Error).message}\n`);
+  } finally {
+    running = false;
+  }
+}
+
+const interval = setInterval(() => void tick(), env.NOTIFICATION_WORKER_INTERVAL_MS);
+void tick();
+
+async function close(): Promise<void> {
+  clearInterval(interval);
+  await redis.close();
+  await database.end();
+  process.exit(0);
+}
+
+process.once('SIGINT', () => void close());
+process.once('SIGTERM', () => void close());
