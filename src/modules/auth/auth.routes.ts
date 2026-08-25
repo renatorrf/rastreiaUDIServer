@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { setTenantContext, withRuntimeTransaction, type Database } from '../../database/pool.js';
 import { unauthorized } from '../../shared/errors.js';
+import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { login, logout, refresh } from './auth.service.js';
 
 const loginSchema = z.object({
@@ -17,16 +18,6 @@ const passwordResetRequestSchema = z.object({
 });
 
 const anonymousUserId = '00000000-0000-0000-0000-000000000000';
-
-function cookieOptions(env: AppEnv) {
-  return {
-    path: '/auth',
-    httpOnly: true,
-    secure: env.COOKIE_SECURE,
-    sameSite: 'lax' as const,
-    maxAge: env.REFRESH_TOKEN_TTL_SECONDS,
-  };
-}
 
 export async function authRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {
   app.post('/auth/password-reset-requests', {
@@ -76,7 +67,7 @@ export async function authRoutes(app: FastifyInstance, database: Database, env: 
       ip: request.ip,
       ...(userAgent === undefined ? {} : { userAgent }),
     });
-    reply.setCookie('rastreia_refresh', result.refreshToken, cookieOptions(env));
+    reply.setCookie('rastreia_refresh', result.refreshToken, sessionCookieOptions(env, '/auth'));
     return reply.send({
       accessToken: result.accessToken,
       expiresIn: result.expiresIn,
@@ -89,7 +80,7 @@ export async function authRoutes(app: FastifyInstance, database: Database, env: 
     const token = request.cookies['rastreia_refresh'];
     if (!token) throw unauthorized('Sessão ausente.');
     const result = await refresh(database, env, token, request.ip, request.headers['user-agent']);
-    reply.setCookie('rastreia_refresh', result.refreshToken, cookieOptions(env));
+    reply.setCookie('rastreia_refresh', result.refreshToken, sessionCookieOptions(env, '/auth'));
     return reply.send({
       accessToken: result.accessToken,
       expiresIn: result.expiresIn,
@@ -101,7 +92,7 @@ export async function authRoutes(app: FastifyInstance, database: Database, env: 
   app.post('/auth/logout', async (request, reply) => {
     const token = request.cookies['rastreia_refresh'];
     if (token) await logout(database, env, token);
-    reply.clearCookie('rastreia_refresh', cookieOptions(env));
+    reply.clearCookie('rastreia_refresh', sessionCookieOptions(env, '/auth'));
     return reply.status(204).send();
   });
 }

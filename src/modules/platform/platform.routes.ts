@@ -4,6 +4,7 @@ import type { AppEnv } from '../../config/env.js';
 import type { Database } from '../../database/pool.js';
 import { unauthorized } from '../../shared/errors.js';
 import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempotency.js';
+import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { authenticatePlatform } from '../auth/auth.guard.js';
 import { platformLogin, platformLogout, platformRefresh } from './platform-auth.service.js';
 import {
@@ -33,11 +34,6 @@ const createSchema = z.object({
 const statusSchema = z.object({ status: tenantStatus, reason: z.string().trim().min(5).max(500) });
 const idSchema = z.object({ id: z.string().uuid() });
 
-function cookieOptions(env: AppEnv) {
-  return { path: '/platform/auth', httpOnly: true, secure: env.COOKIE_SECURE,
-    sameSite: 'strict' as const, maxAge: env.REFRESH_TOKEN_TTL_SECONDS };
-}
-
 function keyFrom(request: FastifyRequest) { return parseIdempotencyKey(request.headers['idempotency-key']); }
 function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
   reply.header('Idempotency-Replayed', result.replayed ? 'true' : 'false');
@@ -51,20 +47,22 @@ export async function platformRoutes(app: FastifyInstance, database: Database, e
     const input = loginSchema.parse(request.body);
     const result = await platformLogin(database, env, { ...input, ip: request.ip,
       ...(request.headers['user-agent'] ? { userAgent: request.headers['user-agent'] } : {}) });
-    reply.setCookie('rastreia_platform_refresh', result.refreshToken, cookieOptions(env));
+    reply.setCookie('rastreia_platform_refresh', result.refreshToken,
+      sessionCookieOptions(env, '/platform/auth', 'strict'));
     return { accessToken: result.accessToken, expiresIn: result.expiresIn, user: result.user };
   });
   app.post('/platform/auth/refresh', async (request, reply) => {
     const token = request.cookies['rastreia_platform_refresh'];
     if (!token) throw unauthorized('Sessão administrativa ausente.');
     const result = await platformRefresh(database, env, token, request.ip, request.headers['user-agent']);
-    reply.setCookie('rastreia_platform_refresh', result.refreshToken, cookieOptions(env));
+    reply.setCookie('rastreia_platform_refresh', result.refreshToken,
+      sessionCookieOptions(env, '/platform/auth', 'strict'));
     return { accessToken: result.accessToken, expiresIn: result.expiresIn, user: result.user };
   });
   app.post('/platform/auth/logout', async (request, reply) => {
     const token = request.cookies['rastreia_platform_refresh'];
     if (token) await platformLogout(database, env, token);
-    reply.clearCookie('rastreia_platform_refresh', cookieOptions(env));
+    reply.clearCookie('rastreia_platform_refresh', sessionCookieOptions(env, '/platform/auth', 'strict'));
     return reply.status(204).send();
   });
   app.get('/platform/tenants', { preHandler: auth }, async (request) =>
