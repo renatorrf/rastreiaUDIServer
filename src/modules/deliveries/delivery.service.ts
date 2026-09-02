@@ -41,7 +41,7 @@ interface ListFilters {
 const deliverySelect = `
   SELECT d.id, d.tenant_id AS "tenantId", d.store_id AS "storeId", store.name AS "storeName",
          d.route_id AS "routeId", d.courier_profile_id AS "courierId", courier_user.name AS "courierName",
-         d.external_reference AS "externalReference", d.recipient_name AS "recipientName",
+         d.external_reference AS "externalReference", d.origin, d.external_order_id AS "externalOrderId", d.recipient_name AS "recipientName",
          d.recipient_phone AS "recipientPhone", d.recipient_whatsapp AS "recipientWhatsapp",
          d.address_line AS "addressLine", d.address_number AS "addressNumber", d.complement,
          d.neighborhood, d.city, d.state, d.postal_code AS "postalCode", d.latitude, d.longitude,
@@ -199,38 +199,8 @@ export async function createDelivery(
 ): Promise<IdempotentResult<DeliveryRecord & { nextActions: string[] }>> {
   return withTenantTransaction(database, auth, async (client) =>
     withIdempotency(client, auth, key, 'delivery.create', input, async () => {
-      if (!canUseStore(auth, input.storeId)) throw forbidden('Você não possui acesso à loja informada.');
-      const store = await client.query('SELECT id FROM stores WHERE id = $1 AND status = \'ACTIVE\'', [input.storeId]);
-      if (!store.rowCount) throw notFound('Loja não encontrada.');
-
-      const deliveryId = randomUUID();
-      await client.query(
-        `INSERT INTO deliveries
-           (id, tenant_id, store_id, external_reference, recipient_name, recipient_phone,
-            recipient_whatsapp, address_line, address_number, complement, neighborhood,
-            city, state, postal_code, latitude, longitude, address_confidence,
-            delivery_instructions, status, promised_window_start, promised_window_end,
-            created_by, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15, $16, $17, $18, 'AWAITING_COURIER', $19, $20, $21, $21)`,
-        [deliveryId, auth.tenantId, input.storeId, input.externalReference ?? null,
-          input.recipientName, input.recipientPhone, input.recipientWhatsapp ?? null,
-          input.addressLine, input.addressNumber ?? null, input.complement ?? null,
-          input.neighborhood ?? null, input.city, input.state, input.postalCode ?? null,
-          input.latitude, input.longitude, input.addressConfidence ?? null,
-          input.deliveryInstructions ?? null, input.promisedWindowStart ?? null,
-          input.promisedWindowEnd ?? null, auth.userId],
-      );
-      const delivery = await loadCurrentRecord(client, auth, deliveryId);
-      await appendHistory(client, auth, delivery, null);
-      await writeAudit(client, {
-        tenantId: auth.tenantId, actorUserId: auth.userId, action: 'delivery.created',
-        entityType: 'delivery', entityId: deliveryId,
-        afterData: { status: delivery.status, storeId: delivery.storeId, externalReference: delivery.externalReference },
-        ...(ip === undefined ? {} : { ip }),
-      });
-      await publishEvent(client, auth, deliveryId, 'delivery.created', { deliveryId, storeId: delivery.storeId, status: delivery.status });
-      return { body: { ...delivery, nextActions: nextOperationalActions(delivery.status) }, statusCode: 201 };
+      const delivery = await createDeliveryInTransaction(client, auth, input, ip);
+      return { body: delivery, statusCode: 201 };
     }),
   );
 }
@@ -301,6 +271,7 @@ export async function transitionDelivery(
         throw conflict('Esta entrega pertence a um lote. Avance pela prancheta de Rotas.');
       }
       if (action === 'cancel') {
+        if (before.origin === 'IFOOD') throw conflict('Solicite o cancelamento na integração iFood e aguarde o evento de confirmação.');
         const marketplace = await client.query(
           `SELECT 1 FROM delivery_offers WHERE delivery_id = $1 AND status IN ('PUBLISHED', 'ACCEPTED')`, [deliveryId],
         );
@@ -323,4 +294,65 @@ export async function transitionDelivery(
       return { body: { ...current, nextActions: nextOperationalActions(current.status) }, statusCode: 200 };
     }),
   );
+}
+
+/** Shared entry point for manual and external orders; caller owns the transaction. */
+export async function createDeliveryInTransaction(client: PoolClient, auth: AuthContext, input: CreateDeliveryInput, ip?: string,
+  initialStatus: 'DRAFT' | 'AWAITING_COURIER' = 'AWAITING_COURIER') {
+      if (!canUseStore(auth, input.storeId)) throw forbidden('Você não possui acesso à loja informada.');
+      const store = await client.query('SELECT id FROM stores WHERE id = $1 AND status = \'ACTIVE\'', [input.storeId]);
+      if (!store.rowCount) throw notFound('Loja não encontrada.');
+
+      const deliveryId = randomUUID();
+      await client.query(
+        `INSERT INTO deliveries
+           (id, tenant_id, store_id, external_reference, recipient_name, recipient_phone,
+            recipient_whatsapp, address_line, address_number, complement, neighborhood,
+            city, state, postal_code, latitude, longitude, address_confidence,
+            delivery_instructions, status, promised_window_start, promised_window_end,
+            created_by, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 $15, $16, $17, $18, $22, $19, $20, $21, $21)`,
+        [deliveryId, auth.tenantId, input.storeId, input.externalReference ?? null,
+          input.recipientName, input.recipientPhone, input.recipientWhatsapp ?? null,
+          input.addressLine, input.addressNumber ?? null, input.complement ?? null,
+          input.neighborhood ?? null, input.city, input.state, input.postalCode ?? null,
+          input.latitude, input.longitude, input.addressConfidence ?? null,
+          input.deliveryInstructions ?? null, input.promisedWindowStart ?? null,
+          input.promisedWindowEnd ?? null, auth.userId, initialStatus],
+      );
+      const delivery = await loadCurrentRecord(client, auth, deliveryId);
+      await appendHistory(client, auth, delivery, null);
+      await writeAudit(client, {
+        tenantId: auth.tenantId, actorUserId: auth.userId, action: 'delivery.created',
+        entityType: 'delivery', entityId: deliveryId,
+        afterData: { status: delivery.status, storeId: delivery.storeId, externalReference: delivery.externalReference },
+        ...(ip === undefined ? {} : { ip }),
+      });
+      if(initialStatus!=='DRAFT')await publishEvent(client, auth, deliveryId, 'delivery.created', { deliveryId, storeId: delivery.storeId, status: delivery.status });
+      return { ...delivery, nextActions: nextOperationalActions(delivery.status) };
+}
+
+/** External cancellation uses the same delivery state/history and existing route/offer records. */
+export async function cancelExternalDelivery(client: PoolClient, auth: AuthContext, id: string, reason: string): Promise<void> {
+  const delivery = await loadDelivery(client, auth, id, true);
+  if (['DELIVERED','CANCELLED','RETURNED','RETURN_STARTED','DELIVERY_FAILED'].includes(delivery.status)) return;
+  await applyTransition(client,auth,delivery,'CANCELLED',reason,{source:'EXTERNAL_PROVIDER',courierId:delivery.courierId});
+  // Keep the historical courier id: terminal status releases availability and notification targeting.
+  await client.query(`UPDATE delivery_offers SET status='CANCELLED',cancelled_at=now(),cancellation_reason=$2,version=version+1 WHERE delivery_id=$1 AND status IN ('PUBLISHED','ACCEPTED')`,[id,reason]);
+  await client.query(`UPDATE offer_candidates SET status='LOST',responded_at=now() WHERE offer_id IN(SELECT id FROM delivery_offers WHERE delivery_id=$1) AND status IN ('NOTIFIED','ACCEPTED')`,[id]);
+  await client.query(`INSERT INTO delivery_offer_events(tenant_id,offer_id,event_type,metadata) SELECT tenant_id,id,'EXTERNAL_ORDER_CANCELLED',$2::jsonb FROM delivery_offers WHERE delivery_id=$1`,[id,JSON.stringify({reason,compensationReviewRequired:Boolean(delivery.courierId)})]);
+  if(delivery.routeId){
+    await client.query(`UPDATE route_stops SET status='SKIPPED',version=version+1 WHERE delivery_id=$1 AND status='PENDING'`,[id]);
+    await client.query(`INSERT INTO route_events(tenant_id,route_id,event_type,metadata) VALUES($1,$2,'EXTERNAL_DELIVERY_CANCELLED',$3::jsonb)`,[auth.tenantId,delivery.routeId,JSON.stringify({deliveryId:id,reason})]);
+    const remaining=(await client.query<{delivery_id:string}>(`SELECT delivery_id FROM route_stops WHERE route_id=$1 AND stop_type='DELIVERY' AND status='PENDING' ORDER BY sequence LIMIT 1`,[delivery.routeId])).rows[0];
+    if(!remaining) await client.query(`UPDATE routes SET status='CANCELLED',version=version+1 WHERE id=$1 AND status IN ('DRAFT','ACTIVE')`,[delivery.routeId]);
+    else if(delivery.status==='NEXT_STOP'){
+      const next=await loadDelivery(client,auth,remaining.delivery_id,true);
+      if(next.status==='IN_ROUTE')await applyTransition(client,auth,next,'NEXT_STOP','Destino anterior cancelado');
+    }
+  }
+  await writeAudit(client,{tenantId:auth.tenantId,actorUserId:null,action:'delivery.external-cancellation',entityType:'delivery',entityId:id,
+    afterData:{reason,courierId:delivery.courierId,compensationReviewRequired:Boolean(delivery.courierId)}});
+  await publishEvent(client,auth,id,'delivery.cancel',{deliveryId:id,storeId:delivery.storeId,courierId:delivery.courierId,source:'EXTERNAL_PROVIDER'});
 }

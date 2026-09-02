@@ -1,0 +1,74 @@
+{
+  "id": "ee44a0a8-8501-469b-83b8-85c84896ed30",
+  "displayId": "4387",
+  "merchant": {
+    "id": "744c8e3f-ef9f-47b7-8c3e-1a8a5bf12ad4",
+    "name": "Unidade de teste"
+  },
+  "orderType": "DELIVERY",
+  "orderTiming": "IMMEDIATE",
+  "customer": {
+    "name": "Cliente de teste iFood",
+    "phone": {
+      "number": "34999990000",
+      "localizer": "12345678"
+    }
+  },
+  "delivery": {
+    "deliveredBy": "MERCHANT",
+    "deliveryDateTime": "2026-09-02T22:00:00.000Z",
+    "deliveryAddress": {
+      "streetName": "Avenida Brasil",
+      "streetNumber": "2662",
+      "complement": "Casa",
+      "reference": "Campainha",
+      "neighborhood": "Brasil",
+      "city": "Uberlandia",
+      "state": "MG",
+      "postalCode": "38400694",
+      "coordinates": {
+        "latitude": -18.9,
+        "longitude": -48.26
+      }
+    }
+  },
+  "items": [
+    {
+      "name": "X-Bacon",
+      "quantity": 2,
+      "unitPrice": 25,
+      "totalPrice": 50,
+      "observations": "Sem cebola",
+      "options": [
+        {
+          "name": "Queijo extra",
+          "quantity": 1,
+          "price": 2
+        }
+      ]
+    },
+    {
+      "name": "Refrigerante",
+      "quantity": 1,
+      "unitPrice": 8,
+      "totalPrice": 8
+    }
+  ],
+  "total": {
+    "orderAmount": 65,
+    "deliveryFee": 7,
+    "benefits": 0
+  },
+  "payments": {
+    "methods": [
+      {
+        "method": "CREDIT",
+        "type": "ONLINE",
+        "prepaid": true,
+        "value": 65
+      }
+    ]
+  },
+  "observations": "Tocar a campainha",
+  "status": "CANCELLED"
+}

@@ -255,11 +255,13 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
 
 function pushCopy(eventType: string): { title: string; body: string } | null {
   const copy: Record<string, { title: string; body: string }> = {
+    'driver-event.created': {title:'Ação necessária na operação',body:'Um entregador informou uma ocorrência crítica. Abra a operação para verificar.'},
     'delivery.assigned': { title: 'Nova entrega atribuída', body: 'Uma entrega está aguardando sua coleta.' },
     'delivery.collect': { title: 'Coleta confirmada', body: 'A entrega coletada está pronta para iniciar o trajeto.' },
     'delivery.start': { title: 'Trajeto iniciado', body: 'O compartilhamento de localização já pode ser ativado.' },
     'delivery.complete': { title: 'Entrega concluída', body: 'A conclusão foi registrada na operação.' },
     'delivery.fail': { title: 'Ocorrência registrada', body: 'A falha da entrega foi registrada.' },
+    'delivery.cancel': { title: 'Entrega cancelada', body: 'A entrega foi cancelada. Confira a operação e, se já coletou, combine a devolução com a loja.' },
     'shift.available': { title: 'Novo turno disponível', body: 'Uma vaga compatível com sua loja foi aberta.' },
     'shift.filled': { title: 'Turno confirmado', body: 'Sua participação no turno foi confirmada.' },
     'shift.checkin': { title: 'Check-in confirmado', body: 'Seu turno está ativo.' },
@@ -279,6 +281,9 @@ function pushCopy(eventType: string): { title: string; body: string } | null {
 }
 
 async function processPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
+  const driverEvent=event.event_type==='driver-event.created';
+  const cancellation=event.event_type==='delivery.cancel';
+  if(driverEvent&&event.payload['severity']!=='CRITICAL')return;
   const copy = pushCopy(event.event_type);
   if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
   const shiftEvent = event.event_type.startsWith('shift.');
@@ -287,7 +292,23 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
   const waveId = typeof event.payload['waveId'] === 'string' ? event.payload['waveId'] : null;
   const result = await database.query<{
     id: string; endpoint: string; p256dh: string; auth_secret: string; user_id: string;
-  }>(offerEvent
+  }>(cancellation
+    ? `SELECT DISTINCT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret,subscription.user_id
+       FROM rastreia.deliveries delivery JOIN rastreia.push_subscriptions subscription ON subscription.tenant_id=delivery.tenant_id AND subscription.active
+       JOIN rastreia.users person ON person.id=subscription.user_id AND person.status='ACTIVE'
+       WHERE delivery.id=$1 AND delivery.tenant_id=$2 AND (
+         EXISTS(SELECT 1 FROM rastreia.courier_profiles p WHERE p.id=delivery.courier_profile_id AND p.user_id=subscription.user_id)
+         OR EXISTS(SELECT 1 FROM rastreia.tenant_users m WHERE m.tenant_id=delivery.tenant_id AND m.user_id=subscription.user_id AND m.status='ACTIVE'
+           AND m.role IN ('TENANT_MANAGER','STORE_OPERATOR') AND rastreia.has_store_access(m.user_id,delivery.store_id)))`
+    : driverEvent
+    ? `SELECT DISTINCT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret,subscription.user_id
+       FROM rastreia.driver_operational_events event
+       JOIN rastreia.tenant_users member ON member.tenant_id=event.tenant_id AND member.status='ACTIVE' AND member.role IN ('TENANT_MANAGER','STORE_OPERATOR')
+       JOIN rastreia.users person ON person.id=member.user_id AND person.status='ACTIVE'
+       JOIN rastreia.push_subscriptions subscription ON subscription.tenant_id=event.tenant_id AND subscription.user_id=member.user_id AND subscription.active
+       WHERE event.id=$1 AND event.tenant_id=$2 AND event.status='OPEN' AND event.severity='CRITICAL'
+        AND rastreia.has_store_access(member.user_id,event.store_id)`
+    : offerEvent
     ? `SELECT DISTINCT subscription.id, subscription.endpoint, subscription.p256dh,
               subscription.auth_secret, subscription.user_id
        FROM rastreia.offer_candidates candidate
@@ -335,7 +356,7 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
       ? [event.aggregate_id, event.tenant_id, event.event_type]
       : [event.aggregate_id, event.tenant_id],
   );
-  const openUrl = offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos' : '/app/entregas';
+  const openUrl = driverEvent ? '/app/operacao' : offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos' : '/app/entregas';
   for (const subscription of result.rows) {
     try {
       const response = await webpush.sendNotification({

@@ -14,6 +14,7 @@ import { createRedisRuntime, type RedisRuntime } from './infrastructure/redis/re
 import { GeoapifyProvider } from './integrations/geo/geoapify.provider.js';
 import type { RouteDirectionsProvider, RouteMatrixProvider } from './integrations/geo/geo-provider.js';
 import { geoRoutes } from './integrations/geo/geo.routes.js';
+import { ifoodRoutes } from './integrations/ifood/ifood.routes.js';
 import { createObjectStorage } from './integrations/objects/object-storage.js';
 import { authRoutes } from './modules/auth/auth.routes.js';
 import { identityRoutes } from './modules/auth/identity.routes.js';
@@ -28,6 +29,7 @@ import { communicationWebhookRoutes } from './modules/communications/webhook.rou
 import { deliveryRoutes } from './modules/deliveries/delivery.routes.js';
 import { locationRoutes } from './modules/locations/location.routes.js';
 import { incidentRoutes } from './modules/incidents/incident.routes.js';
+import { driverEventRoutes } from './modules/driver-events/driver-event.routes.js';
 import { onboardingRoutes } from './modules/onboarding/onboarding.routes.js';
 import { RedisLocationStateStore } from './modules/locations/location-state.store.js';
 import { operationalMetricsRoutes } from './modules/metrics/operational-metrics.routes.js';
@@ -90,6 +92,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await app.register(rawBody, { global: false, encoding: false, runFirst: true });
   await app.register(cors, {
     credentials: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     origin(origin, callback) {
       if (!origin || allowedOrigins.has(origin)) callback(null, true);
       else callback(new Error('Origem não permitida.'), false);
@@ -166,10 +169,12 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await operationalMetricsRoutes(app, database, env);
   await proofRoutes(app, database, objectStorage, env);
   await incidentRoutes(app, database, objectStorage, env);
+  await driverEventRoutes(app, database, env, realtime.publisher);
   await onboardingRoutes(app, database, objectStorage, env);
   await queueOperationsRoutes(app, database, env);
   await shiftRoutes(app, database, env);
   await geoRoutes(app, env, database, geoapify, geoapify);
+  await ifoodRoutes(app, database, env);
 
   app.setNotFoundHandler(async (_request, reply) => reply.status(404).send({
     error: { code: 'NOT_FOUND', message: 'Rota não encontrada.' },

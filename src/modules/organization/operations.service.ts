@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { timezoneSchema } from '../billing/billing.schemas.js';
 import { forbidden } from '../../shared/errors.js';
 import { setTenantContext } from '../../database/pool.js';
+import { listDriverEventsInTransaction } from '../driver-events/driver-event.service.js';
+import type { DriverEvent } from '../driver-events/driver-event.types.js';
 
 export const operationsFilterSchema=z.object({tenantId:z.string().uuid().optional(),companyId:z.string().uuid().optional(),storeId:z.string().uuid().optional(),
   from:z.iso.date().default(()=>new Date(Date.now()-29*86400000).toISOString().slice(0,10)),to:z.iso.date().default(()=>new Date().toISOString().slice(0,10)),
@@ -41,10 +43,11 @@ export async function operationsReport(client:PoolClient,query:unknown,userId?:s
       AND ($2::uuid IS NULL OR company.id=$2) AND ($3::uuid IS NULL OR store.id=$3) LIMIT 1`,[filters.tenantId??null,filters.companyId??null,filters.storeId??null])).rowCount;
     if(!emptyMasterContext)throw forbidden('Os filtros não pertencem à mesma estrutura.');
   }
-  const rows:OperationRow[]=[];const positions:OperationPosition[]=[];
+  const rows:OperationRow[]=[];const positions:OperationPosition[]=[];const operationalEvents:DriverEvent[]=[];
   for(const tenantId of new Set(selected.map(unit=>unit.tenant_id))) {
     const units=selected.filter(unit=>unit.tenant_id===tenantId);
     if(userId)await setTenantContext(client,{tenantId,userId,storeIds:units.map(unit=>unit.id)});
+    for(const unit of units)operationalEvents.push(...await listDriverEventsInTransaction(client,{storeId:unit.id,status:'OPEN',limit:500}));
     const result=await client.query<OperationRow>(`SELECT store.id,store.name,store.tenant_id,tenant.name AS tenant_name,store.company_id,
       company.name AS company_name,store.latitude,store.longitude,
       count(delivery.id)::int AS deliveries,
@@ -72,5 +75,7 @@ export async function operationsReport(client:PoolClient,query:unknown,userId?:s
       [units.map(unit=>unit.id),filters.from,filters.to,filters.timezone,filters.status??null,filters.courierId??null])).rows);
   }
   const companies=Array.from(new Set(rows.map(row=>row.company_id))).map(id=>{const subset=rows.filter(row=>row.company_id===id);return {id,name:subset[0]!.company_name,tenantId:subset[0]!.tenant_id,...summarizeOperations(subset)};});
-  return {filters,generatedAt:new Date().toISOString(),summary:summarizeOperations(rows),companies,stores:rows,positions};
+  const priority={CRITICAL:0,WARNING:1,INFO:2};
+  operationalEvents.sort((a,b)=>priority[a.severity]-priority[b.severity]||new Date(b.occurredAt).getTime()-new Date(a.occurredAt).getTime());
+  return {filters,generatedAt:new Date().toISOString(),summary:summarizeOperations(rows),companies,stores:rows,positions,operationalEvents};
 }

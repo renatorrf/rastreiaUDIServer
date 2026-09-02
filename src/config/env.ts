@@ -42,6 +42,16 @@ const envSchema = z.object({
   REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(2_592_000),
   COOKIE_SECURE: z.string().default('true').transform((value) => value === 'true'),
   GEOAPIFY_API_KEY: optionalSecret,
+  IFOOD_ENABLED: z.string().default('false').transform(value => value === 'true'),
+  IFOOD_MODE: z.enum(['mock', 'sandbox', 'production']).default('mock'),
+  IFOOD_CLIENT_ID: optionalSecret,
+  IFOOD_CLIENT_SECRET: optionalSecret,
+  IFOOD_BASE_URL: z.url().default('https://merchant-api.ifood.com.br'),
+  IFOOD_EVENTS_MODE: z.enum(['polling', 'webhook']).default('polling'),
+  IFOOD_POLLING_INTERVAL_MS: z.coerce.number().int().min(30_000).max(300_000).default(30_000),
+  IFOOD_WEBHOOK_ENABLED: z.string().default('false').transform(value => value === 'true'),
+  IFOOD_WEBHOOK_SECRET: optionalSecret,
+  IFOOD_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30_000).default(15_000),
   PUSH_VAPID_SUBJECT: optionalSecret,
   PUSH_VAPID_PUBLIC_KEY: optionalSecret,
   PUSH_VAPID_PRIVATE_KEY: optionalSecret,
@@ -95,6 +105,15 @@ const envSchema = z.object({
   BOOTSTRAP_PLATFORM_ADMIN_EMAIL: z.string().email().optional(),
   BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: z.string().min(12).optional(),
 }).superRefine((env, context) => {
+  if (env.IFOOD_ENABLED && env.IFOOD_MODE !== 'mock' && (!env.IFOOD_CLIENT_ID || !env.IFOOD_CLIENT_SECRET)) {
+    context.addIssue({ code: 'custom', path: ['IFOOD_CLIENT_ID'], message: 'Configure as credenciais iFood no backend.' });
+  }
+  if (env.IFOOD_MODE !== 'mock' && env.IFOOD_BASE_URL !== 'https://merchant-api.ifood.com.br') {
+    context.addIssue({ code: 'custom', path: ['IFOOD_BASE_URL'], message: 'Use o host oficial da Merchant API.' });
+  }
+  if (env.NODE_ENV === 'production' && env.IFOOD_ENABLED && env.IFOOD_MODE === 'mock') {
+    context.addIssue({ code: 'custom', path: ['IFOOD_MODE'], message: 'Simulação iFood não pode ser ativada em produção.' });
+  }
   if (env.NODE_ENV !== 'production') return;
   const issue = (path: string, message: string) => context.addIssue({
     code: 'custom', path: [path], message,

@@ -11,6 +11,7 @@ import { expireDeliveryOffers } from '../modules/offers/offer.service.js';
 import { enforceRetentionPolicies } from './retention.service.js';
 import { processBillingBatch } from '../modules/billing/billing-worker.service.js';
 import { processEmailBatch } from '../integrations/email/email.service.js';
+import { createIfoodWorker } from '../integrations/ifood/ifood.worker.js';
 
 loadLocalEnv();
 const env = getEnv();
@@ -21,12 +22,15 @@ const redis = await createRedisRuntime(env, (level, message, details) => {
   else process.stdout.write(`${line}\n`);
 });
 const workerId = `${process.pid}:${crypto.randomUUID()}`;
+const processIfood = createIfoodWorker(database,env);
 let running = false;
 
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
   try {
+    // Integration processing must not depend on SMTP or notification maintenance succeeding.
+    try { await processIfood(); } catch { process.stderr.write('ifood worker: batch failed; inspect integration health\n'); }
     const releaseLease = await redis.acquireLease(
       'notification-worker:maintenance', Math.max(30_000, env.NOTIFICATION_WORKER_INTERVAL_MS * 3),
     );

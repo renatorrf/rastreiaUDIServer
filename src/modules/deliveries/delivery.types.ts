@@ -15,6 +15,8 @@ export interface DeliveryRecord {
   courierId: string | null;
   courierName: string | null;
   externalReference: string | null;
+  origin?: string;
+  externalOrderId?: string | null;
   recipientName: string;
   recipientPhone: string;
   recipientWhatsapp: string | null;

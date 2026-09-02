@@ -234,6 +234,8 @@ export async function getPublicTracking(
       [match.delivery_id],
     );
     const revealDestination = canRevealDestination(delivery.status);
+    const operationalNotices=(await client.query(`SELECT status,message,occurred_at AS "occurredAt",resolved_at AS "resolvedAt",affects_eta AS "affectsEta"
+      FROM rastreia.public_driver_event_notices($1)`,[match.delivery_id])).rows;
     const cachedLocation = await state.getDelivery(match.tenant_id, match.delivery_id);
     const databaseLocation = delivery.locationLatitude !== null
       && delivery.locationLongitude !== null
@@ -255,6 +257,8 @@ export async function getPublicTracking(
       store: { name: delivery.storeName, contactPhone: delivery.storeContactPhone },
       reference: delivery.externalReference,
       status: delivery.status,
+      operationalNotices,
+      etaSubjectToChange: operationalNotices.some(notice=>notice.affectsEta===true),
       courier: { displayName: abbreviateCourierName(delivery.courierName) },
       destination: {
         addressLine: revealDestination ? delivery.addressLine : null,

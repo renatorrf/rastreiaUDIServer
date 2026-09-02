@@ -7,6 +7,8 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "smoke:ifood": "tsx src/smoke/ifood.ts",
+    "smoke:driver-events": "tsx src/smoke/driver-events.ts",
     "db:revision-preflight": "tsx src/database/revision-preflight.ts",
     "smoke:spec-revision": "tsx src/smoke/spec-revision.ts",
     "build": "tsc -p tsconfig.build.json",
