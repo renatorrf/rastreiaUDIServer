@@ -1,0 +1,15 @@
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+.env
+.env.*
+.data/
+node_modules/
+dist/
+coverage/
+deploy/cloud-run/*.local.yaml
+*.jks
+*.keystore
+*.p12
+*.mobileprovision

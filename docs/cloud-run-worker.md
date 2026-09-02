@@ -65,6 +65,29 @@ O número de instâncias é manual. **Uma instância ativa gera cobrança mesmo 
 
 ## 4. Alternativa: arquivo YAML e PowerShell
 
+### Preenchimento automático com o `.env` local
+
+Para facilitar os testes em desenvolvimento, há também um gerador local:
+
+```powershell
+npm run cloud-run:prepare-worker
+```
+
+Ele lê somente o `.env` da pasta `rastreia-backend`, valida as configurações e cria `deploy/cloud-run/worker-pool.local.yaml` com os valores existentes e os padrões efetivos do backend. Não lê credenciais do ambiente do terminal, não altera o `.env`, não regenera chaves e não acessa banco, iFood ou Google Cloud. Também não sobrescreve uma cópia local que já exista.
+
+**Essa cópia contém senhas em texto claro**, em `env[].value`, por solicitação de preparação local; ela não usa referências ao Secret Manager. Não compartilhe o arquivo, prints ou seu conteúdo. Está excluída de Git, Docker e dos uploads de fonte pelo `.gcloudignore` do backend. Essas exclusões não criptografam o arquivo, não impedem cópias manuais e não substituem controles de acesso. Para produção, prefira o modelo `worker-pool.example.yaml` com Secret Manager. [Como o Google Cloud CLI trata arquivos ignorados](https://docs.cloud.google.com/sdk/gcloud/reference/topic/gcloudignore).
+
+O gerador exclui senhas de bootstrap/master, variáveis HTTP desnecessárias e campos não reconhecidos. Preserva as chaves de criptografia e o fallback do payload, inclusive quando vazio. **Não ativa iFood nem troca sandbox/production:** os valores vêm do `.env`; confirme que correspondem à revisão hospedada. Configurações ausentes, como SMTP, continuam ausentes/vazias conforme os padrões do código.
+
+Depois de gerar, preencha somente estes marcadores no manifesto:
+
+- `__BACKEND_IMAGE_WITH_SHA256_DIGEST__`: imagem da revisão do backend, não a URL `run.app`.
+- `__WORKER_SERVICE_ACCOUNT_EMAIL__`: conta de serviço escolhida para o pool.
+
+O ID real do projeto continua necessário no comando abaixo. Esses dados de infraestrutura não fazem parte das credenciais do `.env`. Acrescente acesso à rede/Cloud SQL se aplicável. A escala continua zero até ativação explícita. Use o bloco de implantação abaixo **sem executar o Copy-Item**, pois o arquivo já estará preenchido. Ao implantá-lo, as credenciais serão enviadas ao Google Cloud como variáveis de ambiente; não as copie para parâmetros de linha de comando ou logs.
+
+### Preenchimento manual com referências ao Secret Manager
+
 Execute na pasta `rastreia-backend`, com Google Cloud CLI atualizado e autenticado no projeto correto. Os comandos abaixo são para você executar quando for implantar; não foram executados durante a preparação.
 
 ```powershell

@@ -26,6 +26,8 @@ Troque todas as credenciais e segredos do `.env`. O seed é idempotente pelo slu
 
 A API e o worker são processos separados. Para corrigir o aviso “Worker: Ainda não executado” no ambiente hospedado, siga [o guia de implantação do Worker Pool](docs/cloud-run-worker.md), com [modelo YAML](deploy/cloud-run/worker-pool.example.yaml). A configuração inicial é pausada; a ativação é explícita e pode consumir filas reais. O guia não altera a URL da API nem o webhook.
 
+Para preencher uma cópia **local e confidencial** com as credenciais atuais do `.env`, use `npm run cloud-run:prepare-worker`. O arquivo gerado contém senhas em texto claro, fica fora de Git/Docker/uploads de fonte e não é implantado automaticamente. Veja os cuidados e os campos de infraestrutura pendentes no guia.
+
 ## Scripts
 
 - `npm run build`: compila TypeScript estrito.

@@ -16,6 +16,7 @@
     "dev:worker": "tsx watch src/workers/notification-worker.ts",
     "start": "node dist/server.js",
     "start:worker": "node dist/workers/notification-worker.js",
+    "cloud-run:prepare-worker": "tsx src/scripts/prepare-cloud-run-worker.ts",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",

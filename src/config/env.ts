@@ -185,8 +185,12 @@ export type AppEnv = z.infer<typeof envSchema>;
 
 let cached: AppEnv | undefined;
 
+export function parseAppEnv(source: NodeJS.ProcessEnv): AppEnv {
+  return envSchema.parse(source);
+}
+
 export function getEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
-  cached ??= envSchema.parse(source);
+  cached ??= parseAppEnv(source);
   return cached;
 }
 
