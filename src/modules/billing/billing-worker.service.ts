@@ -39,9 +39,9 @@ export async function processBillingBatch(database:Database,storeId?:string) {
             suspension_scheduled_at=GREATEST(now()+interval '24 hours',
               ((due_date+$2::integer)::timestamp AT TIME ZONE timezone)) WHERE id=$1`,[invoice.id,profile.grace_days]);
           await client.query(`INSERT INTO rastreia.billing_notifications(tenant_id,invoice_id,recipient_user_id,kind)
-            SELECT $1,$2,membership.user_id,'DELINQUENCY' FROM rastreia.user_store_access access
-            JOIN rastreia.tenant_users membership ON membership.id=access.tenant_user_id
-            WHERE access.store_id=$3 AND membership.role='TENANT_MANAGER' AND membership.status='ACTIVE'
+            SELECT $1,$2,membership.user_id,'DELINQUENCY' FROM rastreia.tenant_users membership
+            WHERE membership.tenant_id=$1 AND rastreia.has_store_access(membership.user_id,$3)
+            AND membership.role='TENANT_MANAGER' AND membership.status='ACTIVE'
             ON CONFLICT(invoice_id,recipient_user_id,kind) DO NOTHING`,[profile.tenant_id,invoice.id,store_id]);notices++;
         } else if(invoice.days_overdue>0 && invoice.status==='ISSUED') {
           await recordInvoiceState(client,invoice,'OVERDUE','Vencimento sem quitação.');

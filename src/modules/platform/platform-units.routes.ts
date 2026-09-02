@@ -15,17 +15,20 @@ import { billingProfileSchema, timezoneSchema } from '../billing/billing.schemas
 import { masterAudit, saveBillingProfile } from '../billing/billing.service.js';
 import { storeSchema } from '../stores/store.routes.js';
 import { withPlatformIdempotency } from './platform-idempotency.js';
+import { companySchema, contextFilterSchema } from '../organization/organization.schemas.js';
+import { encryptPayload } from '../../shared/encrypted-payload.js';
 
 const managerSchema=z.object({name:z.string().trim().min(2).max(160),email:z.string().trim().email().toLowerCase()});
 const tenantSchema=z.object({slug:z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/),name:z.string().min(2).max(160),timezone:timezoneSchema.default('America/Sao_Paulo')});
 export const provisionUnitSchema=z.object({tenantId:z.string().uuid().optional(),tenant:tenantSchema.optional(),
+  companyId:z.string().uuid().optional(),company:companySchema.optional(),
   store:storeSchema,manager:managerSchema,billing:billingProfileSchema,
   limits:z.record(z.string().max(80),z.number().int().min(0).max(1000000)).default({}),
   settings:z.record(z.string().max(80),z.union([z.string().max(240),z.number(),z.boolean()])).default({}),
 }).refine(input=>Boolean(input.tenantId)!==Boolean(input.tenant),{message:'Informe uma empresa existente ou uma nova, não ambas.'});
 
-async function inviteManager(client:PoolClient,env:AppEnv,auth:PlatformAuthContext,tenantId:string,storeId:string,
-  manager:z.infer<typeof managerSchema>) {
+export async function inviteManager(client:PoolClient,env:AppEnv,auth:PlatformAuthContext,tenantId:string,storeId:string|undefined,
+  manager:z.infer<typeof managerSchema>,grantUnit=true) {
   // Serialize concurrent provisioning of the same global email without changing its password.
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[manager.email]);
   let account=(await client.query('SELECT * FROM rastreia.identity_by_email($1)',[manager.email])).rows[0];
@@ -39,25 +42,28 @@ async function inviteManager(client:PoolClient,env:AppEnv,auth:PlatformAuthConte
   if(account.status!=='ACTIVE')throw conflict('A conta existente precisa estar ativa antes do vínculo.');
   const previous=(await client.query('SELECT id,role,status FROM tenant_users WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE',[tenantId,account.id])).rows[0];
   if(previous && (previous.role!=='TENANT_MANAGER'||previous.status!=='ACTIVE'))throw conflict('Esta identidade já possui outro papel ou um vínculo bloqueado nesta empresa.');
-  const membership=previous??(await client.query(`INSERT INTO tenant_users(tenant_id,user_id,role)
-    VALUES($1,$2,'TENANT_MANAGER') RETURNING id`,[tenantId,account.id])).rows[0];
-  await client.query(`INSERT INTO user_store_access(tenant_id,tenant_user_id,store_id) VALUES($1,$2,$3)
-    ON CONFLICT(tenant_user_id,store_id) DO NOTHING`,[tenantId,membership.id,storeId]);
-  await createIdentityAction(client,env,{userId:account.id,email:manager.email,kind:'INVITE',tenantId,storeId,
+  if(!previous)await client.query(`INSERT INTO tenant_users(tenant_id,user_id,role) VALUES($1,$2,'TENANT_MANAGER')`,[tenantId,account.id]);
+  if(grantUnit&&storeId)await client.query(`INSERT INTO user_access_scopes(tenant_id,user_id,scope_level,company_id,store_id,created_by)
+    SELECT $1,$2,'STORE',company_id,id,$4 FROM stores WHERE id=$3 AND tenant_id=$1
+    ON CONFLICT(user_id,store_id) WHERE scope_level='STORE' AND status='ACTIVE'
+    DO UPDATE SET valid_from=now(),valid_until=NULL`,[tenantId,account.id,storeId,auth.userId]);
+  await createIdentityAction(client,env,{userId:account.id,email:manager.email,kind:'INVITE',tenantId,...(storeId?{storeId}:{}),
     requiresPassword:isNew||!account.email_verified_at});
-  await masterAudit(client,auth,{action:'store.manager_invited',entityType:'store',entityId:storeId,tenantId,
+  await masterAudit(client,auth,{action:'organization.manager_invited',entityType:storeId?'store':'tenant',entityId:storeId??tenantId,tenantId,
     after:{userId:account.id},reason:'Provisionamento explícito de gestor pelo Master.'});
   return {id:account.id,emailDelivery:emailConfigured(env)?'queued':'configuration_required'};
 }
 export async function platformUnitRoutes(app:FastifyInstance,database:Database,env:AppEnv) {
   const auth=authenticatePlatform(env,database);
   app.get('/platform/stores',{preHandler:auth},async request=>withPlatformTransaction(database,request.platformAuth,async client=>{
-    const {tenantId}=z.object({tenantId:z.string().uuid().optional()}).parse(request.query);
-    const result=await client.query(`SELECT store.*,tenant.name AS tenant_name,profile.id AS billing_profile_id,
+    const f=contextFilterSchema.parse(request.query);
+    const result=await client.query(`SELECT store.*,tenant.name AS tenant_name,company.name AS company_name,profile.id AS billing_profile_id,count(*) OVER()::int AS total_count,
       (hold.blocked_at IS NOT NULL AND hold.released_at IS NULL AND (hold.waiver_until IS NULL OR hold.waiver_until<=now())) AS financially_blocked
-      FROM stores store JOIN tenants tenant ON tenant.id=store.tenant_id LEFT JOIN billing_profiles profile ON profile.store_id=store.id
+      FROM stores store JOIN tenants tenant ON tenant.id=store.tenant_id JOIN companies company ON company.id=store.company_id LEFT JOIN billing_profiles profile ON profile.store_id=store.id
       LEFT JOIN unit_financial_holds hold ON hold.store_id=store.id WHERE ($1::uuid IS NULL OR store.tenant_id=$1)
-      ORDER BY tenant.name,store.name LIMIT 200`,[tenantId??null]);return {data:result.rows};
+      AND ($2::uuid IS NULL OR store.company_id=$2) AND ($3::uuid IS NULL OR store.id=$3)
+      AND ($4='' OR position(lower($4) in lower(store.name))>0) AND ($5::text IS NULL OR store.status::text=$5)
+      ORDER BY tenant.name,company.name,store.name,store.id LIMIT $6 OFFSET $7`,[f.tenantId??null,f.companyId??null,f.storeId??null,f.search,f.status??null,f.limit,f.offset]);return {data:result.rows,total:result.rows[0]?.total_count??0,limit:f.limit,offset:f.offset};
   }));
   app.post('/platform/stores',{preHandler:auth},async(request,reply)=>{
     const input=provisionUnitSchema.parse(request.body);const key=parseIdempotencyKey(request.headers['idempotency-key']);
@@ -68,13 +74,20 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
           [input.tenant!.slug,input.tenant!.name,input.tenant!.timezone])).rows[0].id;
         const tenant=(await client.query<{id:string}>("SELECT id FROM tenants WHERE id=$1 AND status='ACTIVE' FOR SHARE",[tenantId])).rows[0];
         if(!tenant)throw conflict('Empresa inativa ou inexistente.');
+        if(!input.companyId&&!input.company)throw conflict('Selecione a empresa jurídica ou preencha os dados de uma nova empresa.');
+        if(input.companyId&&input.company)throw conflict('Selecione uma empresa existente ou uma nova, não ambas.');
+        const companyId=input.companyId??(await client.query<{id:string}>(`INSERT INTO companies(tenant_id,name,legal_name,tax_id_encrypted)
+          VALUES($1,$2,$3,$4) RETURNING id`,[tenantId,input.company!.name,input.company!.legalName,
+            encryptPayload({taxId:input.company!.taxId},env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER)])).rows[0]!.id;
+        if(!(await client.query("SELECT id FROM companies WHERE id=$1 AND tenant_id=$2 AND status='ACTIVE' FOR SHARE",[companyId,tenantId])).rowCount)
+          throw conflict('Empresa inativa ou não pertencente ao grupo selecionado.');
         const s=input.store;
         const store=(await client.query<{id:string;name:string}>(`INSERT INTO stores(tenant_id,name,external_reference,address_line,address_number,complement,
-          neighborhood,city,state,postal_code,latitude,longitude,address_confidence,contact_phone,plan_code,operational_limits,operational_settings)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb) RETURNING *`,
+          neighborhood,city,state,postal_code,latitude,longitude,address_confidence,contact_phone,plan_code,operational_limits,operational_settings,company_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18) RETURNING *`,
         [tenantId,s.name,s.externalReference??null,s.addressLine,s.addressNumber??null,s.complement??null,s.neighborhood??null,s.city,s.state,
           s.postalCode??null,s.latitude,s.longitude,s.addressConfidence??null,s.contactPhone??null,input.billing.planCode,
-          JSON.stringify(input.limits),JSON.stringify(input.settings)])).rows[0]!;
+          JSON.stringify(input.limits),JSON.stringify(input.settings),companyId])).rows[0]!;
         const manager=await inviteManager(client,env,request.platformAuth,tenant.id,store.id,input.manager);
         await saveBillingProfile(client,env,request.platformAuth,store.id,input.billing,'Dados de faturamento no provisionamento.');
         await masterAudit(client,request.platformAuth,{action:'store.provisioned',entityType:'store',entityId:store.id,tenantId:tenant.id,

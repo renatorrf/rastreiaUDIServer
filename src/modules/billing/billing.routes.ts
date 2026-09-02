@@ -36,13 +36,14 @@ export async function billingRoutes(app:FastifyInstance,database:Database,env:Ap
     return mutate(request,reply,'billing.profile',{id,...input},client=>saveBillingProfile(client,env,request.platformAuth,id,input.profile,input.reason,input.version));
   });
   const list=async(client:PoolClient,query:unknown)=>{
-    const filters=z.object({storeId:z.string().uuid().optional(),status:z.enum(['DRAFT','ISSUED','OVERDUE','DELINQUENT','PAID','CANCELLED']).optional(),
+    const filters=z.object({tenantId:z.string().uuid().optional(),companyId:z.string().uuid().optional(),storeId:z.string().uuid().optional(),status:z.enum(['DRAFT','ISSUED','OVERDUE','DELINQUENT','PAID','CANCELLED']).optional(),
       from:z.iso.date().optional(),to:z.iso.date().optional(),limit:z.coerce.number().int().min(1).max(200).default(100),
       offset:z.coerce.number().int().min(0).max(100000).default(0)}).parse(query);
     const result=await client.query(`${invoiceSelect} WHERE ($1::uuid IS NULL OR invoice.store_id=$1)
       AND ($2::text IS NULL OR invoice.status=$2) AND ($3::date IS NULL OR invoice.due_date>=$3)
-      AND ($4::date IS NULL OR invoice.due_date<=$4) ORDER BY invoice.due_date DESC,invoice.id LIMIT $5 OFFSET $6`,
-    [filters.storeId??null,filters.status??null,filters.from??null,filters.to??null,filters.limit,filters.offset]);return {data:result.rows};
+      AND ($4::date IS NULL OR invoice.due_date<=$4) AND ($7::uuid IS NULL OR invoice.tenant_id=$7)
+      AND ($8::uuid IS NULL OR store.company_id=$8) ORDER BY invoice.due_date DESC,invoice.id LIMIT $5 OFFSET $6`,
+    [filters.storeId??null,filters.status??null,filters.from??null,filters.to??null,filters.limit,filters.offset,filters.tenantId??null,filters.companyId??null]);return {data:result.rows};
   };
   app.get('/platform/invoices',{preHandler:master},request=>withPlatformTransaction(database,request.platformAuth,client=>list(client,request.query)));
   app.get('/me/invoices',{preHandler:manager},request=>withTenantTransaction(database,request.auth,client=>list(client,request.query)));
@@ -101,22 +102,25 @@ export async function billingRoutes(app:FastifyInstance,database:Database,env:Ap
       });
     });
   }
-  const summary=async(client:PoolClient)=>{
+  const summary=async(client:PoolClient,query:unknown)=>{
+    const f=z.object({tenantId:z.string().uuid().optional(),companyId:z.string().uuid().optional(),storeId:z.string().uuid().optional()}).parse(query);
+    const params=[f.tenantId??null,f.companyId??null,f.storeId??null];
+    const scope=`($1::uuid IS NULL OR store.tenant_id=$1) AND ($2::uuid IS NULL OR store.company_id=$2) AND ($3::uuid IS NULL OR store.id=$3)`;
     const totals=await client.query(`SELECT COALESCE(sum(balance) FILTER(WHERE status='ISSUED'),0)::text AS upcoming,
       COALESCE(sum(balance) FILTER(WHERE status IN ('OVERDUE','DELINQUENT')),0)::text AS overdue,
       COALESCE(sum(balance) FILTER(WHERE status='DELINQUENT'),0)::text AS delinquent,
-      COALESCE(sum(paid),0)::text AS received FROM (SELECT status,
+      COALESCE(sum(paid),0)::text AS received FROM (SELECT invoices.status,
         COALESCE((SELECT sum(amount) FROM invoice_items WHERE invoice_id=invoices.id),0)-
         COALESCE((SELECT sum(amount) FROM invoice_payments WHERE invoice_id=invoices.id),0) AS balance,
         COALESCE((SELECT sum(amount) FROM invoice_payments WHERE invoice_id=invoices.id
-          AND paid_at>=date_trunc('month',now())),0) AS paid FROM invoices) totals`);
+          AND paid_at>=date_trunc('month',now())),0) AS paid FROM invoices JOIN stores store ON store.id=invoices.store_id WHERE ${scope}) totals`,params);
     const holds=await client.query(`SELECT hold.store_id,store.name AS store_name,hold.scheduled_at,hold.waiver_until,
       (hold.blocked_at IS NOT NULL AND hold.released_at IS NULL AND (hold.waiver_until IS NULL OR hold.waiver_until<=now())) AS blocked
-      FROM unit_financial_holds hold JOIN stores store ON store.id=hold.store_id WHERE hold.released_at IS NULL`);
-    const notices=await client.query(`${invoiceSelect} WHERE invoice.status='DELINQUENT'
-      ORDER BY invoice.suspension_scheduled_at,invoice.id LIMIT 20`);
+      FROM unit_financial_holds hold JOIN stores store ON store.id=hold.store_id WHERE hold.released_at IS NULL AND ${scope}`,params);
+    const notices=await client.query(`${invoiceSelect} WHERE invoice.status='DELINQUENT' AND ${scope}
+      ORDER BY invoice.suspension_scheduled_at,invoice.id LIMIT 20`,params);
     return {...totals.rows[0],holds:holds.rows,notices:notices.rows};
   };
-  app.get('/platform/billing/summary',{preHandler:master},request=>withPlatformTransaction(database,request.platformAuth,summary));
-  app.get('/me/billing-status',{preHandler:manager},request=>withTenantTransaction(database,request.auth,summary));
+  app.get('/platform/billing/summary',{preHandler:master},request=>withPlatformTransaction(database,request.platformAuth,client=>summary(client,request.query)));
+  app.get('/me/billing-status',{preHandler:manager},request=>withTenantTransaction(database,request.auth,client=>summary(client,request.query)));
 }

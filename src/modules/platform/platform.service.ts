@@ -88,7 +88,8 @@ export async function changePlatformTenantStatus(
   }));
 }
 
-export async function listPlatformAudit(database: Database, auth: PlatformAuthContext, limit: number) {
+export async function listPlatformAudit(database: Database, auth: PlatformAuthContext, limit: number,
+  filters:{tenantId?:string|undefined;companyId?:string|undefined;storeId?:string|undefined}={}) {
   return withPlatformTransaction(database, auth, async (client) => {
     const result = await client.query(
       `SELECT audit.id, audit.action, audit.entity_type AS "entityType", audit.entity_id AS "entityId",
@@ -97,7 +98,14 @@ export async function listPlatformAudit(database: Database, auth: PlatformAuthCo
               audit.reason, audit.created_at AS "createdAt"
        FROM platform_audit_logs audit
        LEFT JOIN tenants tenant ON tenant.id = audit.target_tenant_id
-       ORDER BY audit.created_at DESC LIMIT $1`, [limit],
+       LEFT JOIN user_access_scopes scope ON audit.entity_type='access_scope' AND scope.id=audit.entity_id
+       LEFT JOIN invoices invoice ON audit.entity_type='invoice' AND invoice.id=audit.entity_id
+       LEFT JOIN billing_profiles profile ON audit.entity_type='billing_profile' AND profile.id=audit.entity_id
+       LEFT JOIN stores store ON store.id=CASE WHEN audit.entity_type='store' THEN audit.entity_id ELSE COALESCE(invoice.store_id,profile.store_id,scope.store_id) END
+       WHERE ($2::uuid IS NULL OR audit.target_tenant_id=$2)
+         AND ($3::uuid IS NULL OR store.company_id=$3 OR scope.company_id=$3 OR (audit.entity_type='company' AND audit.entity_id=$3))
+         AND ($4::uuid IS NULL OR store.id=$4)
+       ORDER BY audit.created_at DESC,audit.id DESC LIMIT $1`, [limit,filters.tenantId??null,filters.companyId??null,filters.storeId??null],
     );
     return { data: result.rows };
   });

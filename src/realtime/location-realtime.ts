@@ -2,18 +2,15 @@ import type { Server as HttpServer } from 'node:http';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { Server } from 'socket.io';
 import type { AppEnv } from '../config/env.js';
-import { setTenantContext, withRuntimeTransaction, type Database } from '../database/pool.js';
+import { withRuntimeTransaction, type Database } from '../database/pool.js';
 import type { RedisRuntime } from '../infrastructure/redis/redis-runtime.js';
-import { assertActiveTenant } from '../modules/auth/auth.guard.js';
 import { verifyAccessToken } from '../modules/auth/token.service.js';
 import type { LocationStateStore } from '../modules/locations/location-state.store.js';
 import type { LocationPublisher, LocationUpdate } from '../modules/locations/location.types.js';
 import { resolvePublicTrackingSocket } from '../modules/tracking/tracking.service.js';
 
-const anonymousUserId = '00000000-0000-0000-0000-000000000000';
-const tenantRoom = (tenantId: string) => `tenant:${tenantId}`;
 const storeRoom = (storeId: string) => `store:${storeId}`;
-const trackingRoom = (tokenId: string) => `tracking-token:${tokenId}`;
+const trackingRoom = (deliveryId: string) => `tracking-delivery:${deliveryId}`;
 
 class SocketLocationPublisher implements LocationPublisher {
   constructor(
@@ -37,26 +34,22 @@ class SocketLocationPublisher implements LocationPublisher {
       capturedAt: update.capturedAt,
       stale: false,
     };
-    this.io.of('/operations')
-      .to(tenantRoom(update.tenantId))
-      .to(storeRoom(update.storeId))
-      .emit('location:update', internalPayload);
+    // Revalidate before every publication: a room joined before revocation is
+    // not an authorization cache. Remote sockets are included by the adapter.
+    const sockets=await this.io.of('/operations').in(storeRoom(update.storeId)).fetchSockets();
+    for(const socket of sockets) {
+      try {
+        const token=socket.data['accessToken'] as string;
+        const auth=await verifyAccessToken(this.env,token);
+        if(auth.tenantId!==update.tenantId||!auth.storeIds.includes(update.storeId))throw new Error('scope mismatch');
+        const current=await withRuntimeTransaction(this.database,async client=>(await client.query<{allowed:boolean}>(
+          'SELECT rastreia.tenant_session_is_current($1,$2,$3,$4) AS allowed',[auth.tenantId,auth.userId,auth.role,auth.storeIds])).rows[0]?.allowed);
+        if(!current)throw new Error('revoked scope');
+        socket.emit('location:update',internalPayload);
+      } catch { socket.disconnect(true); }
+    }
 
     if (!update.publicVisible) return;
-    const tokenIds = await withRuntimeTransaction(this.database, async (client) => {
-      await setTenantContext(client, { tenantId: update.tenantId, userId: anonymousUserId });
-      const result = await client.query<{ id: string }>(
-        `SELECT token.id
-         FROM tracking_tokens token
-         JOIN deliveries delivery ON delivery.id = token.delivery_id
-         WHERE token.delivery_id = $1 AND token.revoked_at IS NULL AND token.expires_at > now()
-           AND delivery.status IN ('IN_ROUTE', 'NEXT_STOP')
-           AND (delivery.delivered_at IS NULL
-                OR delivery.delivered_at + ($2::text || ' seconds')::interval > now())`,
-        [update.deliveryId, this.env.TRACKING_COMPLETED_GRACE_SECONDS],
-      );
-      return result.rows.map((row) => row.id);
-    });
     const publicPayload = {
       latitude: update.latitude,
       longitude: update.longitude,
@@ -65,8 +58,15 @@ class SocketLocationPublisher implements LocationPublisher {
       capturedAt: update.capturedAt,
       stale: false,
     };
-    for (const tokenId of tokenIds) {
-      this.io.of('/tracking').to(trackingRoom(tokenId)).emit('location:update', publicPayload);
+    const subscribers=await this.io.of('/tracking').in(trackingRoom(update.deliveryId)).fetchSockets();
+    for (const socket of subscribers) {
+      try {
+        // Resolve each subscriber under its own token RLS context; an anonymous
+        // tenant-wide query must never enumerate all tracking tokens.
+        const scope=await resolvePublicTrackingSocket(this.database,this.env,socket.data['trackingToken'] as string);
+        if(scope.deliveryId!==update.deliveryId||scope.tenantId!==update.tenantId)throw new Error('scope mismatch');
+        socket.emit('location:update',publicPayload);
+      } catch { socket.disconnect(true); }
     }
   }
 }
@@ -106,8 +106,11 @@ export async function createLocationRealtime(
       const accessToken = socket.handshake.auth['accessToken'];
       if (typeof accessToken !== 'string') throw new Error('missing token');
       const auth = await verifyAccessToken(env, accessToken);
-      await assertActiveTenant(database, auth.tenantId);
+      const current=await withRuntimeTransaction(database,async client=>(await client.query<{allowed:boolean}>(
+        'SELECT rastreia.tenant_session_is_current($1,$2,$3,$4) AS allowed',[auth.tenantId,auth.userId,auth.role,auth.storeIds])).rows[0]?.allowed);
+      if(!current||!['TENANT_MANAGER','STORE_OPERATOR'].includes(auth.role))throw new Error('unauthorized scope');
       socket.data['auth'] = auth;
+      socket.data['accessToken'] = accessToken;
       next();
     } catch {
       next(new Error('unauthorized'));
@@ -115,8 +118,7 @@ export async function createLocationRealtime(
   });
   operations.on('connection', (socket) => {
     const auth = socket.data['auth'] as Awaited<ReturnType<typeof verifyAccessToken>>;
-    if (auth.role === 'TENANT_MANAGER') void socket.join(tenantRoom(auth.tenantId));
-    if (auth.role === 'STORE_OPERATOR') {
+    if (auth.role === 'TENANT_MANAGER' || auth.role === 'STORE_OPERATOR') {
       for (const storeId of auth.storeIds) void socket.join(storeRoom(storeId));
     }
   });
@@ -127,14 +129,15 @@ export async function createLocationRealtime(
       const token = socket.handshake.auth['token'];
       if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('invalid token');
       socket.data['scope'] = await resolvePublicTrackingSocket(database, env, token);
+      socket.data['trackingToken'] = token;
       next();
     } catch {
       next(new Error('unauthorized'));
     }
   });
   tracking.on('connection', (socket) => {
-    const scope = socket.data['scope'] as { tokenId: string };
-    void socket.join(trackingRoom(scope.tokenId));
+    const scope = socket.data['scope'] as { deliveryId: string };
+    void socket.join(trackingRoom(scope.deliveryId));
   });
 
   return {

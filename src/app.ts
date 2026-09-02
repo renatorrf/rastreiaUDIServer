@@ -20,6 +20,8 @@ import { identityRoutes } from './modules/auth/identity.routes.js';
 import { courierAccountRoutes } from './modules/couriers/courier-account.routes.js';
 import { platformUnitRoutes } from './modules/platform/platform-units.routes.js';
 import { billingRoutes } from './modules/billing/billing.routes.js';
+import { organizationRoutes } from './modules/organization/organization.routes.js';
+import { organizationOperationsRoutes } from './modules/organization/operations.routes.js';
 import { courierRoutes } from './modules/couriers/courier.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
@@ -144,6 +146,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await identityRoutes(app, database, env);
   await courierAccountRoutes(app, database, env);
   await platformUnitRoutes(app, database, env);
+  await organizationRoutes(app, database, env);
+  await organizationOperationsRoutes(app, database, env);
   await billingRoutes(app, database, env);
   await platformRoutes(app, database, env);
   await tenantRoutes(app, database, env);

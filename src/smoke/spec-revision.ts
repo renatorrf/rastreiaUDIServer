@@ -30,6 +30,8 @@ function check(value:unknown,message:string){assert.ok(value,message);checks++;}
 try {
   const migrated=await database.query("SELECT 1 FROM pg_trigger WHERE tgname='stores_master_only'");
   if(!migrated.rowCount)await database.query(await readFile(resolve('migrations/0032_explicit_unit_scope.sql'),'utf8'));
+  const hierarchy=await database.query("SELECT 1 FROM information_schema.tables WHERE table_schema='rastreia' AND table_name='companies'");
+  if(!hierarchy.rowCount)await database.query(await readFile(resolve('migrations/0033_organization_hierarchy.sql'),'utf8'));
   const masterId=randomUUID();const password='Synthetic-only-password-3489!';
   await database.query(`INSERT INTO rastreia.platform_admins(id,name,email,password_hash) VALUES($1,'Master de teste',$2,$3)`,[masterId,`${prefix}-master@example.test`,await argon2.hash(password)]);
   app=await buildApp({env,database});
@@ -39,14 +41,18 @@ try {
   };
   const master=(await call('POST','/platform/auth/login',{email:`${prefix}-master@example.test`,password})).body.accessToken as string;
   check(master,'Master authenticated');
+  const emptyGroup=await call('POST','/platform/groups',{name:'Grupo vazio',slug:prefix+'-empty'},master);
+  check(emptyGroup.status===200,'Master can create group before companies');
+  const emptyReport=await call('GET',`/platform/operations/summary?tenantId=${emptyGroup.body.id}`,undefined,master);
+  check(emptyReport.status===200&&emptyReport.body.summary.units===0,'Empty organization context has an empty dashboard, not forbidden');
   const billing={legalName:'Empresa teste',tradeName:'Unidade teste',taxId:'52998224725',financialEmail:'finance@example.test',financialContact:'Responsável teste',
     billingAddress:{addressLine:'Rua de teste',number:'1',neighborhood:'Centro',city:'Teste',state:'MG',postalCode:'38400000'},
     planCode:'test',recurringAmount:'100.00',dueDay:10,startsOn:'2026-01-01',enabled:false};
   const store={name:'Unidade Um',addressLine:'Rua de teste',addressNumber:'1',neighborhood:'Centro',city:'Teste',state:'MG',postalCode:'38400000',latitude:-18.9,longitude:-48.2};
-  const input={tenant:{name:'Empresa teste',slug:prefix},store,manager:{name:'Gestor teste',email:`${prefix}-manager@example.test`},billing};
+  const input={tenant:{name:'Grupo teste',slug:prefix},company:{name:'Empresa teste',legalName:'Empresa teste',taxId:'11222333000181'},store,manager:{name:'Gestor teste',email:`${prefix}-manager@example.test`},billing};
   const key=randomUUID();const first=await call('POST','/platform/stores',input,master,key);
   assert.equal(first.status,201,JSON.stringify(first.body));checks++;
-  const unit=first.body as {id:string;tenant_id:string;manager:{id:string}};
+  const unit=first.body as {id:string;tenant_id:string;company_id:string;manager:{id:string}};
   const replay=await call('POST','/platform/stores',input,master,key);check(replay.body.id===unit.id,'Provisioning replay');
   const conflictReplay=await call('POST','/platform/stores',{...input,store:{...store,name:'Outro nome'}},master,key);
   check(conflictReplay.status===409,'Idempotency key cannot be reused for a different provisioning payload');
@@ -60,14 +66,55 @@ try {
   const invitation=await emailToken(unit.manager.id,'INVITE');
   check((await call('POST','/auth/accept-invite',{token:invitation,password})).status===200,'Invite acceptance');
   check((await call('POST','/auth/accept-invite',{token:invitation,password})).status===409,'Invite single use');
-  const second=await call('POST','/platform/stores',{tenantId:unit.tenant_id,store:{...store,name:'Unidade Dois'},manager:input.manager,billing},master);
+  const second=await call('POST','/platform/stores',{tenantId:unit.tenant_id,companyId:unit.company_id,store:{...store,name:'Unidade Dois'},manager:input.manager,billing},master);
   assert.equal(second.status,201,JSON.stringify(second.body));checks++;
   check(second.body.manager.id===unit.manager.id,'Reuse global manager identity');
-  const failedProvision=await call('POST','/platform/stores',{tenantId:unit.tenant_id,store:{...store,name:'Unidade inválida'},manager:input.manager,billing:{...billing,taxId:'11111111111'}},master);
+  const failedProvision=await call('POST','/platform/stores',{tenantId:unit.tenant_id,companyId:unit.company_id,store:{...store,name:'Unidade inválida'},manager:input.manager,billing:{...billing,taxId:'11111111111'}},master);
   check(failedProvision.status===400,'Invalid fiscal profile rejects provisioning');
   const unitCount=await database.query<{count:string}>('SELECT count(*)::text FROM rastreia.stores WHERE tenant_id=$1',[unit.tenant_id]);
   check(unitCount.rows[0]?.count==='2','No partial units left by rejected provisioning');
   const identity=(await call('POST','/auth/sign-in',{email:input.manager.email,password})).body;
+  const hierarchyDraft={group:{name:'Grupo hierárquico',slug:prefix+'-hierarchy'},manager:{name:'Gestor da empresa',email:`${prefix}-scoped@example.test`},
+    scope:{level:'COMPANY',targetKeys:['company-a']},companies:[
+      {key:'company-a',company:{name:'Empresa A',legalName:'Empresa A',taxId:'11222333000181'},units:[{key:'store-a',store:{...store,name:'Loja A'},billing}]},
+      {key:'company-b',company:{name:'Empresa B',legalName:'Empresa B',taxId:'11222333000181'},units:[{key:'store-b',store:{...store,name:'Loja B'},billing}]},
+    ]};
+  const provision=await call('POST','/platform/organizations/provision',hierarchyDraft,master);
+  assert.equal(provision.status,200,JSON.stringify(provision.body));checks++;
+  const organization=provision.body as {id:string;manager:{id:string};targets:Record<string,{companyId:string;storeId:string}>};
+  check((await call('POST','/auth/accept-invite',{token:await emailToken(organization.manager.id,'INVITE'),password})).status===200,'Hierarchical invitation accepted');
+  const scopedIdentity=(await call('POST','/auth/sign-in',{email:hierarchyDraft.manager.email,password})).body;
+  check(scopedIdentity.units.length===1&&scopedIdentity.units[0].id===organization.targets['store-a']!.storeId,'Company grant does not expose sibling company');
+  const tree=await call('GET','/me/organization-tree',undefined,scopedIdentity.accessToken as string);
+  check(tree.status===200&&tree.body.companies.length===1&&tree.body.stores.length===1,'Organization selector contains effective scope only');
+  check((await call('GET',`/management/operations/summary?companyId=${organization.targets['company-b']!.companyId}`,undefined,scopedIdentity.accessToken as string)).status===403,'Forged sibling filter rejected');
+  check((await call('GET',`/management/operations/summary?tenantId=${unit.tenant_id}`,undefined,scopedIdentity.accessToken as string)).status===403,'Forged group filter rejected');
+  const consolidated=await call('GET','/management/operations/summary',undefined,scopedIdentity.accessToken as string);
+  assert.equal(consolidated.status,200,JSON.stringify(consolidated.body));checks++;
+  check(consolidated.body.summary.units===1&&consolidated.body.stores.length===1,'Consolidated scope matches store breakdown');
+  const inherited=await call('POST','/platform/stores',{tenantId:organization.id,companyId:organization.targets['company-a']!.companyId,
+    store:{...store,name:'Loja A2'},billing,manager:{name:'Outro gestor',email:`${prefix}-other@example.test`}},master);
+  assert.equal(inherited.status,201,JSON.stringify(inherited.body));checks++;
+  const inheritedSnapshot=await call('GET','/auth/identity/me',undefined,scopedIdentity.accessToken as string);
+  check(inheritedSnapshot.body.units.length===2,'Company scope dynamically inherits new unit');
+  const currentOperational=await call('POST','/auth/enter-unit',{storeId:organization.targets['store-a']!.storeId},scopedIdentity.accessToken as string);
+  check(currentOperational.status===200,'Inherited scope can enter one operational unit');
+  const scopedGrants=await call('GET','/me/effective-scopes',undefined,scopedIdentity.accessToken as string);
+  const groupGrant=await call('POST','/platform/access-scopes',{manager:hierarchyDraft.manager,scope:{level:'TENANT',tenantId:organization.id},reason:'Autorizar todo o grupo no teste.'},master);
+  check(groupGrant.status===200,'Explicit group scope created');
+  check((await call('GET','/auth/identity/me',undefined,scopedIdentity.accessToken as string)).body.units.length===3,'Group access includes both companies');
+  check((await call('POST',`/platform/access-scopes/${groupGrant.body.id}/revoke`,{reason:'Revogar acesso global no teste.'},master)).status===200,'Group grant revoked');
+  check((await call('GET','/auth/identity/me',undefined,scopedIdentity.accessToken as string)).body.units.length===2,'Revocation retains only independent company grant');
+  check((await call('POST',`/platform/access-scopes/${scopedGrants.body.grants[0].id}/revoke`,{reason:'Revogar acesso da empresa no teste.'},master)).status===200,'Company grant revoked');
+  check((await call('GET','/stores',undefined,currentOperational.body.accessToken as string)).status===401,'Previously issued unit token stops working after scope revocation');
+  check((await call('POST','/platform/access-scopes',{manager:hierarchyDraft.manager,scope:{level:'COMPANY',tenantId:unit.tenant_id,companyId:organization.targets['company-a']!.companyId},reason:'Vínculo inválido de outro grupo.'},master)).status===409,'Cross-group company grant rejected');
+  check(!(await database.query('SELECT 1 FROM rastreia.tenant_users WHERE user_id=$1 AND tenant_id=$2',[organization.manager.id,unit.tenant_id])).rowCount,'Rejected grant rolls back partial group membership');
+  const filteredGrants=await call('GET',`/platform/access-scopes?companyId=${unit.company_id}&storeId=${unit.id}`,undefined,master);
+  check(filteredGrants.status===200&&filteredGrants.body.data.length===1&&filteredGrants.body.data[0].store_id===unit.id,'Access list applies company and unit filters without including other group grants');
+  const filteredCompanies=await call('GET',`/platform/companies?storeId=${unit.id}`,undefined,master);
+  check(filteredCompanies.status===200&&filteredCompanies.body.data.length===1&&filteredCompanies.body.data[0].id===unit.company_id,'Company list respects selected unit');
+  const filteredAudit=await call('GET',`/platform/audit?companyId=${unit.company_id}`,undefined,master);
+  check(filteredAudit.status===200&&filteredAudit.body.data.length>0&&(filteredAudit.body.data as Array<{targetTenantId:string}>).every(row=>row.targetTenantId===unit.tenant_id),'Audit filters apply organizational context');
   check(identity.units.length===2,'Only explicitly linked units returned');
   const entered=await call('POST','/auth/enter-unit',{storeId:unit.id},identity.accessToken as string);
   assert.equal(entered.status,200,JSON.stringify(entered.body));checks++;
@@ -80,6 +127,8 @@ try {
   const delivery=await call('POST','/deliveries',parcel,manager);
   assert.equal(delivery.status,201,JSON.stringify(delivery.body));checks++;
   const deliveryId=delivery.body.id as string;
+  const counted=await call('GET',`/management/operations/summary?tenantId=${unit.tenant_id}`,undefined,identity.accessToken as string);
+  check(counted.status===200&&counted.body.summary.deliveries===1&&(counted.body.stores as Array<{deliveries:number}>).reduce((sum,row)=>sum+row.deliveries,0)===1,'Nonzero summary matches authorized unit totals');
   const secondSession=await call('POST','/auth/enter-unit',{storeId:second.body.id},identity.accessToken as string);
   check((await call('GET',`/deliveries/${deliveryId}`,undefined,secondSession.body.accessToken as string)).status===404,'Other selected unit cannot read delivery by ID');
   // Fixture state simulates a trip already started; all writes are rolled back.
@@ -146,6 +195,14 @@ try {
   const stopped=await database.query<{count:string}>("SELECT count(*)::text FROM rastreia.courier_availability WHERE courier_profile_id=$1 AND (status='AVAILABLE' OR latitude IS NOT NULL)",[profileId]);
   check(stopped.rows[0]?.count==='0','Going offline clears all linked tenant discovery snapshots');
   check((await call('GET','/me/invoices',undefined,courierToken)).status===401,'Global courier token cannot read tenant billing');
+  check((await call('GET','/management/operations/summary',undefined,courierToken)).status===403,'Courier cannot access consolidated management reports');
+  await database.query("UPDATE rastreia.deliveries SET status='IN_ROUTE',courier_profile_id=$2 WHERE id=$1",[deliveryId,profileId]);
+  await database.query(`INSERT INTO rastreia.courier_last_locations(tenant_id,courier_profile_id,delivery_id,store_id,latitude,longitude,accuracy,captured_at)
+    VALUES($1,$2,$3,$4,-18.9,-48.2,10,now())`,[unit.tenant_id,profileId,deliveryId,unit.id]);
+  const mapped=await call('GET',`/management/operations/summary?storeId=${unit.id}`,undefined,identity.accessToken as string);
+  check(mapped.status===200&&mapped.body.positions.length===1&&mapped.body.positions[0].delivery_id===deliveryId,'Consolidated map includes only authorized active delivery positions');
+  const hiddenMap=await call('GET',`/management/operations/summary?storeId=${second.body.id}`,undefined,identity.accessToken as string);
+  check(hiddenMap.status===200&&hiddenMap.body.positions.length===0,'Another unit filter excludes location from consolidated map');
   const inactive=await call('PATCH',`/platform/stores/${unit.id}/status`,{status:'INACTIVE',reason:'Inativação sintética para verificar sessões.'},master);
   check(inactive.status===200,'Master can inactivate a unit');
   check((await call('GET','/stores',undefined,manager)).status===401,'Old operational access token loses inactive unit access');

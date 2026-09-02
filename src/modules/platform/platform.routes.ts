@@ -82,7 +82,8 @@ export async function platformRoutes(app: FastifyInstance, database: Database, e
     ));
   });
   app.get('/platform/audit', { preHandler: auth }, async (request) => {
-    const { limit } = z.object({ limit: z.coerce.number().int().min(1).max(100).default(30) }).parse(request.query);
-    return listPlatformAudit(database, request.platformAuth, limit);
+    const filters = z.object({ limit: z.coerce.number().int().min(1).max(100).default(30),
+      tenantId:z.string().uuid().optional(),companyId:z.string().uuid().optional(),storeId:z.string().uuid().optional() }).parse(request.query);
+    return listPlatformAudit(database, request.platformAuth, filters.limit, filters);
   });
 }
