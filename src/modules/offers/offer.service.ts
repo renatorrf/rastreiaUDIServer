@@ -148,6 +148,8 @@ export async function createDeliveryOffer(
              AND availability.courier_profile_id = profile.id AND availability.status = 'AVAILABLE'
            WHERE store.id = $3 AND (availability.available_until IS NULL OR availability.available_until > now())
              AND availability.accuracy <= 100
+             AND availability.updated_at>now()-interval '5 minutes'
+             AND courier_matches_preferences(profile.id,store.id,'ONE_OFF',$6,$7)
              AND ($4::jsonb->>'vehicleType' IS NULL OR $4::jsonb->>'vehicleType' = profile.vehicle_type::text)
              AND NOT EXISTS (SELECT 1 FROM deliveries busy WHERE busy.courier_profile_id = profile.id
                AND busy.status IN ('AWAITING_PICKUP', 'COLLECTED', 'IN_ROUTE', 'NEXT_STOP'))
@@ -156,7 +158,8 @@ export async function createDeliveryOffer(
              AND courier_is_marketplace_eligible($1, profile.id, store.id)
          ) eligible WHERE eligible.distance_m <= LEAST($5, eligible.interest_radius_m)
          ORDER BY eligible.distance_m LIMIT 100`,
-        [auth.tenantId, offerId, target.store_id, JSON.stringify(input.requirements), input.searchRadiusM],
+        [auth.tenantId, offerId, target.store_id, JSON.stringify(input.requirements), input.searchRadiusM,
+          input.pickupWindowStart,input.pickupWindowEnd],
       );
       await appendEvent(client, auth, offerId, 'OFFER_PUBLISHED', { candidateCount: candidates.rowCount });
       await publish(client, auth.tenantId, offerId, 'offer.published', { candidateCount: candidates.rowCount });

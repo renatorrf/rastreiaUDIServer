@@ -24,6 +24,9 @@ try {
   if (existing.rowCount) {
     process.stdout.write('Administrador da plataforma já existe; nenhuma alteração aplicada.\n');
   } else {
+    if (/change|replace|troque|mude|example|exemplo/i.test(env.BOOTSTRAP_PLATFORM_ADMIN_PASSWORD!)) {
+      throw new Error('Substitua a senha de exemplo. Use npm run security:generate-master-password -- --write-env antes de criar o Master.');
+    }
     const id = randomUUID();
     const passwordHash = await argon2.hash(env.BOOTSTRAP_PLATFORM_ADMIN_PASSWORD!, {
       type: argon2.argon2id, memoryCost: 19_456, timeCost: 2, parallelism: 1,

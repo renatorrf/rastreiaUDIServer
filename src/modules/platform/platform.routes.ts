@@ -1,14 +1,17 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
-import type { Database } from '../../database/pool.js';
-import { unauthorized } from '../../shared/errors.js';
+import { withPlatformTransaction, type Database } from '../../database/pool.js';
+import { conflict, notFound, unauthorized } from '../../shared/errors.js';
+import { updateTenantSchema } from '../tenants/tenant.routes.js';
+import { withPlatformIdempotency } from './platform-idempotency.js';
+import { masterAudit } from '../billing/billing.service.js';
 import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempotency.js';
 import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { authenticatePlatform } from '../auth/auth.guard.js';
 import { platformLogin, platformLogout, platformRefresh } from './platform-auth.service.js';
 import {
-  changePlatformTenantStatus, createPlatformTenant, listPlatformAudit, listPlatformTenants,
+  changePlatformTenantStatus, listPlatformAudit, listPlatformTenants,
 } from './platform.service.js';
 
 const loginSchema = z.object({
@@ -19,17 +22,6 @@ const listSchema = z.object({
   search: z.string().trim().max(120).optional(), status: tenantStatus.optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().min(0).max(100_000).default(0),
-});
-const createSchema = z.object({
-  slug: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{1,62}$/),
-  name: z.string().trim().min(2).max(160),
-  legalName: z.string().trim().max(200).nullable().optional(),
-  timezone: z.string().trim().min(3).max(80).default('America/Sao_Paulo'),
-  contactPhone: z.string().trim().max(30).nullable().optional(),
-  manager: z.object({
-    name: z.string().trim().min(2).max(160), email: z.string().trim().email().toLowerCase(),
-    password: z.string().min(12).max(200),
-  }),
 });
 const statusSchema = z.object({ status: tenantStatus, reason: z.string().trim().min(5).max(500) });
 const idSchema = z.object({ id: z.string().uuid() });
@@ -67,10 +59,21 @@ export async function platformRoutes(app: FastifyInstance, database: Database, e
   });
   app.get('/platform/tenants', { preHandler: auth }, async (request) =>
     listPlatformTenants(database, request.platformAuth, listSchema.parse(request.query)));
-  app.post('/platform/tenants', { preHandler: auth }, async (request, reply) =>
-    sendIdempotent(reply, await createPlatformTenant(
-      database, request.platformAuth, keyFrom(request), createSchema.parse(request.body), request.ip,
-    )));
+  app.patch('/platform/tenants/:id',{preHandler:auth},async(request,reply)=>{
+    const {id}=idSchema.parse(request.params);
+    const body=z.object({tenant:updateTenantSchema,reason:z.string().trim().min(5).max(500)}).parse(request.body);
+    const result=await withPlatformTransaction(database,request.platformAuth,client=>withPlatformIdempotency(client,request.platformAuth,
+      keyFrom(request),'tenant.details',{id,...body},async()=>{
+        const before=(await client.query<{updated_at:Date;status:string}>('SELECT * FROM tenants WHERE id=$1 FOR UPDATE',[id])).rows[0];
+        if(!before)throw notFound();if(before.status==='ARCHIVED')throw conflict('Empresa arquivada.');
+        if(before.updated_at.getTime()!==new Date(body.tenant.updatedAt).getTime())throw conflict('Dados alterados em outra sessão. Recarregue.');
+        const input=body.tenant;
+        await client.query('UPDATE tenants SET name=$2,legal_name=$3,contact_phone=$4,timezone=$5 WHERE id=$1',
+          [id,input.name,input.legalName??null,input.contactPhone??null,input.timezone]);
+        await masterAudit(client,request.platformAuth,{action:'tenant.details_updated',entityType:'tenant',entityId:id,tenantId:id,
+          before,after:input,reason:body.reason});return {statusCode:200,body:{id}};
+      }));return sendIdempotent(reply,result);
+  });
   app.patch('/platform/tenants/:id/status', { preHandler: auth }, async (request, reply) => {
     const { id } = idSchema.parse(request.params);
     const input = statusSchema.parse(request.body);

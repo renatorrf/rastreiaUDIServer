@@ -2,11 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
-import { writeAudit } from '../../shared/audit.js';
-import { conflict } from '../../shared/errors.js';
+import { forbidden } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 
-const updateTenantSchema = z.object({
+export const updateTenantSchema = z.object({
   name: z.string().trim().min(2).max(160),
   legalName: z.string().trim().max(200).nullable().optional(),
   contactPhone: z.string().trim().max(30).nullable().optional(),
@@ -49,36 +48,7 @@ export async function tenantRoutes(app: FastifyInstance, database: Database, env
     }),
   );
 
-  app.patch(
-    '/tenants/current',
-    { preHandler: [auth, requireRoles('TENANT_MANAGER')] },
-    async (request) => {
-      const input = updateTenantSchema.parse(request.body);
-      return withTenantTransaction(database, request.auth, async (client) => {
-        const before = await client.query('SELECT name, legal_name, contact_phone, timezone FROM tenants WHERE id = $1', [request.auth.tenantId]);
-        const result = await client.query(
-          `UPDATE tenants SET name = $2, legal_name = $3, contact_phone = $4, timezone = $5
-           WHERE id = $1 AND date_trunc('milliseconds', updated_at) = $6::timestamptz
-           RETURNING id, slug, name, legal_name AS "legalName", status, timezone,
-                     contact_phone AS "contactPhone", created_at AS "createdAt", updated_at AS "updatedAt"`,
-          [request.auth.tenantId, input.name, input.legalName ?? null, input.contactPhone ?? null,
-            input.timezone, input.updatedAt],
-        );
-        if (!result.rowCount) {
-          throw conflict('As configurações foram alteradas em outra sessão. Recarregue antes de salvar.');
-        }
-        await writeAudit(client, {
-          tenantId: request.auth.tenantId,
-          actorUserId: request.auth.userId,
-          action: 'tenant.updated',
-          entityType: 'tenant',
-          entityId: request.auth.tenantId,
-          beforeData: before.rows[0],
-          afterData: result.rows[0],
-          ip: request.ip,
-        });
-        return { ...result.rows[0], capabilities: capabilities(env) };
-      });
-    },
-  );
+  app.patch('/tenants/current', {preHandler:[auth,requireRoles('TENANT_MANAGER')]}, async()=> {
+    throw forbidden('Somente o Master pode alterar os dados compartilhados da empresa.');
+  });
 }

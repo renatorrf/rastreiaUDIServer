@@ -16,6 +16,10 @@ import type { RouteDirectionsProvider, RouteMatrixProvider } from './integration
 import { geoRoutes } from './integrations/geo/geo.routes.js';
 import { createObjectStorage } from './integrations/objects/object-storage.js';
 import { authRoutes } from './modules/auth/auth.routes.js';
+import { identityRoutes } from './modules/auth/identity.routes.js';
+import { courierAccountRoutes } from './modules/couriers/courier-account.routes.js';
+import { platformUnitRoutes } from './modules/platform/platform-units.routes.js';
+import { billingRoutes } from './modules/billing/billing.routes.js';
 import { courierRoutes } from './modules/couriers/courier.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
@@ -137,6 +141,10 @@ export async function buildApp(options: BuildAppOptions = {}) {
   );
   realtimeStatus = realtime.status;
   await authRoutes(app, database, env);
+  await identityRoutes(app, database, env);
+  await courierAccountRoutes(app, database, env);
+  await platformUnitRoutes(app, database, env);
+  await billingRoutes(app, database, env);
   await platformRoutes(app, database, env);
   await tenantRoutes(app, database, env);
   await storeRoutes(app, database, env);
@@ -164,6 +172,13 @@ export async function buildApp(options: BuildAppOptions = {}) {
   }));
 
   app.setErrorHandler(async (error, request, reply) => {
+    if (error instanceof Error && error.message === 'MASTER_REQUIRED') {
+      return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.' } });
+    }
+    if (error instanceof Error && error.message === 'UNIT_UNAVAILABLE') {
+      return reply.status(409).send({ error: { code: 'UNIT_UNAVAILABLE',
+        message: 'A unidade está temporariamente indisponível para novas operações.' } });
+    }
     if (error instanceof ZodError) {
       markRequestError(request, 'VALIDATION_ERROR');
       return reply.status(400).send({

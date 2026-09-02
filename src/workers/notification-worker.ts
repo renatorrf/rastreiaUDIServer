@@ -9,6 +9,8 @@ import { advanceEmergencySearches } from '../modules/shifts/shift-search.service
 import { createDueShiftConfirmations, sendDueShiftReminders } from '../modules/shifts/shift-change.service.js';
 import { expireDeliveryOffers } from '../modules/offers/offer.service.js';
 import { enforceRetentionPolicies } from './retention.service.js';
+import { processBillingBatch } from '../modules/billing/billing-worker.service.js';
+import { processEmailBatch } from '../integrations/email/email.service.js';
 
 loadLocalEnv();
 const env = getEnv();
@@ -38,6 +40,9 @@ async function tick(): Promise<void> {
     let retention = { ran: false };
     try {
       if (runMaintenance) {
+        await database.query(`UPDATE rastreia.courier_service_preferences SET availability_status='OFFLINE',latitude=NULL,longitude=NULL,accuracy=NULL,
+          location_authorized_at=NULL,location_expires_at=NULL,updated_at=now() WHERE availability_status='AVAILABLE' AND location_expires_at<=now()`);
+        if (env.BILLING_ENABLED) await processBillingBatch(database);
         recurring = await materializeActiveShiftTemplates(database);
         confirmations = await createDueShiftConfirmations(database);
         reminders = await sendDueShiftReminders(database);
@@ -50,6 +55,7 @@ async function tick(): Promise<void> {
       await releaseLease?.();
     }
     const result = await processNotificationBatch(database, env, 25, workerId);
+    await processEmailBatch(database, env);
     if (recurring.generatedSlots || confirmations.created || reminders.reminded || offers.expired
         || maintenance.released || searches.advanced || retention.ran
         || result.processed || result.retried || result.deadLettered) {

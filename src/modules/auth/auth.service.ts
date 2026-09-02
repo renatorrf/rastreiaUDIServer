@@ -83,6 +83,7 @@ export async function login(database: Database, env: AppEnv, input: LoginInput):
        WHERE membership.tenant_id = $1
          AND membership.status = 'ACTIVE'
          AND u.status = 'ACTIVE'
+         AND u.email_verified_at IS NOT NULL
          AND u.email = $2::citext
        LIMIT 1`,
       [tenant.id, input.email],
@@ -92,13 +93,11 @@ export async function login(database: Database, env: AppEnv, input: LoginInput):
 
     await setTenantContext(client, { tenantId: tenant.id, userId: account.id });
     const storeResult = await client.query<{ store_id: string }>(
-      `SELECT access.store_id
-       FROM user_store_access access
-       JOIN tenant_users membership ON membership.id = access.tenant_user_id
-       WHERE membership.tenant_id = $1 AND membership.user_id = $2`,
+      `SELECT id AS store_id FROM rastreia.identity_units($2) WHERE tenant_id=$1`,
       [tenant.id, account.id],
     );
     const storeIds = storeResult.rows.map((row) => row.store_id);
+    if (!storeIds.length) throw unauthorized('Nenhuma unidade ativa autorizada. Entre em contato com o Master.');
     const auth = { userId: account.id, tenantId: tenant.id, role: account.role, storeIds };
     const tokens = await createTokenPair(env, auth);
     await storeSession(client, tokens, auth, input.ip, input.userAgent);
@@ -174,17 +173,15 @@ export async function refresh(
        JOIN users u ON u.id = membership.user_id
        JOIN tenants t ON t.id = membership.tenant_id
        WHERE membership.tenant_id = $1 AND membership.user_id = $2
-         AND membership.status = 'ACTIVE' AND u.status = 'ACTIVE' AND t.status = 'ACTIVE'`,
+         AND membership.status = 'ACTIVE' AND u.status = 'ACTIVE' AND u.email_verified_at IS NOT NULL AND t.status = 'ACTIVE'`,
       [claims.tenantId, claims.userId],
     );
     const membership = membershipResult.rows[0];
     if (!membership) throw unauthorized();
 
     const stores = await client.query<{ store_id: string }>(
-      `SELECT access.store_id FROM user_store_access access
-       JOIN tenant_users membership ON membership.id = access.tenant_user_id
-       WHERE membership.tenant_id = $1 AND membership.user_id = $2`,
-      [claims.tenantId, claims.userId],
+      `SELECT id AS store_id FROM rastreia.identity_units($2) WHERE tenant_id=$1 AND id=ANY($3::uuid[])`,
+      [claims.tenantId, claims.userId, claims.storeIds],
     );
     const auth = {
       userId: claims.userId,
@@ -192,6 +189,7 @@ export async function refresh(
       role: membership.role,
       storeIds: stores.rows.map((row) => row.store_id),
     };
+    if (!auth.storeIds.length) throw unauthorized('Unidade inativa ou acesso revogado.');
     const tokens = await createTokenPair(env, auth);
     await storeSession(client, tokens, auth, ip, userAgent);
     await client.query(

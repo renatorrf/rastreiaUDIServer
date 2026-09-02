@@ -20,7 +20,8 @@ export async function getCourierAvailability(database: Database, auth: AuthConte
   return withTenantTransaction(database, auth, async (client) => {
     const id = await courierId(client, auth);
     const result = await client.query(
-      `SELECT status = 'AVAILABLE' AS available, latitude, longitude, accuracy,
+      `SELECT status = 'AVAILABLE' AND updated_at>now()-interval '5 minutes'
+              AND (available_until IS NULL OR available_until>now()) AS available, latitude, longitude, accuracy,
               interest_radius_m AS "interestRadiusM", available_until AS "availableUntil", updated_at AS "updatedAt"
        FROM courier_availability WHERE courier_profile_id = $1`, [id],
     );
@@ -35,6 +36,9 @@ export async function setCourierAvailability(database: Database, auth: AuthConte
     if (input.available && (input.latitude === undefined || input.longitude === undefined || input.accuracy === undefined)) {
       throw forbidden('Informe a localização para ficar disponível.');
     }
+    const preference=await client.query<{registration_status:string}>('SELECT registration_status FROM courier_service_preferences WHERE courier_profile_id=$1',[id]);
+    if(input.available&&preference.rows[0]&&preference.rows[0].registration_status!=='APPROVED')throw forbidden('Seu cadastro precisa estar aprovado.');
+    if(input.available&&(input.accuracy??101)>100)throw forbidden('A precisão da localização deve ser de até 100 metros.');
     const result = await client.query(
       `INSERT INTO courier_availability
          (tenant_id, courier_profile_id, status, latitude, longitude, accuracy, interest_radius_m, available_until, updated_by)
@@ -45,10 +49,15 @@ export async function setCourierAvailability(database: Database, auth: AuthConte
          available_until = EXCLUDED.available_until, updated_by = EXCLUDED.updated_by
        RETURNING status = 'AVAILABLE' AS available, latitude, longitude, accuracy,
          interest_radius_m AS "interestRadiusM", available_until AS "availableUntil", updated_at AS "updatedAt"`,
-      [auth.tenantId, id, input.available ? 'AVAILABLE' : 'UNAVAILABLE', input.latitude ?? null,
-        input.longitude ?? null, input.accuracy ?? null, input.interestRadiusM,
-        input.availableUntil ?? null, auth.userId],
+      [auth.tenantId, id, input.available ? 'AVAILABLE' : 'UNAVAILABLE', input.available?input.latitude:null,
+        input.available?input.longitude:null, input.available?input.accuracy:null, input.interestRadiusM,
+        input.available?new Date(Math.min(input.availableUntil?.getTime()??Infinity,Date.now()+300000)):null, auth.userId],
     );
+    await client.query(`UPDATE courier_service_preferences SET availability_status=$2,latitude=$3,longitude=$4,accuracy=$5,
+      location_authorized_at=CASE WHEN $2='AVAILABLE' THEN now() ELSE NULL END,
+      location_expires_at=CASE WHEN $2='AVAILABLE' THEN now()+interval '5 minutes' ELSE NULL END,updated_at=now()
+      WHERE courier_profile_id=$1`,[id,input.available?'AVAILABLE':'OFFLINE',input.available?input.latitude:null,
+        input.available?input.longitude:null,input.available?input.accuracy:null]);
     return result.rows[0];
   });
 }

@@ -7,6 +7,8 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "db:revision-preflight": "tsx src/database/revision-preflight.ts",
+    "smoke:spec-revision": "tsx src/smoke/spec-revision.ts",
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/server.ts",
     "dev:worker": "tsx watch src/workers/notification-worker.ts",
@@ -19,6 +21,7 @@
     "db:inspect": "tsx src/database/inspect.ts",
     "db:seed": "tsx src/database/seed.ts",
     "db:seed:platform": "tsx src/database/seed-platform.ts",
+    "security:generate-master-password": "tsx src/scripts/generate-master-password.ts",
     "push:generate-keys": "web-push generate-vapid-keys --json",
     "smoke:phase1": "tsx src/smoke/phase1.ts",
     "smoke:phase2": "tsx src/smoke/phase1.ts",
@@ -33,7 +36,7 @@
     "smoke:phase4-routes": "tsx src/smoke/phase4-routes.ts",
     "smoke:phase5-scale": "tsx src/smoke/phase5-scale.ts",
     "smoke:phase6-horizontal": "tsx src/smoke/phase6-horizontal.ts",
-    "smoke:platform-admin": "tsx src/smoke/platform-admin.ts",
+    "smoke:platform-admin": "tsx src/smoke/spec-revision.ts",
     "smoke:people-directory": "tsx src/smoke/people-directory.ts",
     "smoke:incidents": "tsx src/smoke/incidents-and-returns.ts",
     "smoke:tenant-settings": "tsx src/smoke/tenant-settings.ts",
@@ -55,6 +58,7 @@
     "fastify": "5.12.1",
     "fastify-raw-body": "^6.0.1",
     "jose": "6.2.9",
+    "nodemailer": "^9.1.1",
     "pg": "8.23.0",
     "prom-client": "^15.1.3",
     "redis": "^6.2.1",
@@ -65,6 +69,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "^24.0.0",
+    "@types/nodemailer": "^8.0.1",
     "@types/pg": "^8.15.0",
     "@types/web-push": "^3.6.4",
     "eslint": "10.0.2",

@@ -197,6 +197,8 @@ export async function courierRoutes(app: FastifyInstance, database: Database, en
       );
       const target = targetResult.rows[0];
       if (!target) throw notFound('Entregador não encontrado nesta empresa.');
+      const manageable=await client.query<{allowed:boolean}>('SELECT rastreia.can_manage_scoped_person($1) AS allowed',[target.user_id]);
+      if(!manageable.rows[0]?.allowed)throw conflict('O entregador possui vínculos fora da unidade selecionada. Solicite ao Master.');
       const before = { status: target.status, storeIds: target.store_ids };
       await client.query(
         `UPDATE tenant_users SET status = $3, updated_by = $4

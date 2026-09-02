@@ -1,5 +1,3 @@
-import argon2 from 'argon2';
-import { randomUUID } from 'node:crypto';
 import { setTenantContext, withPlatformTransaction, type Database } from '../../database/pool.js';
 import { conflict, notFound } from '../../shared/errors.js';
 import type { PlatformAuthContext } from '../auth/auth.types.js';
@@ -8,11 +6,6 @@ import { withPlatformIdempotency } from './platform-idempotency.js';
 type TenantStatus = 'ACTIVE' | 'SUSPENDED' | 'ARCHIVED';
 
 interface ListInput { search?: string | undefined; status?: TenantStatus | undefined; limit: number; offset: number }
-interface CreateTenantInput {
-  slug: string; name: string; legalName?: string | null | undefined; timezone: string;
-  contactPhone?: string | null | undefined;
-  manager: { name: string; email: string; password: string };
-}
 
 async function writePlatformAudit(client: import('pg').PoolClient, input: {
   actorId: string; action: string; entityId: string; targetTenantId: string;
@@ -53,49 +46,6 @@ export async function listPlatformTenants(database: Database, auth: PlatformAuth
     return { data: result.rows.map(({ totalCount: _totalCount, ...tenant }) => tenant),
       total: result.rows[0]?.totalCount ?? 0, limit: input.limit, offset: input.offset };
   });
-}
-
-export async function createPlatformTenant(
-  database: Database,
-  auth: PlatformAuthContext,
-  idempotencyKey: string,
-  input: CreateTenantInput,
-  ip?: string,
-) {
-  const passwordHash = await argon2.hash(input.manager.password, {
-    type: argon2.argon2id, memoryCost: 19_456, timeCost: 2, parallelism: 1,
-  });
-  const idempotencyPayload = {
-    ...input,
-    manager: { name: input.manager.name, email: input.manager.email },
-  };
-  return withPlatformTransaction(database, auth, (client) => withPlatformIdempotency(
-    client, auth, idempotencyKey, 'platform.tenant.create', idempotencyPayload, async () => {
-    const tenantId = randomUUID();
-    const managerId = randomUUID();
-    const tenantResult = await client.query(
-      `INSERT INTO tenants (id, slug, name, legal_name, timezone, contact_phone)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, slug, name, legal_name AS "legalName", status, timezone,
-                 contact_phone AS "contactPhone", created_at AS "createdAt", updated_at AS "updatedAt"`,
-      [tenantId, input.slug, input.name, input.legalName ?? null, input.timezone, input.contactPhone ?? null],
-    );
-    await setTenantContext(client, { tenantId, userId: managerId });
-    await client.query(
-      'INSERT INTO users (id, name, email, password_hash) VALUES ($1, $2, $3, $4)',
-      [managerId, input.manager.name, input.manager.email, passwordHash],
-    );
-    await client.query(
-      `INSERT INTO tenant_users (tenant_id, user_id, role, created_by, updated_by)
-       VALUES ($1, $2, 'TENANT_MANAGER', $2, $2)`, [tenantId, managerId],
-    );
-    const tenant = tenantResult.rows[0];
-    await writePlatformAudit(client, {
-      actorId: auth.userId, action: 'platform.tenant.created', entityId: tenantId,
-      targetTenantId: tenantId, afterData: { slug: tenant.slug, name: tenant.name, status: tenant.status }, ip,
-    });
-    return { body: tenant, statusCode: 201 };
-  }));
 }
 
 export async function changePlatformTenantStatus(

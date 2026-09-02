@@ -2,10 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
-import { writeAudit } from '../../shared/audit.js';
-import { authenticate, requireRoles } from '../auth/auth.guard.js';
+import { forbidden } from '../../shared/errors.js';
+import { authenticate } from '../auth/auth.guard.js';
 
-const storeSchema = z.object({
+export const storeSchema = z.object({
   name: z.string().trim().min(2).max(160),
   externalReference: z.string().trim().max(100).nullable().optional(),
   addressLine: z.string().trim().min(3).max(240),
@@ -40,34 +40,7 @@ export async function storeRoutes(app: FastifyInstance, database: Database, env:
     }),
   );
 
-  app.post('/stores', { preHandler: [auth, requireRoles('TENANT_MANAGER')] }, async (request, reply) => {
-    const input = storeSchema.parse(request.body);
-    const store = await withTenantTransaction(database, request.auth, async (client) => {
-      const result = await client.query(
-        `INSERT INTO stores
-           (tenant_id, name, external_reference, address_line, address_number, complement,
-            neighborhood, city, state, postal_code, longitude, latitude, address_confidence,
-            contact_phone, created_by, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $15)
-         RETURNING id, name, city, state, status, latitude, longitude, created_at AS "createdAt"`,
-        [request.auth.tenantId, input.name, input.externalReference ?? null, input.addressLine,
-          input.addressNumber ?? null, input.complement ?? null, input.neighborhood ?? null,
-          input.city, input.state, input.postalCode ?? null, input.longitude, input.latitude,
-          input.addressConfidence ?? null, input.contactPhone ?? null, request.auth.userId],
-      );
-      const created = result.rows[0];
-      await writeAudit(client, {
-        tenantId: request.auth.tenantId,
-        actorUserId: request.auth.userId,
-        action: 'store.created',
-        entityType: 'store',
-        entityId: created.id as string,
-        afterData: created,
-        ip: request.ip,
-      });
-      return created;
-    });
-    return reply.status(201).send(store);
+  app.post('/stores', { preHandler: auth }, async () => {
+    throw forbidden('Somente o Master pode cadastrar unidades pelo painel administrativo.');
   });
 }

@@ -123,6 +123,9 @@ async function openNextWave(client: PoolClient, search: SearchRow, qualified = f
          AND availability.courier_profile_id = profile.id AND availability.status = 'AVAILABLE'
        WHERE search.id = $2 AND (availability.available_until IS NULL OR availability.available_until > now())
          AND availability.accuracy <= 100
+         AND availability.updated_at>now()-interval '5 minutes'
+         AND ${q}unit_accepts_new_operations(store.id)
+         AND ${q}courier_matches_preferences(profile.id,store.id,'FIXED_SHIFT',slot.starts_at,slot.ends_at)
          AND (slot.requirements->>'vehicleType' IS NULL OR slot.requirements->>'vehicleType' = profile.vehicle_type::text)
          AND NOT EXISTS (
            SELECT 1 FROM ${q}shift_positions occupied

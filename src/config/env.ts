@@ -8,6 +8,18 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.string().url(),
   APP_ORIGINS: z.string().default('http://localhost:8100'),
+  EMAIL_ACTION_BASE_URL: z.string().url().default('http://localhost:8100'),
+  SMTP_HOST: optionalSecret,
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
+  SMTP_SECURE: z.string().default('false').transform((value) => value === 'true'),
+  SMTP_USER: optionalSecret,
+  SMTP_PASSWORD: optionalSecret,
+  SMTP_FROM: optionalSecret,
+  BILLING_ENABLED: z.string().default('false').transform((value) => value === 'true'),
+  PUBLIC_COURIER_REGISTRATION_ENABLED: z.string().default('false').transform((value) => value === 'true'),
+  TERMS_URL: optionalSecret,
+  PRIVACY_URL: optionalSecret,
+  LEGAL_DOCUMENTS_VERSION: z.string().trim().min(1).default('2026-09'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   DEPLOYMENT_ENVIRONMENT: z.string().trim().min(1).default('local'),
   RELEASE_VERSION: z.string().trim().min(1).default('dev'),
@@ -97,6 +109,9 @@ const envSchema = z.object({
     issue('RELEASE_COMMIT', 'Informe o hash do commit implantado.');
   }
   if (!env.COOKIE_SECURE) issue('COOKIE_SECURE', 'Cookies seguros são obrigatórios em produção.');
+  if ((env.SMTP_HOST || env.PUBLIC_COURIER_REGISTRATION_ENABLED) && !env.EMAIL_ACTION_BASE_URL.startsWith('https://')) {
+    issue('EMAIL_ACTION_BASE_URL', 'Links de convite e recuperação devem usar a URL HTTPS do frontend.');
+  }
   if (env.LOG_LEVEL === 'debug' || env.LOG_LEVEL === 'trace') {
     issue('LOG_LEVEL', 'Debug/trace não devem permanecer habilitados em produção.');
   }

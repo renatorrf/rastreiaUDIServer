@@ -11,6 +11,7 @@ export type Database = InstanceType<typeof Pool>;
 export interface TenantContext {
   tenantId: string;
   userId: string;
+  storeIds?: string[];
 }
 
 export function createPool(env: AppEnv): Database {
@@ -61,8 +62,9 @@ export async function setTenantContext(client: PoolClient, context: TenantContex
   await client.query(
     `SELECT
        set_config('app.tenant_id', $1, true),
-       set_config('app.user_id', $2, true)`,
-    [context.tenantId, context.userId],
+       set_config('app.user_id', $2, true),
+       set_config('app.store_ids', $3, true)`,
+    [context.tenantId, context.userId, context.storeIds ? JSON.stringify(context.storeIds) : ''],
   );
 }
 

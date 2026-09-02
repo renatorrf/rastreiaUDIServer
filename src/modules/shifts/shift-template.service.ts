@@ -238,7 +238,7 @@ export async function materializeActiveShiftTemplates(database: Database, horizo
               template.auto_approve_substitutes, template.confirmation_lead_minutes,
               template.withdrawal_notice_minutes, tenant.timezone
        FROM rastreia.shift_templates template JOIN rastreia.tenants tenant ON tenant.id = template.tenant_id
-       WHERE template.active ORDER BY template.updated_at LIMIT 100`,
+       WHERE template.active AND rastreia.unit_accepts_new_operations(template.store_id) ORDER BY template.updated_at LIMIT 100`,
     );
     const from = new Date().toISOString().slice(0, 10);
     const to = new Date(Date.now() + horizonDays * 86_400_000).toISOString().slice(0, 10);
