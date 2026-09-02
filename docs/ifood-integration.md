@@ -43,6 +43,8 @@ npm run start:local
 
 Entre como gestor, escolha a unidade e abra **Configurações → Integrações** (também disponível no menu). Cadastre um UUID de merchant exclusivamente sintético em mock, habilite a conexão e teste. Use “Simular pedido iFood”. Aguarde o worker; confira o horário de sua última execução na tela. A API sozinha não processa a fila.
 
+Para o ambiente hospedado, consulte [Worker Pool separado no Cloud Run](cloud-run-worker.md). Há um modelo de implantação pausada, instruções de ativação e verificação do heartbeat; nenhum recurso de nuvem foi criado durante sua preparação.
+
 Confirme o pedido, aguarde o evento de confirmação e libere a entrega quando configurado como manual. Em Entregas, atribua um entregador vinculado. O entregador usa coleta/início/conclusão normais. **Aceite e coleta não enviam dispatch; somente a saída efetiva para entrega envia.** Rotas em lote seguem a mesma regra, uma vez por pedido.
 
 Para testar sem deixar cadastros sintéticos permanentes: `npm run smoke:ifood`. A opção `-- --ui` sobe uma API temporária em 3000, mostra credenciais sintéticas no terminal e mantém uma transação aberta até Ctrl+C. Não execute migrations durante esse modo: a transação pode bloquear DDL. Esse modo é para validação local, não hospedagem.

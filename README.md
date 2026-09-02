@@ -22,6 +22,10 @@ npm run dev:worker
 
 Troque todas as credenciais e segredos do `.env`. O seed é idempotente pelo slug do tenant e cria somente o primeiro gestor local.
 
+## Worker no Cloud Run
+
+A API e o worker são processos separados. Para corrigir o aviso “Worker: Ainda não executado” no ambiente hospedado, siga [o guia de implantação do Worker Pool](docs/cloud-run-worker.md), com [modelo YAML](deploy/cloud-run/worker-pool.example.yaml). A configuração inicial é pausada; a ativação é explícita e pode consumir filas reais. O guia não altera a URL da API nem o webhook.
+
 ## Scripts
 
 - `npm run build`: compila TypeScript estrito.

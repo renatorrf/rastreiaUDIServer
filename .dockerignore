@@ -9,3 +9,4 @@ coverage
 *.keystore
 *.p12
 *.mobileprovision
+deploy/cloud-run/*.local.yaml

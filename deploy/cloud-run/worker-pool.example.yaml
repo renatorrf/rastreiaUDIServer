@@ -1,0 +1,93 @@
+# Modelo para CRIAR um worker pool separado. Leia docs/cloud-run-worker.md.
+# Copie para worker-pool.local.yaml (ignorado pelo Git) e preencha __...__.
+# Nao coloque senhas aqui: use referencias ao Secret Manager no mesmo projeto.
+# A configuracao inicial permanece PAUSADA ate a revisao e ativacao explicita.
+apiVersion: run.googleapis.com/v1
+kind: WorkerPool
+metadata:
+  name: rastreiaudiworker
+  annotations:
+    run.googleapis.com/manualInstanceCount: '0'
+spec:
+  template:
+    spec:
+      serviceAccountName: '__WORKER_SERVICE_ACCOUNT_EMAIL__'
+      containers:
+        - name: worker
+          image: '__BACKEND_IMAGE_WITH_SHA256_DIGEST__'
+          command: ['node']
+          args: ['dist/workers/notification-worker.js']
+          # Preserve o WORKDIR da imagem. Nao adicione porta ou probe HTTP da API.
+          resources:
+            limits:
+              cpu: '1'
+              memory: '512Mi'
+          env:
+            # Mesmos valores da API. Hoje o ambiente informado e development,
+            # com iFood sandbox/webhook. Nao use esse perfil em producao.
+            - name: NODE_ENV
+              value: '__API_NODE_ENV__'
+            - name: DEPLOYMENT_ENVIRONMENT
+              value: '__API_DEPLOYMENT_ENVIRONMENT__'
+            - name: IFOOD_ENABLED
+              value: 'true'
+            - name: IFOOD_MODE
+              value: '__API_IFOOD_MODE__'
+            - name: IFOOD_EVENTS_MODE
+              value: '__API_IFOOD_EVENTS_MODE__'
+            - name: IFOOD_BASE_URL
+              value: 'https://merchant-api.ifood.com.br'
+            - name: IFOOD_POLLING_INTERVAL_MS
+              value: '30000'
+            - name: NOTIFICATION_WORKER_INTERVAL_MS
+              value: '5000'
+            - name: LOG_LEVEL
+              value: 'info'
+            - name: COMMUNICATIONS_MOCK
+              value: '__API_COMMUNICATIONS_MOCK__'
+            - name: BILLING_ENABLED
+              value: '__API_BILLING_ENABLED__'
+            - name: RETENTION_ENABLED
+              value: '__API_RETENTION_ENABLED__'
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: '__DATABASE_URL_SECRET__'
+                  key: '__DATABASE_URL_VERSION__'
+            # A validacao compartilhada exige esses segredos tambem no worker.
+            - name: JWT_ACCESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: '__JWT_ACCESS_SECRET__'
+                  key: '__JWT_ACCESS_VERSION__'
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: '__JWT_REFRESH_SECRET__'
+                  key: '__JWT_REFRESH_VERSION__'
+            - name: TRACKING_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: '__TRACKING_PEPPER_SECRET__'
+                  key: '__TRACKING_PEPPER_VERSION__'
+            # Se a API de desenvolvimento usa MESSAGE_PAYLOAD_SECRET vazio,
+            # remova este item inteiro para preservar o fallback para o pepper.
+            # Nunca gere outra chave: os payloads existentes ficariam ilegíveis.
+            - name: MESSAGE_PAYLOAD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: '__MESSAGE_PAYLOAD_SECRET__'
+                  key: '__MESSAGE_PAYLOAD_VERSION__'
+            - name: IFOOD_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: '__IFOOD_CLIENT_ID_SECRET__'
+                  key: '__IFOOD_CLIENT_ID_VERSION__'
+            - name: IFOOD_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: '__IFOOD_CLIENT_SECRET__'
+                  key: '__IFOOD_CLIENT_SECRET_VERSION__'
+            # ANTES DE ATIVAR: acrescente a configuracao restante da API usada
+            # por Redis, SMTP, push, WhatsApp/SMS, URLs publicas, storage,
+            # retencao e producao. Consulte a lista completa no runbook.
