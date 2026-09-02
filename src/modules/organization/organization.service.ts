@@ -44,9 +44,9 @@ export async function provisionOrganization(client:PoolClient,env:AppEnv,auth:Pl
     for(const unit of draft.units) {
       const s=unit.store;
       const store=(await client.query<{id:string}>(`INSERT INTO stores(tenant_id,company_id,name,address_line,address_number,complement,neighborhood,
-        city,state,postal_code,latitude,longitude,contact_phone,plan_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        city,state,postal_code,latitude,longitude,contact_phone,plan_code,address_confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
         [tenant.id,company.id,s.name,s.addressLine,s.addressNumber??null,s.complement??null,s.neighborhood??null,s.city,s.state,
-          s.postalCode??null,s.latitude,s.longitude,s.contactPhone??null,unit.billing.planCode])).rows[0]!;
+          s.postalCode??null,s.latitude,s.longitude,s.contactPhone??null,unit.billing.planCode,s.addressConfidence??null])).rows[0]!;
       await saveBillingProfile(client,env,auth,store.id,unit.billing,'Faturamento definido no provisionamento do grupo.');
       targets.set(unit.key,{companyId:company.id,storeId:store.id});
     }

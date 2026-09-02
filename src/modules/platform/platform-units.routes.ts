@@ -115,9 +115,9 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
         if(new Date(before.updated_at).getTime()!==new Date(input.updatedAt).getTime())throw conflict('Unidade alterada em outra sessão. Recarregue.');
         const s=input.store;
         await client.query(`UPDATE stores SET name=$2,address_line=$3,address_number=$4,complement=$5,neighborhood=$6,city=$7,
-          state=$8,postal_code=$9,latitude=$10,longitude=$11,contact_phone=$12,plan_code=$13 WHERE id=$1`,
+          state=$8,postal_code=$9,latitude=$10,longitude=$11,contact_phone=$12,plan_code=$13,address_confidence=$14 WHERE id=$1`,
           [id,s.name,s.addressLine,s.addressNumber??null,s.complement??null,s.neighborhood??null,s.city,s.state,s.postalCode??null,
-            s.latitude,s.longitude,s.contactPhone??null,input.billing.planCode]);
+            s.latitude,s.longitude,s.contactPhone??null,input.billing.planCode,s.addressConfidence??null]);
         await saveBillingProfile(client,env,request.platformAuth,id,input.billing,input.reason,input.billingVersion);
         await masterAudit(client,request.platformAuth,{action:'store.updated',entityType:'store',entityId:id,tenantId:before.tenant_id,
           before,after:s,reason:input.reason});return {statusCode:200,body:{id}};

@@ -41,6 +41,8 @@ try {
   };
   const master=(await call('POST','/platform/auth/login',{email:`${prefix}-master@example.test`,password})).body.accessToken as string;
   check(master,'Master authenticated');
+  check((await call('GET','/platform/geo/autocomplete?q=Avenida')).status===401,'Master address search rejects anonymous requests');
+  check((await call('GET','/platform/geo/autocomplete?q=Av',undefined,master)).status===400,'Master address search validates query before calling provider');
   const emptyGroup=await call('POST','/platform/groups',{name:'Grupo vazio',slug:prefix+'-empty'},master);
   check(emptyGroup.status===200,'Master can create group before companies');
   const emptyReport=await call('GET',`/platform/operations/summary?tenantId=${emptyGroup.body.id}`,undefined,master);
@@ -48,7 +50,7 @@ try {
   const billing={legalName:'Empresa teste',tradeName:'Unidade teste',taxId:'52998224725',financialEmail:'finance@example.test',financialContact:'Responsável teste',
     billingAddress:{addressLine:'Rua de teste',number:'1',neighborhood:'Centro',city:'Teste',state:'MG',postalCode:'38400000'},
     planCode:'test',recurringAmount:'100.00',dueDay:10,startsOn:'2026-01-01',enabled:false};
-  const store={name:'Unidade Um',addressLine:'Rua de teste',addressNumber:'1',neighborhood:'Centro',city:'Teste',state:'MG',postalCode:'38400000',latitude:-18.9,longitude:-48.2};
+  const store={name:'Unidade Um',addressLine:'Rua de teste',addressNumber:'1',neighborhood:'Centro',city:'Teste',state:'MG',postalCode:'38400000',latitude:-18.9,longitude:-48.2,addressConfidence:0.95};
   const input={tenant:{name:'Grupo teste',slug:prefix},company:{name:'Empresa teste',legalName:'Empresa teste',taxId:'11222333000181'},store,manager:{name:'Gestor teste',email:`${prefix}-manager@example.test`},billing};
   const key=randomUUID();const first=await call('POST','/platform/stores',input,master,key);
   assert.equal(first.status,201,JSON.stringify(first.body));checks++;
@@ -56,6 +58,13 @@ try {
   const replay=await call('POST','/platform/stores',input,master,key);check(replay.body.id===unit.id,'Provisioning replay');
   const conflictReplay=await call('POST','/platform/stores',{...input,store:{...store,name:'Outro nome'}},master,key);
   check(conflictReplay.status===409,'Idempotency key cannot be reused for a different provisioning payload');
+  check(Number(first.body.address_confidence)===0.95,'Standalone unit stores address confidence');
+  const unitProfile=await call('GET',`/platform/stores/${unit.id}/billing`,undefined,master);
+  const addressEdit=await call('PATCH',`/platform/stores/${unit.id}`,{store:{...store,addressNumber:'2662',addressConfidence:0.88},billing,
+    billingVersion:unitProfile.body.version,updatedAt:first.body.updated_at,reason:'Conferência de endereço geocodificado.'},master);
+  check(addressEdit.status===200,'Master can update geocoded address');
+  const savedAddress=(await database.query<{address_number:string;address_confidence:number}>('SELECT address_number,address_confidence FROM rastreia.stores WHERE id=$1',[unit.id])).rows[0]!;
+  check(savedAddress.address_number==='2662'&&Number(savedAddress.address_confidence)===0.88,'Edited house number and confidence persist together');
   const emailToken=async(userId:string,kind:string)=>{
     const jobs=await database.query<{encrypted_payload:string}>(`SELECT job.encrypted_payload FROM rastreia.email_jobs job
       JOIN rastreia.identity_actions action ON job.dedup_key='identity:'||action.id::text
@@ -82,6 +91,7 @@ try {
   const provision=await call('POST','/platform/organizations/provision',hierarchyDraft,master);
   assert.equal(provision.status,200,JSON.stringify(provision.body));checks++;
   const organization=provision.body as {id:string;manager:{id:string};targets:Record<string,{companyId:string;storeId:string}>};
+  check(Number((await database.query<{address_confidence:number}>('SELECT address_confidence FROM rastreia.stores WHERE id=$1',[organization.targets['store-a']!.storeId])).rows[0]?.address_confidence)===0.95,'Full organization provisioning preserves geocoding confidence');
   check((await call('POST','/auth/accept-invite',{token:await emailToken(organization.manager.id,'INVITE'),password})).status===200,'Hierarchical invitation accepted');
   const scopedIdentity=(await call('POST','/auth/sign-in',{email:hierarchyDraft.manager.email,password})).body;
   check(scopedIdentity.units.length===1&&scopedIdentity.units[0].id===organization.targets['store-a']!.storeId,'Company grant does not expose sibling company');
@@ -119,6 +129,7 @@ try {
   const entered=await call('POST','/auth/enter-unit',{storeId:unit.id},identity.accessToken as string);
   assert.equal(entered.status,200,JSON.stringify(entered.body));checks++;
   const manager=entered.body.accessToken as string;
+  check((await call('GET','/platform/geo/autocomplete?q=Avenida',undefined,manager)).status===401,'Operational token cannot use Master address search');
   const visible=await call('GET','/stores',undefined,manager);
   assert.equal(visible.status,200,JSON.stringify(visible.body));check(visible.body.data.length===1&&visible.body.data[0].id===unit.id,'Manager isolated to selected unit');
   check((await call('POST','/stores',store,manager)).status===403,'Manager cannot provision stores');
