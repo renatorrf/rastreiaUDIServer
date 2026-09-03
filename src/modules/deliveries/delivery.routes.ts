@@ -37,6 +37,8 @@ const createDeliverySchema = z.object({
 const assignSchema = z.object({ courierId: z.uuid() });
 const reasonSchema = z.object({ reason: z.string().trim().min(3).max(500) });
 const listSchema = z.object({
+  view: z.enum(['all','active','history']).default('all'),
+  offset: z.coerce.number().int().min(0).max(100000).default(0),
   status: z.enum(deliveryStatuses).optional(),
   storeId: z.uuid().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),

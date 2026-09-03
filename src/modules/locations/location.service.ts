@@ -10,11 +10,13 @@ import type {
 } from './location.types.js';
 import type { LocationStateStore } from './location-state.store.js';
 import { shouldSampleLocation, validateLocationPoint } from './location-validation.js';
+import { requireCourierCheckin } from '../workdays/workday.service.js';
 
 interface DeliveryScope {
   id: string;
   storeId: string;
   status: DeliveryStatus;
+  routeId: string | null;
 }
 
 interface ProcessResult {
@@ -54,8 +56,8 @@ async function deliveryScope(
   courierId: string,
   deliveryId: string,
 ): Promise<DeliveryScope> {
-  const result = await client.query<{ id: string; store_id: string; status: DeliveryStatus }>(
-    `SELECT id, store_id, status
+  const result = await client.query<{ id: string; store_id: string; status: DeliveryStatus; route_id: string | null }>(
+    `SELECT id, store_id, status, route_id
      FROM deliveries
      WHERE id = $1 AND tenant_id = $2 AND courier_profile_id = $3`,
     [deliveryId, auth.tenantId, courierId],
@@ -64,7 +66,8 @@ async function deliveryScope(
   if (!delivery || !activeLocationStatuses.includes(delivery.status)) {
     throw new AppError(422, 'LOCATION_NOT_AUTHORIZED', 'A entrega não está em um estado que permita localização.');
   }
-  return { id: delivery.id, storeId: delivery.store_id, status: delivery.status };
+  await requireCourierCheckin(client,auth,delivery.store_id);
+  return { id: delivery.id, storeId: delivery.store_id, status: delivery.status, routeId: delivery.route_id };
 }
 
 async function lastLocation(client: PoolClient, auth: AuthContext, courierId: string): Promise<StoredLocation | undefined> {
@@ -184,7 +187,7 @@ export async function processLocationPoints(
       tenantId: auth.tenantId, storeId: delivery.storeId, deliveryId: delivery.id, courierId,
       latitude: point.latitude, longitude: point.longitude, accuracy: point.accuracy,
       speed: point.speed ?? null, heading: point.heading ?? null, capturedAt: point.capturedAt,
-      publicVisible: publicLocationStatuses.includes(delivery.status),
+      publicVisible: publicLocationStatuses.includes(delivery.status) && (!delivery.routeId || delivery.status === 'NEXT_STOP'),
     });
   }
   return { results, updates };
@@ -226,7 +229,7 @@ export async function ingestLocations(
 interface ActiveLocationRow {
   courierId: string;
   courierName: string;
-  deliveryId: string;
+  deliveryId: string | null;
   deliveryReference: string | null;
   storeId: string;
   storeName: string;
@@ -266,11 +269,25 @@ export async function listActiveLocations(
        ORDER BY location.captured_at DESC`,
       [auth.role, auth.storeIds, auth.userId],
     );
-    const cached = await state.getCouriers(auth.tenantId, result.rows.map((row) => row.courierId));
-    const data = result.rows.map((row) => {
+    const workdays = await client.query<ActiveLocationRow>(`SELECT day.courier_profile_id AS "courierId",person.name AS "courierName",
+      NULL::uuid AS "deliveryId",NULL::text AS "deliveryReference",day.store_id AS "storeId",store.name AS "storeName",
+      day.latitude,day.longitude,day.accuracy,day.speed,day.heading,day.captured_at AS "capturedAt",
+      day.captured_at<now()-interval '2 minutes' AS stale
+      FROM courier_workdays day JOIN courier_profiles profile ON profile.id=day.courier_profile_id
+      JOIN users person ON person.id=profile.user_id JOIN stores store ON store.id=day.store_id
+      WHERE day.tenant_id=$1 AND day.status='CHECKED_IN' AND day.ends_at>now() AND day.captured_at IS NOT NULL
+        AND ($2::text<>'COURIER' OR profile.user_id=$3)`,[auth.tenantId,auth.role,auth.userId]);
+    const latest = new Map<string,ActiveLocationRow>();
+    for (const row of [...result.rows,...workdays.rows]) {
+      const prior = latest.get(row.courierId);
+      if (!prior || row.capturedAt > prior.capturedAt) latest.set(row.courierId,row);
+    }
+    const rows = [...latest.values()];
+    const cached = await state.getCouriers(auth.tenantId, rows.map((row) => row.courierId));
+    const data = rows.map((row) => {
       const live = cached.get(row.courierId);
       if (!live || live.deliveryId !== row.deliveryId || live.capturedAt <= row.capturedAt) {
-        return { ...row, online: live?.online ?? false };
+        return { ...row, online: row.deliveryId === null ? !row.stale : live?.online ?? false };
       }
       return {
         ...row,

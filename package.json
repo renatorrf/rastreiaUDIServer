@@ -71,6 +71,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@eslint/js": "10.0.1",
     "@types/node": "^24.0.0",
     "@types/nodemailer": "^8.0.1",

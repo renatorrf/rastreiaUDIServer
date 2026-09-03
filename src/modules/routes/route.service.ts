@@ -1,4 +1,6 @@
 import type { PoolClient } from 'pg';
+import { requireCourierCheckin } from '../workdays/workday.service.js';
+import { efficientOrder } from './route-order.js';
 import type { Database } from '../../database/pool.js';
 import { withTenantTransaction } from '../../database/pool.js';
 import { writeAudit } from '../../shared/audit.js';
@@ -136,7 +138,7 @@ async function refreshEtas(client: PoolClient, routeId: string, baseAt = new Dat
 export async function listRoutes(database: Database, auth: AuthContext): Promise<{ data: DeliveryRouteView[] }> {
   return withTenantTransaction(database, auth, async (client) => {
     const result = await client.query<RouteBase>(
-      `${routeSelect} WHERE 1 = 1 ${routeListAccess}
+      `${routeSelect} WHERE ($1::text<>'COURIER' OR route.status IN ('DRAFT','ACTIVE')) ${routeListAccess}
        ORDER BY CASE route.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
          route.planned_start_at NULLS LAST, route.created_at DESC`,
       [auth.role, auth.storeIds, auth.userId],
@@ -175,10 +177,12 @@ export async function getRouteNavigation(
     if (!destination) throw conflict('A rota não possui uma próxima parada pendente.');
 
     const current = await client.query<{ latitude: number; longitude: number; capturedAt: Date }>(
-      `SELECT latitude, longitude, captured_at AS "capturedAt"
-       FROM courier_last_locations
-       WHERE tenant_id = $1 AND courier_profile_id = $2`,
-      [auth.tenantId, route.courierId],
+      `SELECT latitude, longitude, captured_at AS "capturedAt" FROM (
+         SELECT latitude,longitude,captured_at FROM courier_last_locations WHERE tenant_id=$1 AND courier_profile_id=$2 AND store_id=$3
+         UNION ALL SELECT latitude,longitude,captured_at FROM courier_workdays WHERE tenant_id=$1 AND courier_profile_id=$2 AND store_id=$3
+           AND status='CHECKED_IN' AND ends_at>now()
+       ) positions WHERE captured_at>now()-interval '2 minutes' ORDER BY captured_at DESC LIMIT 1`,
+      [auth.tenantId, route.courierId,route.storeId],
     );
     const previous = current.rows[0] ? undefined : (await client.query<{ latitude: number; longitude: number }>(
       `SELECT CASE WHEN stop.stop_type = 'PICKUP' THEN store.latitude ELSE delivery.latitude END AS latitude,
@@ -333,6 +337,7 @@ export async function startRoute(
     client, auth, key, `route.start:${routeId}`, {}, async () => {
       const route = await loadRoute(client, auth, routeId, true);
       if (route.status !== 'DRAFT') throw conflict('A rota não está pronta para iniciar.');
+      await requireCourierCheckin(client,auth,route.storeId);
       if (route.stops.some((stop) => stop.stopType === 'PICKUP' && stop.status !== 'COMPLETED')) {
         throw conflict('Conclua todas as coletas antes de iniciar os destinos.');
       }
@@ -387,6 +392,7 @@ export async function completeRouteStop(
       const current = delivery.rows[0];
       if (!current) throw notFound('Entrega não encontrada.');
       if (stop.stopType === 'PICKUP') {
+        await requireCourierCheckin(client,auth,route.storeId);
         if (route.status !== 'DRAFT' || current.status !== 'AWAITING_PICKUP') throw conflict('A coleta não está disponível.');
         await client.query(`UPDATE deliveries SET status = 'COLLECTED', collected_at = now(), version = version + 1,
           updated_by = $2 WHERE id = $1`, [stop.deliveryId, auth.userId]);
@@ -448,9 +454,9 @@ export async function optimizeRoute(
   return withTenantTransaction(database, auth, (client) => withIdempotency(
     client, auth, key, `route.optimize:${routeId}`, {}, async () => {
       const route = await loadRoute(client, auth, routeId, true);
-      if (!canUseStore(auth, route.storeId)) throw forbidden('Somente a gestão pode planejar a sequência.');
-      if (route.status !== 'DRAFT' || route.stops.some((stop) => stop.status !== 'PENDING')) {
-        throw conflict('A sugestão só pode ser calculada antes da primeira coleta.');
+      if (auth.role !== 'COURIER' && !canUseStore(auth, route.storeId)) throw forbidden('Sem acesso ao planejamento desta rota.');
+      if (route.status !== 'DRAFT' || route.stops.some((stop) => stop.stopType === 'DELIVERY' && stop.status !== 'PENDING')) {
+        throw conflict('A sugestão só pode ser calculada antes de iniciar os destinos.');
       }
       const deliveryStops = route.stops.filter((stop) => stop.stopType === 'DELIVERY');
       if (deliveryStops.length > 30) throw conflict('A otimização aceita até 30 destinos por lote.');
@@ -472,12 +478,7 @@ export async function optimizeRoute(
       catch { matrix = await new HaversineRouteMatrixProvider().calculate(locations, mode); }
       const indexByStop = new Map(deliveryStops.map((stop, index) => [stop.id, index + 1]));
       const currentIndices = deliveryStops.map((stop) => indexByStop.get(stop.id)!);
-      const unvisited = new Set(currentIndices); const suggestedIndices: number[] = []; let cursor = 0;
-      while (unvisited.size) {
-        const next = [...unvisited].sort((left, right) =>
-          matrix.cells[cursor]![left]!.durationS - matrix.cells[cursor]![right]!.durationS)[0]!;
-        suggestedIndices.push(next); unvisited.delete(next); cursor = next;
-      }
+      const suggestedIndices = efficientOrder(matrix.cells,currentIndices);
       const stopByIndex = new Map(deliveryStops.map((stop, index) => [index + 1, stop]));
       const suggestedDeliveries = suggestedIndices.map((index) => stopByIndex.get(index)!);
       const pickups = route.stops.filter((stop) => stop.stopType === 'PICKUP');
@@ -515,9 +516,9 @@ export async function applyRouteSuggestion(
   return withTenantTransaction(database, auth, (client) => withIdempotency(
     client, auth, key, `route.suggestion.apply:${routeId}`, {}, async () => {
       const route = await loadRoute(client, auth, routeId, true);
-      if (!canUseStore(auth, route.storeId)) throw forbidden('Somente a gestão pode aplicar a sugestão.');
-      if (route.status !== 'DRAFT' || route.stops.some((stop) => stop.status !== 'PENDING')) {
-        throw conflict('A sugestão só pode ser aplicada antes da primeira coleta.');
+      if (auth.role !== 'COURIER' && !canUseStore(auth, route.storeId)) throw forbidden('Sem acesso ao planejamento desta rota.');
+      if (route.status !== 'DRAFT' || route.stops.some((stop) => stop.stopType === 'DELIVERY' && stop.status !== 'PENDING')) {
+        throw conflict('A sugestão só pode ser aplicada antes de iniciar os destinos.');
       }
       const planning = await client.query<{ suggested_stop_ids: string[] | null; suggested_legs: Array<{
         stopId: string; distanceM: number; durationS: number }> | null; suggested_total_distance_m: number | null;

@@ -83,11 +83,11 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
           throw conflict('Empresa inativa ou não pertencente ao grupo selecionado.');
         const s=input.store;
         const store=(await client.query<{id:string;name:string}>(`INSERT INTO stores(tenant_id,name,external_reference,address_line,address_number,complement,
-          neighborhood,city,state,postal_code,latitude,longitude,address_confidence,contact_phone,plan_code,operational_limits,operational_settings,company_id)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18) RETURNING *`,
+          neighborhood,city,state,postal_code,latitude,longitude,address_confidence,contact_phone,plan_code,operational_limits,operational_settings,company_id,opening_time,closing_time,operating_weekdays)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18,$19,$20,$21) RETURNING *`,
         [tenantId,s.name,s.externalReference??null,s.addressLine,s.addressNumber??null,s.complement??null,s.neighborhood??null,s.city,s.state,
           s.postalCode??null,s.latitude,s.longitude,s.addressConfidence??null,s.contactPhone??null,input.billing.planCode,
-          JSON.stringify(input.limits),JSON.stringify(input.settings),companyId])).rows[0]!;
+          JSON.stringify(input.limits),JSON.stringify(input.settings),companyId,s.openingTime??null,s.closingTime??null,s.operatingWeekdays])).rows[0]!;
         const manager=await inviteManager(client,env,request.platformAuth,tenant.id,store.id,input.manager);
         await saveBillingProfile(client,env,request.platformAuth,store.id,input.billing,'Dados de faturamento no provisionamento.');
         await masterAudit(client,request.platformAuth,{action:'store.provisioned',entityType:'store',entityId:store.id,tenantId:tenant.id,
@@ -115,9 +115,13 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
         if(new Date(before.updated_at).getTime()!==new Date(input.updatedAt).getTime())throw conflict('Unidade alterada em outra sessão. Recarregue.');
         const s=input.store;
         await client.query(`UPDATE stores SET name=$2,address_line=$3,address_number=$4,complement=$5,neighborhood=$6,city=$7,
-          state=$8,postal_code=$9,latitude=$10,longitude=$11,contact_phone=$12,plan_code=$13,address_confidence=$14 WHERE id=$1`,
+          state=$8,postal_code=$9,latitude=$10,longitude=$11,contact_phone=$12,plan_code=$13,address_confidence=$14,
+          opening_time=CASE WHEN $18 THEN $15::time ELSE opening_time END,
+          closing_time=CASE WHEN $18 THEN $16::time ELSE closing_time END,
+          operating_weekdays=CASE WHEN $18 THEN $17::integer[] ELSE operating_weekdays END WHERE id=$1`,
           [id,s.name,s.addressLine,s.addressNumber??null,s.complement??null,s.neighborhood??null,s.city,s.state,s.postalCode??null,
-            s.latitude,s.longitude,s.contactPhone??null,input.billing.planCode,s.addressConfidence??null]);
+            s.latitude,s.longitude,s.contactPhone??null,input.billing.planCode,s.addressConfidence??null,s.openingTime??null,s.closingTime??null,s.operatingWeekdays,
+            s.openingTime!==undefined||s.closingTime!==undefined]);
         await saveBillingProfile(client,env,request.platformAuth,id,input.billing,input.reason,input.billingVersion);
         await masterAudit(client,request.platformAuth,{action:'store.updated',entityType:'store',entityId:id,tenantId:before.tenant_id,
           before,after:s,reason:input.reason});return {statusCode:200,body:{id}};

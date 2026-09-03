@@ -10,6 +10,7 @@ import { assertDeliveryTransition, nextOperationalActions } from './delivery-sta
 import type { DeliveryRecord, DeliveryStatus } from './delivery.types.js';
 import { completeOfferForDelivery } from '../offers/offer.service.js';
 import { createFailureIncident } from '../incidents/incident.repository.js';
+import { requireCourierCheckin } from '../workdays/workday.service.js';
 
 export interface CreateDeliveryInput {
   storeId: string;
@@ -33,6 +34,8 @@ export interface CreateDeliveryInput {
 }
 
 interface ListFilters {
+  view?: 'all' | 'active' | 'history' | undefined;
+  offset?: number | undefined;
   status?: DeliveryStatus | undefined;
   storeId?: string | undefined;
   limit: number;
@@ -169,9 +172,11 @@ export async function listDeliveries(
        WHERE ($1::delivery_status IS NULL OR d.status = $1)
        ${accessPredicate}
        AND ($5::uuid IS NULL OR d.store_id = $5)
+       AND ($7::text='all' OR ($7='active' AND d.status IN ('ASSIGNED','AWAITING_PICKUP','COLLECTED','IN_ROUTE','NEXT_STOP','RETURN_STARTED'))
+         OR ($7='history' AND d.status IN ('DELIVERED','DELIVERY_FAILED','CANCELLED','RETURNED')))
        ORDER BY d.created_at DESC
-       LIMIT $6`,
-      [filters.status ?? null, ...accessParameters(auth), filters.storeId ?? null, filters.limit],
+       LIMIT $6 OFFSET $8`,
+      [filters.status ?? null, ...accessParameters(auth), filters.storeId ?? null, filters.limit,filters.view ?? 'all',filters.offset ?? 0],
     );
     return { data: result.rows.map((delivery) => ({ ...delivery, nextActions: nextOperationalActions(delivery.status) })) };
   });
@@ -267,6 +272,7 @@ export async function transitionDelivery(
   return withTenantTransaction(database, auth, async (client) =>
     withIdempotency(client, auth, key, `delivery.${action}`, { deliveryId, reason: reason ?? null }, async () => {
       const before = await loadDelivery(client, auth, deliveryId, true);
+      if (action === 'collect' || action === 'start') await requireCourierCheckin(client,auth,before.storeId);
       if (before.routeId && ['collect', 'start', 'complete'].includes(action)) {
         throw conflict('Esta entrega pertence a um lote. Avance pela prancheta de Rotas.');
       }

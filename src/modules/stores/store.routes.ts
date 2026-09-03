@@ -4,8 +4,10 @@ import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
 import { forbidden } from '../../shared/errors.js';
 import { authenticate } from '../auth/auth.guard.js';
+import { workingHoursFields, validWorkingHours } from '../workdays/working-hours.js';
 
 export const storeSchema = z.object({
+  ...workingHoursFields,
   name: z.string().trim().min(2).max(160),
   externalReference: z.string().trim().max(100).nullable().optional(),
   addressLine: z.string().trim().min(3).max(240),
@@ -19,13 +21,14 @@ export const storeSchema = z.object({
   longitude: z.number().min(-180).max(180),
   addressConfidence: z.number().min(0).max(1).nullable().optional(),
   contactPhone: z.string().trim().max(30).nullable().optional(),
-});
+}).refine(validWorkingHours, { path: ['closingTime'], message: 'Informe início e fim diferentes, ou deixe ambos sem configuração.' });
 
 const storeSelect = `
   SELECT id, name, external_reference AS "externalReference", address_line AS "addressLine",
          address_number AS "addressNumber", complement, neighborhood, city, state,
          postal_code AS "postalCode", latitude, longitude, address_confidence AS "addressConfidence",
-         contact_phone AS "contactPhone", status, created_at AS "createdAt", updated_at AS "updatedAt"
+         contact_phone AS "contactPhone", opening_time::text AS "openingTime", closing_time::text AS "closingTime",
+         operating_weekdays AS "operatingWeekdays", status, created_at AS "createdAt", updated_at AS "updatedAt"
   FROM stores`;
 
 export async function storeRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {

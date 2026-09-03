@@ -28,6 +28,7 @@ import { communicationRoutes } from './modules/communications/communication.rout
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
 import { deliveryRoutes } from './modules/deliveries/delivery.routes.js';
 import { locationRoutes } from './modules/locations/location.routes.js';
+import { workdayRoutes } from './modules/workdays/workday.routes.js';
 import { incidentRoutes } from './modules/incidents/incident.routes.js';
 import { driverEventRoutes } from './modules/driver-events/driver-event.routes.js';
 import { onboardingRoutes } from './modules/onboarding/onboarding.routes.js';
@@ -167,6 +168,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     options.routeDirectionsProvider ?? geoapify);
   await trackingRoutes(app, database, env, locationState);
   await locationRoutes(app, database, env, realtime.publisher, locationState);
+  await workdayRoutes(app, database, env, realtime.publisher);
   await operationalMetricsRoutes(app, database, env);
   await proofRoutes(app, database, objectStorage, env);
   await incidentRoutes(app, database, objectStorage, env);

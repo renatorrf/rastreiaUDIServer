@@ -26,7 +26,7 @@ export function distanceMeters(left: Pick<LocationReference, 'latitude' | 'longi
 }
 
 export function validateLocationPoint(
-  point: LocationPointInput,
+  point: Omit<LocationPointInput, 'deliveryId'>,
   previous?: LocationReference,
   now = new Date(),
 ): LocationRejection | null {

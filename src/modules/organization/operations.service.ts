@@ -14,7 +14,7 @@ export const operationsFilterSchema=z.object({tenantId:z.string().uuid().optiona
   if(days<0||days>365)c.addIssue({code:'custom',path:['to'],message:'Selecione um período de até 366 dias, com início anterior ao fim.'});});
 export interface OrganizationUnit {id:string;name:string;tenant_id:string;tenant_name:string;company_id:string;company_name:string;role?:string}
 interface OperationRow extends OrganizationUnit {deliveries:number;active_deliveries:number;delivered:number;failed:number;late:number;open_incidents:number;active_routes:number;open_shifts:number;latitude:number;longitude:number}
-interface OperationPosition {courier_id:string;store_id:string;delivery_id:string;latitude:number;longitude:number;captured_at:Date;stale:boolean}
+interface OperationPosition {courier_id:string;store_id:string;delivery_id:string|null;latitude:number;longitude:number;captured_at:Date;stale:boolean}
 export async function scopedUnits(client:PoolClient,userId?:string):Promise<OrganizationUnit[]> {
   return (await client.query<OrganizationUnit>(userId?'SELECT * FROM rastreia.organization_units($1)':
     `SELECT store.id,store.name,store.tenant_id,tenant.name AS tenant_name,store.company_id,company.name AS company_name
@@ -73,9 +73,16 @@ export async function operationsReport(client:PoolClient,query:unknown,userId?:s
       AND delivery.created_at>=($2::date::timestamp AT TIME ZONE $4) AND delivery.created_at<(($3::date+1)::timestamp AT TIME ZONE $4)
       AND ($5::text IS NULL OR delivery.status::text=$5) AND ($6::uuid IS NULL OR location.courier_profile_id=$6)`,
       [units.map(unit=>unit.id),filters.from,filters.to,filters.timezone,filters.status??null,filters.courierId??null])).rows);
+    if(!filters.status)positions.push(...(await client.query<OperationPosition>(`SELECT courier_profile_id AS courier_id,store_id,NULL::uuid AS delivery_id,
+      latitude,longitude,captured_at,captured_at<now()-interval '2 minutes' AS stale FROM courier_workdays
+      WHERE store_id=ANY($1::uuid[]) AND status='CHECKED_IN' AND ends_at>now() AND captured_at IS NOT NULL
+        AND captured_at>=($2::date::timestamp AT TIME ZONE $4) AND captured_at<(($3::date+1)::timestamp AT TIME ZONE $4)
+        AND ($5::uuid IS NULL OR courier_profile_id=$5)`,[units.map(unit=>unit.id),filters.from,filters.to,filters.timezone,filters.courierId??null])).rows);
   }
   const companies=Array.from(new Set(rows.map(row=>row.company_id))).map(id=>{const subset=rows.filter(row=>row.company_id===id);return {id,name:subset[0]!.company_name,tenantId:subset[0]!.tenant_id,...summarizeOperations(subset)};});
   const priority={CRITICAL:0,WARNING:1,INFO:2};
   operationalEvents.sort((a,b)=>priority[a.severity]-priority[b.severity]||new Date(b.occurredAt).getTime()-new Date(a.occurredAt).getTime());
-  return {filters,generatedAt:new Date().toISOString(),summary:summarizeOperations(rows),companies,stores:rows,positions,operationalEvents};
+  const latest=new Map<string,OperationPosition>();
+  for(const position of positions){const key=position.store_id+':'+position.courier_id;const prior=latest.get(key);if(!prior||position.captured_at>prior.captured_at)latest.set(key,position);}
+  return {filters,generatedAt:new Date().toISOString(),summary:summarizeOperations(rows),companies,stores:rows,positions:[...latest.values()],operationalEvents};
 }

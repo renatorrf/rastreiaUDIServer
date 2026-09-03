@@ -60,11 +60,12 @@ export async function createBackgroundTrackingSession(
   const tokenHash = backgroundTrackingTokenHash(token, env.TRACKING_TOKEN_PEPPER);
   return withTenantTransaction(database, auth, async (client) => {
     const courierId = await activeCourierProfile(client, auth);
-    const delivery = await client.query<{ status: string }>(
-      `SELECT status
-       FROM deliveries
-       WHERE id = $1 AND tenant_id = $2 AND courier_profile_id = $3
-       FOR UPDATE`,
+    const delivery = await client.query<{ status: string; ends_at: Date }>(
+      `SELECT delivery.status,day.ends_at FROM deliveries delivery
+       JOIN courier_workdays day ON day.store_id=delivery.store_id AND day.courier_profile_id=delivery.courier_profile_id
+         AND day.tenant_id=delivery.tenant_id AND day.status='CHECKED_IN' AND day.ends_at>now()
+       WHERE delivery.id=$1 AND delivery.tenant_id=$2 AND delivery.courier_profile_id=$3
+       FOR UPDATE OF delivery`,
       [deliveryId, auth.tenantId, courierId],
     );
     if (!delivery.rows[0] || !activeLocationStatuses.includes(delivery.rows[0].status)) {
@@ -80,10 +81,10 @@ export async function createBackgroundTrackingSession(
     const created = await client.query<{ id: string; expires_at: Date }>(
       `INSERT INTO background_tracking_sessions
          (tenant_id, user_id, courier_profile_id, delivery_id, token_hash, platform, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now() + ($7::text || ' seconds')::interval)
+       VALUES ($1, $2, $3, $4, $5, $6, LEAST($8::timestamptz,now() + ($7::text || ' seconds')::interval))
        RETURNING id, expires_at`,
       [auth.tenantId, auth.userId, courierId, deliveryId, tokenHash, platform,
-        env.BACKGROUND_TRACKING_SESSION_TTL_SECONDS],
+        env.BACKGROUND_TRACKING_SESSION_TTL_SECONDS,delivery.rows[0].ends_at],
     );
     const session = created.rows[0]!;
     await writeAudit(client, {

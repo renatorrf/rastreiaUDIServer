@@ -50,12 +50,12 @@ export async function routeRoutes(
     const { id } = routeIdSchema.parse(request.params);
     return sendIdempotent(reply, await startRoute(database, request.auth, keyFrom(request), id, request.ip));
   });
-  app.post('/routes/:id/optimize', { preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')] },
+  app.post('/routes/:id/optimize', { preHandler: auth },
     async (request, reply) => { const { id } = routeIdSchema.parse(request.params);
       return sendIdempotent(reply, await optimizeRoute(
         database, request.auth, keyFrom(request), id, matrixProvider, request.ip,
       )); });
-  app.post('/routes/:id/apply-suggestion', { preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')] },
+  app.post('/routes/:id/apply-suggestion', { preHandler: auth },
     async (request, reply) => { const { id } = routeIdSchema.parse(request.params);
       return sendIdempotent(reply, await applyRouteSuggestion(
         database, request.auth, keyFrom(request), id, request.ip,

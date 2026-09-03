@@ -12,6 +12,7 @@ import { enforceRetentionPolicies } from './retention.service.js';
 import { processBillingBatch } from '../modules/billing/billing-worker.service.js';
 import { processEmailBatch } from '../integrations/email/email.service.js';
 import { createIfoodWorker } from '../integrations/ifood/ifood.worker.js';
+import { maintainWorkdays } from '../modules/workdays/workday.service.js';
 
 loadLocalEnv();
 const env = getEnv();
@@ -38,12 +39,14 @@ async function tick(): Promise<void> {
     let recurring = { generatedSlots: 0 };
     let confirmations = { created: 0 };
     let reminders = { reminded: 0 };
+    let workdays = { reminded: 0 };
     let offers = { expired: 0 };
     let maintenance = { released: 0 };
     let searches = { advanced: 0 };
     let retention = { ran: false };
     try {
       if (runMaintenance) {
+        workdays = await maintainWorkdays(database, Boolean(env.PUSH_VAPID_SUBJECT && env.PUSH_VAPID_PUBLIC_KEY && env.PUSH_VAPID_PRIVATE_KEY));
         await database.query(`UPDATE rastreia.courier_service_preferences SET availability_status='OFFLINE',latitude=NULL,longitude=NULL,accuracy=NULL,
           location_authorized_at=NULL,location_expires_at=NULL,updated_at=now() WHERE availability_status='AVAILABLE' AND location_expires_at<=now()`);
         if (env.BILLING_ENABLED) await processBillingBatch(database);
@@ -60,11 +63,11 @@ async function tick(): Promise<void> {
     }
     const result = await processNotificationBatch(database, env, 25, workerId);
     await processEmailBatch(database, env);
-    if (recurring.generatedSlots || confirmations.created || reminders.reminded || offers.expired
+    if (workdays.reminded || recurring.generatedSlots || confirmations.created || reminders.reminded || offers.expired
         || maintenance.released || searches.advanced || retention.ran
         || result.processed || result.retried || result.deadLettered) {
       process.stdout.write(`${JSON.stringify({ ...recurring, confirmations: confirmations.created,
-        reminders: reminders.reminded, offersExpired: offers.expired, ...maintenance, ...searches,
+        reminders: reminders.reminded, workdayReminders: workdays.reminded, offersExpired: offers.expired, ...maintenance, ...searches,
         retention, ...result })}\n`);
     }
   } catch (error) {

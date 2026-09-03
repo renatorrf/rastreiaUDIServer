@@ -91,8 +91,11 @@ export async function createDriverEvent(database:Database,auth:AuthContext,key:s
       [context.courierId,input.eventType,scope,scope==='DELIVERY'?context.delivery.id:context.batchId??context.delivery.id]);
     if(duplicate.rowCount)throw conflict('Este tipo de ocorrência já está aberto nesta operação. Resolva a anterior antes de registrar outra.');
     const stored=(await client.query<{latitude:number;longitude:number;accuracy:number;capturedAt:Date}>(
-      `SELECT latitude,longitude,accuracy,captured_at AS "capturedAt" FROM courier_last_locations
-       WHERE courier_profile_id=$1 AND store_id=$2`,[context.courierId,context.delivery.storeId])).rows[0];
+      `SELECT latitude,longitude,accuracy,captured_at AS "capturedAt" FROM (
+         SELECT latitude,longitude,accuracy,captured_at FROM courier_last_locations WHERE courier_profile_id=$1 AND store_id=$2
+         UNION ALL SELECT latitude,longitude,accuracy,captured_at FROM courier_workdays WHERE courier_profile_id=$1 AND store_id=$2
+           AND status='CHECKED_IN' AND ends_at>now() AND captured_at IS NOT NULL
+       ) positions ORDER BY captured_at DESC LIMIT 1`,[context.courierId,context.delivery.storeId])).rows[0];
     const local=input.location?recentEventLocation({...input.location,capturedAt:new Date(input.location.capturedAt)}):null;
     const last=recentEventLocation(stored);const location=local&&(!last||local.capturedAt>last.capturedAt)?local:last;
     const id=randomUUID();

@@ -278,7 +278,7 @@ export async function getPublicTracking(
         calculatedAt: delivery.etaCalculatedAt,
         message: delivery.hasPreviousStops ? 'O entregador está concluindo entregas anteriores.' : 'Sua entrega é a próxima parada.',
       } : null,
-      location: publicLocationStatuses.includes(delivery.status) && selectedLocation
+      location: publicLocationStatuses.includes(delivery.status) && !delivery.hasPreviousStops && selectedLocation
         ? {
             latitude: selectedLocation.latitude,
             longitude: selectedLocation.longitude,

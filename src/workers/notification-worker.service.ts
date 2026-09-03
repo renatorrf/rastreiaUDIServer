@@ -255,6 +255,7 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
 
 function pushCopy(eventType: string): { title: string; body: string } | null {
   const copy: Record<string, { title: string; body: string }> = {
+    'workday.confirmation.requested': { title: 'Você vem trabalhar hoje?', body: 'As atividades da loja começam em até duas horas. Abra Loja de hoje e confirme sua presença.' },
     'driver-event.created': {title:'Ação necessária na operação',body:'Um entregador informou uma ocorrência crítica. Abra a operação para verificar.'},
     'delivery.assigned': { title: 'Nova entrega atribuída', body: 'Uma entrega está aguardando sua coleta.' },
     'delivery.collect': { title: 'Coleta confirmada', body: 'A entrega coletada está pronta para iniciar o trajeto.' },
@@ -287,12 +288,24 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
   const copy = pushCopy(event.event_type);
   if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
   const shiftEvent = event.event_type.startsWith('shift.');
+  const workdayEvent = event.event_type === 'workday.confirmation.requested';
   const offerEvent = event.event_type.startsWith('offer.');
   const searchWave = event.event_type === 'shift.search.wave';
   const waveId = typeof event.payload['waveId'] === 'string' ? event.payload['waveId'] : null;
   const result = await database.query<{
     id: string; endpoint: string; p256dh: string; auth_secret: string; user_id: string;
-  }>(cancellation
+  }>(workdayEvent
+    ? `SELECT DISTINCT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret,subscription.user_id
+       FROM rastreia.courier_workdays day
+       JOIN rastreia.courier_profiles courier ON courier.id=day.courier_profile_id AND courier.status='ACTIVE'
+       JOIN rastreia.users person ON person.id=courier.user_id AND person.status='ACTIVE'
+       JOIN rastreia.tenant_users member ON member.tenant_id=day.tenant_id AND member.user_id=person.id AND member.status='ACTIVE' AND member.role='COURIER'
+       JOIN rastreia.stores store ON store.id=day.store_id AND store.status='ACTIVE'
+       JOIN rastreia.tenants tenant ON tenant.id=day.tenant_id AND tenant.status='ACTIVE'
+       JOIN rastreia.courier_store_links link ON link.store_id=day.store_id AND link.courier_profile_id=courier.id AND link.status='ACTIVE'
+       JOIN rastreia.push_subscriptions subscription ON subscription.tenant_id=day.tenant_id AND subscription.user_id=person.id AND subscription.active
+       WHERE day.id=$1 AND day.tenant_id=$2 AND day.status='PENDING' AND day.starts_at>now() AND day.starts_at=$3::timestamptz`
+    : cancellation
     ? `SELECT DISTINCT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret,subscription.user_id
        FROM rastreia.deliveries delivery JOIN rastreia.push_subscriptions subscription ON subscription.tenant_id=delivery.tenant_id AND subscription.active
        JOIN rastreia.users person ON person.id=subscription.user_id AND person.status='ACTIVE'
@@ -348,7 +361,9 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
        JOIN rastreia.push_subscriptions subscription
          ON subscription.tenant_id = delivery.tenant_id AND subscription.user_id = courier.user_id
        WHERE delivery.id = $1 AND delivery.tenant_id = $2 AND subscription.active`,
-    offerEvent
+    workdayEvent
+      ? [event.aggregate_id, event.tenant_id, event.payload['startsAt']]
+      : offerEvent
       ? [event.aggregate_id, event.tenant_id]
       : searchWave
       ? [waveId, event.tenant_id]
@@ -356,7 +371,7 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
       ? [event.aggregate_id, event.tenant_id, event.event_type]
       : [event.aggregate_id, event.tenant_id],
   );
-  const openUrl = driverEvent ? '/app/operacao' : offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos' : '/app/entregas';
+  const openUrl = workdayEvent ? `/app/turnos?workdayId=${encodeURIComponent(event.aggregate_id)}` : driverEvent ? '/app/operacao' : offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos' : '/app/entregas';
   for (const subscription of result.rows) {
     try {
       const response = await webpush.sendNotification({
@@ -365,6 +380,7 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
       }, JSON.stringify({
         notification: {
           title: copy.title, body: copy.body,
+          tag: `${event.aggregate_id}:${event.event_type}`,
           icon: env.PUSH_NOTIFICATION_ICON_URL || undefined,
           badge: env.PUSH_NOTIFICATION_BADGE_URL || undefined,
           data: { onActionClick: { default: { operation: 'navigateLastFocusedOrOpen',
@@ -419,7 +435,7 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
 async function processEvent(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   if (event.event_type === 'communication.tracking.requested') await processMessage(database, env, event);
   else if (event.event_type.startsWith('delivery.') || event.event_type.startsWith('shift.')
-      || event.event_type.startsWith('offer.')) {
+      || event.event_type.startsWith('offer.') || event.event_type.startsWith('workday.')) {
     await processPush(database, env, event);
   }
 }

@@ -229,6 +229,8 @@ export async function logout(database: Database, env: AppEnv, refreshToken: stri
          WHERE id = $1 AND token_hash = $2`,
         [claims.sessionId, hashToken(refreshToken)],
       );
+      await client.query('UPDATE courier_workday_tracking_sessions SET revoked_at=now() WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL', [claims.tenantId,claims.userId]);
+      await client.query('UPDATE background_tracking_sessions SET revoked_at=now() WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL', [claims.tenantId,claims.userId]);
     });
   } catch {
     // Logout is intentionally idempotent and does not reveal token validity.
