@@ -6,7 +6,7 @@ import type { Database } from '../../database/pool.js';
 import { withTenantTransaction } from '../../database/pool.js';
 import type { AppEnv } from '../../config/env.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import { getMyWorkdays, maintainWorkdays, respondWorkday } from './workday.service.js';
+import { getMyWorkdays, maintainWorkdays, reopenDeclinedWorkday, respondWorkday } from './workday.service.js';
 import { createWorkdayTrackingSession, ingestNativeWorkdayPoint, ingestWorkdayPoints } from './workday-tracking.service.js';
 import type { LocationUpdate } from '../locations/location.types.js';
 
@@ -46,7 +46,8 @@ describe('courier workday SQL / authorization / tracking',()=>{
           AND (NULLIF(current_setting('app.store_ids',true),'') IS NULL OR current_setting('app.store_ids',true)::jsonb='[]'::jsonb
             OR current_setting('app.store_ids',true)::jsonb ? target::text)) $$;
       GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA rastreia TO rastreia_runtime;`);
-    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0038_courier_workdays.sql',import.meta.url),'utf8')+'COMMIT;');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0038_courier_workdays.sql',import.meta.url),'utf8')+
+      await readFile(new URL('../../../migrations/0039_workday_presence_decline.sql',import.meta.url),'utf8')+'COMMIT;');
     await pg.query('INSERT INTO tenants(id,name) VALUES($1,\'Loja teste\'),($2,\'Outro grupo\')',[tenant,otherTenant]);
     await pg.query('INSERT INTO users(id,name) VALUES($1,\'Entregador teste\'),($2,\'Outro usuário\')',[user,otherUser]);
     await pg.query('INSERT INTO stores(id,tenant_id,name,opening_time,closing_time) VALUES($1,$2,\'Unidade teste\',\'09:00\',\'23:00\'),($3,$2,\'Outra unidade\',\'09:00\',\'23:00\')',[store,tenant,otherStore]);
@@ -86,6 +87,20 @@ describe('courier workday SQL / authorization / tracking',()=>{
     const second=(await getMyWorkdays(database,{...auth,storeIds:[otherStore]})).data[0]!;
     await pg.query("UPDATE courier_workdays SET starts_at=now(),ends_at=now()+interval '8 hours' WHERE id=$1",[second.id]);
     await expect(respondWorkday(database,{...auth,storeIds:[otherStore]},second.id,randomUUID(),'check-in',true)).rejects.toMatchObject({statusCode:409});
+  });
+  it('records one irreversible decline event and only store management can reopen it',async()=>{
+    const declinedId=randomUUID();
+    await pg.query(`INSERT INTO courier_workdays(id,tenant_id,store_id,courier_profile_id,service_date,starts_at,ends_at)
+      VALUES($1,$2,$3,$4,current_date+10,now(),now()+interval '4 hours')`,[declinedId,tenant,store,courier]);
+    await respondWorkday(database,auth,declinedId,randomUUID(),'decline',false,undefined,{reasonCode:'VEHICLE'});
+    await respondWorkday(database,auth,declinedId,randomUUID(),'decline',false,undefined,{reasonCode:'VEHICLE'});
+    const stored=await pg.query<{status:string;reason:string;events:number}>(`SELECT day.status,day.decline_reason_code AS reason,
+      (SELECT count(*)::int FROM outbox_events event WHERE event.aggregate_id=day.id AND event.event_type='workday.presence.declined') AS events
+      FROM courier_workdays day WHERE day.id=$1`,[declinedId]);
+    expect(stored.rows[0]).toEqual({status:'DECLINED',reason:'VEHICLE',events:1});
+    await expect(respondWorkday(database,auth,declinedId,randomUUID(),'confirm',false)).rejects.toMatchObject({statusCode:409});
+    const reopened=await reopenDeclinedWorkday(database,{...auth,role:'STORE_OPERATOR'},declinedId,randomUUID(),'Substituição cancelada');
+    expect(reopened.body.status).toBe('PENDING');
   });
   it('hides another tenant/user/store and rejects cross-scope writes',async()=>{
     for(const denied of [{...auth,userId:otherUser},{...auth,tenantId:otherTenant},{...auth,storeIds:[otherStore]}]){

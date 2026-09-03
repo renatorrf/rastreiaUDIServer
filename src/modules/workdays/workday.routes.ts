@@ -8,7 +8,7 @@ import { parseIdempotencyKey } from '../../shared/idempotency.js';
 import { unauthorized } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import type { LocationPublisher } from '../locations/location.types.js';
-import { getMyWorkdays, respondWorkday } from './workday.service.js';
+import { getMyWorkdays, reopenDeclinedWorkday, respondWorkday } from './workday.service.js';
 import { createWorkdayTrackingSession, ingestNativeWorkdayPoint, ingestWorkdayPoints, revokeWorkdayTrackingSession } from './workday-tracking.service.js';
 
 const params = z.object({id:z.uuid()});
@@ -25,15 +25,27 @@ export async function workdayRoutes(app: FastifyInstance, database: Database, en
   for (const action of ['confirm','decline','check-in','check-out'] as const) {
     app.post(`/courier/workdays/:id/${action}`,{preHandler},async (request,reply) => {
       const {id} = params.parse(request.params);
-      const input = z.object({consent:z.boolean().default(false)}).parse(request.body ?? {});
+      const input = z.object({consent:z.boolean().default(false),declineReasonCode:z.enum(['PERSONAL_EMERGENCY','HEALTH','VEHICLE','WEATHER','OTHER']).optional(),
+        declineReasonDetail:z.string().trim().max(500).optional()}).superRefine((value,context)=>{
+          if(action==='decline'&&!value.declineReasonCode)context.addIssue({code:'custom',path:['declineReasonCode'],message:'Informe o motivo da ausência.'});
+          if(action==='decline'&&value.declineReasonCode==='OTHER'&&(!value.declineReasonDetail||value.declineReasonDetail.length<3))
+            context.addIssue({code:'custom',path:['declineReasonDetail'],message:'Descreva o motivo da ausência.'});
+        }).parse(request.body ?? {});
       const eventId=parseIdempotencyKey(request.headers['idempotency-key']);
-      const result = await respondWorkday(database,request.auth,id,eventId,action,input.consent,request.ip);
+      const result = await respondWorkday(database,request.auth,id,eventId,action,input.consent,request.ip,input.declineReasonCode?{
+        reasonCode:input.declineReasonCode,...(input.declineReasonDetail?{detail:input.declineReasonDetail}:{})}:undefined);
       request.log.info({event_id:eventId,user_id:request.auth.userId,tenant_id:request.auth.tenantId,
         store_id:result.body.storeId,courier_id:result.body.courierId,shift_assignment_id:id,
         new_status:result.body.status,replayed:result.replayed},'Courier workday transition completed');
       return reply.header('Idempotency-Replayed',String(result.replayed)).status(result.statusCode).send(result.body);
     });
   }
+  app.post('/workdays/:id/reopen-decline',{preHandler:[authenticate(env,database),requireRoles('TENANT_MANAGER','STORE_OPERATOR')]},async(request,reply)=>{
+    const {id}=params.parse(request.params);const {reason}=z.object({reason:z.string().trim().min(3).max(500)}).parse(request.body);
+    const eventId=parseIdempotencyKey(request.headers['idempotency-key']);
+    const result=await reopenDeclinedWorkday(database,request.auth,id,eventId,reason,request.ip);
+    return reply.header('Idempotency-Replayed',String(result.replayed)).status(result.statusCode).send(result.body);
+  });
   app.post('/courier/workdays/:id/locations',{preHandler},request => {
     const {id} = params.parse(request.params);
     return ingestWorkdayPoints(database,publisher,request.auth,id,z.object({points:z.array(point).min(1).max(100)}).parse(request.body).points);

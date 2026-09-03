@@ -51,7 +51,10 @@ export async function identitySnapshot(client: PoolClient, userId: string) {
   const account = (await client.query(`SELECT id,name,email FROM users WHERE id=$1 AND status='ACTIVE'
     AND email_verified_at IS NOT NULL`, [userId])).rows[0];
   if (!account) throw unauthorized('Verifique seu e-mail antes de acessar.');
-  const units = await client.query('SELECT * FROM rastreia.identity_units($1)', [userId]);
+  const units = await client.query(`SELECT unit.*,store.address_line,store.address_number,store.neighborhood,
+    store.city,store.state,store.postal_code,company.name AS company_name
+    FROM rastreia.identity_units($1) unit JOIN stores store ON store.id=unit.id
+    LEFT JOIN companies company ON company.id=store.company_id ORDER BY unit.tenant_name,unit.name`, [userId]);
   const courier = (await client.query(`SELECT profile.id, profile.status,
     preferences.registration_status AS "registrationStatus"
     FROM courier_profiles profile LEFT JOIN courier_service_preferences preferences

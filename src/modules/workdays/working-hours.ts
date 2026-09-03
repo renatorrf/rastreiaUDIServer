@@ -14,6 +14,8 @@ export function validWorkingHours(input: { openingTime?: string | null | undefin
 export const workdaySelect = `SELECT day.id,day.store_id AS "storeId",store.name AS "storeName",
   day.service_date::text AS "serviceDate",day.starts_at AS "startsAt",day.ends_at AS "endsAt",tenant.timezone,
   day.status,day.checkin_at AS "checkinAt",day.checkout_at AS "checkoutAt",day.version,
+  day.decline_reason_code AS "declineReasonCode",day.decline_reason_detail AS "declineReasonDetail",
+  day.declined_at AS "declinedAt",day.decline_revoked_at AS "declineRevokedAt",
   store.address_line AS "addressLine",store.address_number AS "addressNumber",store.city,
   day.courier_profile_id AS "courierId",profile.user_id AS "userId",person.name AS "courierName"
   FROM courier_workdays day JOIN stores store ON store.id=day.store_id
