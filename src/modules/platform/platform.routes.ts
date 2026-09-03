@@ -10,6 +10,7 @@ import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempot
 import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { authenticatePlatform } from '../auth/auth.guard.js';
 import { platformLogin, platformLogout, platformRefresh } from './platform-auth.service.js';
+import { createMasterLoginGrant, verifyMasterLoginGrant } from '../../security/master-access.js';
 import {
   changePlatformTenantStatus, listPlatformAudit, listPlatformTenants,
 } from './platform.service.js';
@@ -35,7 +36,18 @@ function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
 export async function platformRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {
   const auth = authenticatePlatform(env, database);
 
-  app.post('/platform/auth/login', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
+  app.post('/platform/auth/access', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const { token } = z.object({ token: z.string().min(1).max(256) }).parse(request.body);
+    return createMasterLoginGrant(env, token);
+  });
+  app.post('/platform/auth/login', {
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      await verifyMasterLoginGrant(env, request.headers['x-master-login-grant']);
+    },
+  }, async (request, reply) => {
     const input = loginSchema.parse(request.body);
     const result = await platformLogin(database, env, { ...input, ip: request.ip,
       ...(request.headers['user-agent'] ? { userAgent: request.headers['user-agent'] } : {}) });

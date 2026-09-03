@@ -7,6 +7,9 @@ const envSchema = z.object({
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.string().url(),
+  MASTER_ACCESS_TOKEN: z.string().trim().max(256).optional().default('').refine(
+    value => value === '' || value.length >= 32, 'Use um token master de pelo menos 32 caracteres.',
+  ),
   APP_ORIGINS: z.string().default('http://localhost:8100'),
   EMAIL_ACTION_BASE_URL: z.string().url().default('http://localhost:8100'),
   SMTP_HOST: optionalSecret,

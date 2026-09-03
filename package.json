@@ -25,6 +25,7 @@
     "db:seed": "tsx src/database/seed.ts",
     "db:seed:platform": "tsx src/database/seed-platform.ts",
     "security:generate-master-password": "tsx src/scripts/generate-master-password.ts",
+    "security:generate-master-access-token": "tsx src/scripts/generate-master-access-token.ts",
     "push:generate-keys": "web-push generate-vapid-keys --json",
     "smoke:phase1": "tsx src/smoke/phase1.ts",
     "smoke:phase2": "tsx src/smoke/phase1.ts",

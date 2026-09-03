@@ -6,6 +6,7 @@ import { parseAppEnv } from '../config/env.js';
 const excludedKeys = new Set([
   'PORT', 'HOST', 'GEOAPIFY_API_KEY', 'IFOOD_WEBHOOK_SECRET',
   'WHATSAPP_WEBHOOK_VERIFY_TOKEN', 'WHATSAPP_APP_SECRET',
+  'MASTER_ACCESS_TOKEN',
 ]);
 
 function yamlString(value: string): string {

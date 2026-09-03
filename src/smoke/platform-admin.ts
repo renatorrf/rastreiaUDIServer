@@ -43,7 +43,8 @@ await withTransaction(database, async (client) => {
 
 const app = await buildApp({ env, database });
 try {
-  const platformLogin = await app.inject({ method: 'POST', url: '/platform/auth/login', payload: {
+  const gate = body<{ grant: string }>(await app.inject({method:'POST',url:'/platform/auth/access',payload:{token:env.MASTER_ACCESS_TOKEN}}),200);
+  const platformLogin = await app.inject({ method: 'POST', url: '/platform/auth/login', headers:{'x-master-login-grant':gate.grant}, payload: {
     email: adminEmail, password: adminPassword,
   } });
   const platform = body<{ accessToken: string }>(platformLogin, 200);

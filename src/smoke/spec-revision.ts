@@ -16,6 +16,7 @@ const source=getEnv();
 if(source.NODE_ENV==='production')throw new Error('Run this rollback smoke only against development/test.');
 const prefix=`revision-${randomBytes(6).toString('hex')}`;
 const env={...source,NODE_ENV:'test' as const,LOG_LEVEL:'error' as const,
+  MASTER_ACCESS_TOKEN:randomBytes(32).toString('base64url'),
   REDIS_URL:'',REDIS_REQUIRED:false,COMMUNICATIONS_MOCK:true,BILLING_ENABLED:false,
   SMTP_HOST:'smtp.example.invalid',SMTP_FROM:'noreply@example.test',PUBLIC_COURIER_REGISTRATION_ENABLED:true,
   EMAIL_ACTION_BASE_URL:'https://app.example.test',TERMS_URL:'https://app.example.test/terms',PRIVACY_URL:'https://app.example.test/privacy'};
@@ -35,10 +36,12 @@ try {
   const masterId=randomUUID();const password='Synthetic-only-password-3489!';
   await database.query(`INSERT INTO rastreia.platform_admins(id,name,email,password_hash) VALUES($1,'Master de teste',$2,$3)`,[masterId,`${prefix}-master@example.test`,await argon2.hash(password)]);
   app=await buildApp({env,database});
+  let masterGrant='';
   const call=async(method:'GET'|'POST'|'PATCH'|'PUT',url:string,payload?:Record<string,unknown>,token?:string,key=randomUUID())=>{
-    const response=await app!.inject({method,url,...(payload?{payload}:{}),headers:{'idempotency-key':key,...(token?{authorization:`Bearer ${token}`}:{})}});
+    const response=await app!.inject({method,url,...(payload?{payload}:{}),headers:{'idempotency-key':key,...(token?{authorization:`Bearer ${token}`}:{}) ,...(url==='/platform/auth/login'?{'x-master-login-grant':masterGrant}:{})}});
     return {status:response.statusCode,body:response.json(),headers:response.headers};
   };
+  masterGrant=(await call('POST','/platform/auth/access',{token:env.MASTER_ACCESS_TOKEN})).body.grant as string;
   const master=(await call('POST','/platform/auth/login',{email:`${prefix}-master@example.test`,password})).body.accessToken as string;
   check(master,'Master authenticated');
   check((await call('GET','/platform/geo/autocomplete?q=Avenida')).status===401,'Master address search rejects anonymous requests');

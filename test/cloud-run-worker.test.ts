@@ -25,6 +25,7 @@ describe('local Cloud Run worker export', () => {
     const { yaml } = prepareCloudRunWorker(sample);
     expect(yaml).toContain('name: NODE_ENV\n              value: "development"');
     expect(yaml).toContain('name: IFOOD_ENABLED\n              value: "false"');
+    expect(yaml).not.toContain('MASTER_ACCESS_TOKEN');
     expect(yaml).toContain('name: MESSAGE_PAYLOAD_SECRET\n              value: ""');
     expect(yaml).toContain('value: "pepper-test-123456789012345678901234567890"');
   });
@@ -52,5 +53,11 @@ describe('local Cloud Run worker export', () => {
     prepareCloudRunWorker(sample);
     expect(() => prepareCloudRunWorker('')).toThrow();
     expect(() => prepareCloudRunWorker(`${sample}\nNODE_ENV=production`)).toThrow();
+  });
+
+  it('never copies the API-only master entry secret into worker configuration', () => {
+    const { yaml } = prepareCloudRunWorker(`${sample}\nMASTER_ACCESS_TOKEN=master-entry-test-secret-do-not-export`);
+    expect(yaml).not.toContain('MASTER_ACCESS_TOKEN');
+    expect(yaml).not.toContain('master-entry-test-secret-do-not-export');
   });
 });
