@@ -30,6 +30,8 @@ interface TrackingDeliveryRow {
   city: string;
   state: string;
   postalCode: string | null;
+  destinationLatitude: number;
+  destinationLongitude: number;
   promisedWindowStart: Date | null;
   promisedWindowEnd: Date | null;
   deliveredAt: Date | null;
@@ -46,6 +48,23 @@ interface TrackingDeliveryRow {
   estimatedArrivalAt: Date | null;
   etaCalculatedAt: Date | null;
   hasPreviousStops: boolean;
+}
+
+export function distanceMeters(
+  from: { latitude: number; longitude: number },
+  to: { latitude: number; longitude: number },
+): number {
+  const radians = (value: number) => value * Math.PI / 180;
+  const latitudeDelta = radians(to.latitude - from.latitude);
+  const longitudeDelta = radians(to.longitude - from.longitude);
+  const left = Math.sin(latitudeDelta / 2) ** 2
+    + Math.cos(radians(from.latitude)) * Math.cos(radians(to.latitude))
+    * Math.sin(longitudeDelta / 2) ** 2;
+  return Math.round(6_371_000 * 2 * Math.atan2(Math.sqrt(left), Math.sqrt(1 - left)));
+}
+
+export function shouldRevealPublicDestination(status: DeliveryStatus, hasPreviousStops: boolean): boolean {
+  return canRevealDestination(status) && !hasPreviousStops;
 }
 
 function assertDeliveryAccess(auth: AuthContext, storeId: string): void {
@@ -173,6 +192,8 @@ export async function getPublicTracking(
               delivery.address_line AS "addressLine", delivery.address_number AS "addressNumber",
               delivery.neighborhood, delivery.city, delivery.state,
               delivery.postal_code AS "postalCode",
+              delivery.latitude AS "destinationLatitude",
+              delivery.longitude AS "destinationLongitude",
               delivery.promised_window_start AS "promisedWindowStart",
               delivery.promised_window_end AS "promisedWindowEnd",
               delivery.delivered_at AS "deliveredAt", delivery.updated_at AS "updatedAt",
@@ -233,7 +254,9 @@ export async function getPublicTracking(
        ORDER BY delivery_version`,
       [match.delivery_id],
     );
-    const revealDestination = canRevealDestination(delivery.status);
+    // In a batch, the customer must not receive the next customers' route or
+    // even their own exact stop before it becomes the current one.
+    const revealDestination = shouldRevealPublicDestination(delivery.status, delivery.hasPreviousStops);
     const operationalNotices=(await client.query(`SELECT status,message,occurred_at AS "occurredAt",resolved_at AS "resolvedAt",affects_eta AS "affectsEta"
       FROM rastreia.public_driver_event_notices($1)`,[match.delivery_id])).rows;
     const cachedLocation = await state.getDelivery(match.tenant_id, match.delivery_id);
@@ -267,8 +290,16 @@ export async function getPublicTracking(
         city: delivery.city,
         state: delivery.state,
         postalCode: revealDestination ? delivery.postalCode : null,
+        latitude: revealDestination ? delivery.destinationLatitude : null,
+        longitude: revealDestination ? delivery.destinationLongitude : null,
         protectedUntilInRoute: !revealDestination,
       },
+      distanceM: revealDestination && selectedLocation
+        ? distanceMeters(selectedLocation, {
+            latitude: delivery.destinationLatitude,
+            longitude: delivery.destinationLongitude,
+          })
+        : null,
       promisedWindow: {
         start: delivery.promisedWindowStart,
         end: delivery.promisedWindowEnd,
