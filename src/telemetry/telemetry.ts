@@ -128,6 +128,9 @@ export async function registerTelemetry(
     const spanContext = span.spanContext();
     correlatedLogger.setBindings({
       requestId: request.id,
+      correlation_id: request.id,
+      app_version: env.RELEASE_VERSION,
+      ...(process.env['K_REVISION'] ? { cloud_run_revision: process.env['K_REVISION'] } : {}),
       ...(isSpanContextValid(spanContext) ? { traceId: spanContext.traceId } : {}),
     });
   });
@@ -152,7 +155,9 @@ export async function registerTelemetry(
 
   app.get('/internal/metrics', async (request, reply) => {
     if (!bearerMatches(request.headers.authorization, env.METRICS_BEARER_TOKEN)) {
-      return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Rota não encontrada.' } });
+      return reply.header('X-Correlation-Id',request.id).status(404).send({
+        error: { code: 'NOT_FOUND', message: 'Rota não encontrada.', correlation_id: request.id },
+      });
     }
     reply.header('Cache-Control', 'no-store');
     let postgresUp = 0;

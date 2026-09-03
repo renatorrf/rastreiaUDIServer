@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withPlatformTransaction, type Database } from '../../database/pool.js';
 import { emailConfigured } from '../../integrations/email/email.service.js';
-import { conflict, notFound } from '../../shared/errors.js';
+import { conflict, notFound, validationError } from '../../shared/errors.js';
 import { parseIdempotencyKey } from '../../shared/idempotency.js';
 import { authenticatePlatform } from '../auth/auth.guard.js';
 import type { PlatformAuthContext } from '../auth/auth.types.js';
@@ -20,6 +20,12 @@ import { encryptPayload } from '../../shared/encrypted-payload.js';
 
 const managerSchema=z.object({name:z.string().trim().min(2).max(160),email:z.string().trim().email().toLowerCase()});
 const tenantSchema=z.object({slug:z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/),name:z.string().min(2).max(160),timezone:timezoneSchema.default('America/Sao_Paulo')});
+export function requireChangeReason(value: unknown) {
+  if (typeof value !== 'string' || value.trim().length < 5) {
+    throw validationError({ change_reason: 'Informe o motivo da alteração com pelo menos 5 caracteres.' });
+  }
+  return value.trim();
+}
 export const provisionUnitSchema=z.object({tenantId:z.string().uuid().optional(),tenant:tenantSchema.optional(),
   companyId:z.string().uuid().optional(),company:companySchema.optional(),
   store:storeSchema,manager:managerSchema,billing:billingProfileSchema,
@@ -106,6 +112,7 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
   });
   app.patch('/platform/stores/:id',{preHandler:auth},async(request,reply)=>{
     const id=z.object({id:z.string().uuid()}).parse(request.params).id;
+    requireChangeReason((request.body as {reason?:unknown}|null)?.reason);
     const input=z.object({store:storeSchema,billing:billingProfileSchema,billingVersion:z.number().int().positive().optional(),
       updatedAt:z.iso.datetime(),reason:z.string().trim().min(5).max(500)}).parse(request.body);
     const key=parseIdempotencyKey(request.headers['idempotency-key']);
@@ -129,6 +136,7 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
   });
   app.patch('/platform/stores/:id/status',{preHandler:auth},async request=>{
     const {id}=z.object({id:z.string().uuid()}).parse(request.params);
+    requireChangeReason((request.body as {reason?:unknown}|null)?.reason);
     const input=z.object({status:z.enum(['ACTIVE','INACTIVE']),reason:z.string().trim().min(5).max(500)}).parse(request.body);
     return withPlatformTransaction(database,request.platformAuth,async client=>{
       const before=(await client.query('SELECT tenant_id,status FROM stores WHERE id=$1 FOR UPDATE',[id])).rows[0];if(!before)throw notFound();

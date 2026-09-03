@@ -20,7 +20,7 @@ afterEach(async()=>{await app.close();vi.resetAllMocks();});
 describe('Master geocoding route',()=>{
   it('requires Master audience, not operational or anonymous access',async()=>{
     expect((await app.inject('/platform/geo/autocomplete?q=Avenida')).statusCode).toBe(401);
-    expect((await app.inject({url:'/platform/geo/autocomplete?q=Avenida',headers:{authorization:'Bearer operational'}})).statusCode).toBe(401);
+    expect((await app.inject({url:'/platform/geo/autocomplete?q=Avenida',headers:{authorization:'Bearer operational'}})).statusCode).toBe(403);
     expect(autocomplete).not.toHaveBeenCalled();
   });
   it('accepts a Master with no selected store and forwards the number',async()=>{

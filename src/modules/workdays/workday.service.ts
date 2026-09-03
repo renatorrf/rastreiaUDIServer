@@ -27,7 +27,7 @@ export async function loadOwnWorkday(client: PoolClient, auth: AuthContext, id: 
 export function assertCheckinWindow(day: Workday, now = new Date()): void {
   if (now.getTime() < new Date(day.startsAt).getTime() - 2 * 60 * 60_000) throw conflict('O check-in abre duas horas antes do início da loja.');
   if (now >= new Date(day.endsAt)) throw conflict('As atividades desta jornada já encerraram.');
-  if (!['PENDING', 'CONFIRMED', 'DECLINED', 'CHECKED_IN'].includes(day.status)) throw conflict('Esta jornada já foi encerrada.');
+  if (!['CONFIRMED', 'CHECKED_IN'].includes(day.status)) throw conflict('Confirme sua presença antes de realizar o check-in.');
 }
 
 export async function requireCourierCheckin(client: PoolClient, auth: AuthContext, storeId: string): Promise<void> {
@@ -75,10 +75,9 @@ export async function respondWorkday(database: Database, auth: AuthContext, id: 
         if (action === 'check-in') {
           assertCheckinWindow(day);
           if (!consent) throw conflict('Confirme o compartilhamento de localização durante a jornada.');
-          if (day.status !== 'CHECKED_IN') {
-            await client.query(`UPDATE courier_workdays SET status='CHECKED_IN',confirmed_at=COALESCE(confirmed_at,now()),
+          if (day.status === 'CHECKED_IN') return { statusCode: 200, body: day };
+          await client.query(`UPDATE courier_workdays SET status='CHECKED_IN',
               checkin_at=now(),location_consent_at=now(),version=version+1,updated_at=now() WHERE id=$1`, [id]);
-          }
         } else if (action === 'check-out') {
           if (day.status !== 'CHECKED_IN') throw conflict('Não há check-in ativo nesta jornada.');
           const deliveries = await client.query(`SELECT id FROM deliveries WHERE tenant_id=$1 AND courier_profile_id=$2
@@ -90,8 +89,10 @@ export async function respondWorkday(database: Database, auth: AuthContext, id: 
           await client.query('UPDATE background_tracking_sessions SET revoked_at=now() WHERE tenant_id=$1 AND courier_profile_id=$2 AND revoked_at IS NULL',[auth.tenantId,day.courierId]);
         } else {
           if (!['PENDING','CONFIRMED','DECLINED'].includes(day.status) || new Date(day.endsAt) <= new Date()) throw conflict('A confirmação desta jornada já encerrou.');
+          const targetStatus = action === 'confirm' ? 'CONFIRMED' : 'DECLINED';
+          if (day.status === targetStatus) return { statusCode: 200, body: day };
           await client.query(`UPDATE courier_workdays SET status=$2,confirmed_at=now(),version=version+1,updated_at=now() WHERE id=$1`,
-            [id, action === 'confirm' ? 'CONFIRMED' : 'DECLINED']);
+            [id, targetStatus]);
         }
         const updated = await loadOwnWorkday(client, auth, id);
         await writeAudit(client, { tenantId: auth.tenantId, actorUserId: auth.userId, action: `workday.${action}`,
@@ -128,7 +129,7 @@ export async function maintainWorkdays(database: Database, pushConfigured: boole
     for (const day of due) {
       await client.query(`INSERT INTO outbox_events(tenant_id,aggregate_type,aggregate_id,event_type,payload)
         VALUES($1,'courier_workday',$2,'workday.confirmation.requested',$3::jsonb)`,
-      [day.tenant_id, day.id, JSON.stringify({ startsAt: day.starts_at })]);
+      [day.tenant_id, day.id, JSON.stringify({ startsAt: day.starts_at, notificationKey: `presence:${day.id}:requested` })]);
       await client.query('UPDATE courier_workdays SET reminder_queued_at=now() WHERE id=$1', [day.id]);
     }
     return { reminded: due.length };

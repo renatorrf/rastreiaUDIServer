@@ -3,6 +3,7 @@ export class AppError extends Error {
     public readonly statusCode: number,
     public readonly code: string,
     message: string,
+    public readonly fieldErrors?: Record<string, string>,
   ) {
     super(message);
     this.name = 'AppError';
@@ -19,3 +20,6 @@ export const notFound = (message = 'Recurso não encontrado.') =>
   new AppError(404, 'NOT_FOUND', message);
 
 export const conflict = (message: string) => new AppError(409, 'CONFLICT', message);
+
+export const validationError = (fieldErrors: Record<string, string>, message = 'Revise os campos obrigatórios.') =>
+  new AppError(422, 'VALIDATION_ERROR', message, fieldErrors);

@@ -6,7 +6,7 @@ import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempot
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
   getPushStatus, listDeliveryMessages, queueTrackingMessage,
-  removePushSubscription, savePushSubscription,
+  getPushSubscriptionStatus, queuePushTest, removePushSubscription, savePushSubscription,
 } from './communication.service.js';
 
 const subscriptionSchema = z.object({
@@ -33,6 +33,14 @@ export async function communicationRoutes(app: FastifyInstance, database: Databa
     const input = subscriptionSchema.parse(request.body);
     return savePushSubscription(database, request.auth, input, request.headers['user-agent']);
   });
+
+  app.post('/push/subscriptions/status', { preHandler: auth }, async (request) => {
+    const input = removeSchema.parse(request.body);
+    return getPushSubscriptionStatus(database,request.auth,input.endpoint);
+  });
+
+  app.post('/push/test', { preHandler: auth }, async (request,reply) =>
+    sendIdempotent(reply,await queuePushTest(database,request.auth,parseIdempotencyKey(request.headers['idempotency-key']))));
 
   app.delete('/push/subscriptions', { preHandler: auth }, async (request) => {
     const input = removeSchema.parse(request.body);

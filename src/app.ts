@@ -179,17 +179,18 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await geoRoutes(app, env, database, geoapify, geoapify);
   await ifoodRoutes(app, database, env);
 
-  app.setNotFoundHandler(async (_request, reply) => reply.status(404).send({
-    error: { code: 'NOT_FOUND', message: 'Rota não encontrada.' },
+  app.setNotFoundHandler(async (request, reply) => reply.header('X-Correlation-Id', request.id).status(404).send({
+    error: { code: 'NOT_FOUND', message: 'Rota não encontrada.', correlation_id: request.id },
   }));
 
   app.setErrorHandler(async (error, request, reply) => {
+    reply.header('X-Correlation-Id', request.id);
     if (error instanceof Error && error.message === 'MASTER_REQUIRED') {
-      return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.' } });
+      return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.', correlation_id: request.id } });
     }
     if (error instanceof Error && error.message === 'UNIT_UNAVAILABLE') {
       return reply.status(409).send({ error: { code: 'UNIT_UNAVAILABLE',
-        message: 'A unidade está temporariamente indisponível para novas operações.' } });
+        message: 'A unidade está temporariamente indisponível para novas operações.', correlation_id: request.id } });
     }
     if (error instanceof ZodError) {
       markRequestError(request, 'VALIDATION_ERROR');
@@ -198,15 +199,17 @@ export async function buildApp(options: BuildAppOptions = {}) {
           code: 'VALIDATION_ERROR',
           message: 'Revise os campos informados.',
           details: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
+          correlation_id: request.id,
         },
       });
     }
     if (error instanceof AppError) {
       if (error.statusCode >= 500) markRequestError(request, error.code);
-      return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message } });
+      return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message,
+        ...(error.fieldErrors ? { field_errors: error.fieldErrors } : {}), correlation_id: request.id } });
     }
     if ((error as { code?: string }).code === '23505') {
-      return reply.status(409).send({ error: { code: 'CONFLICT', message: 'Já existe um registro com a mesma referência.' } });
+      return reply.status(409).send({ error: { code: 'CONFLICT', message: 'Já existe um registro com a mesma referência.', correlation_id: request.id } });
     }
     markRequestError(request, 'INTERNAL_ERROR');
     request.log.error({
@@ -216,7 +219,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
         : undefined,
       errorMessage: env.NODE_ENV === 'production' || !(error instanceof Error) ? undefined : error.message,
     }, 'Erro não tratado');
-    return reply.status(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Erro interno.' } });
+    return reply.status(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Erro interno.', correlation_id: request.id } });
   });
 
   app.addHook('onClose', async () => {

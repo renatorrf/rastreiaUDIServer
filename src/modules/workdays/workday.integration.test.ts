@@ -69,7 +69,14 @@ describe('courier workday SQL / authorization / tracking',()=>{
     await maintainWorkdays(database,true);await maintainWorkdays(database,true);
     const events=await pg.query('SELECT * FROM outbox_events WHERE aggregate_id=$1',[dayId]);
     expect(events.rows).toHaveLength(1);expect(before.rows).toHaveLength(0);
+    expect((events.rows[0] as {payload:{notificationKey:string}}).payload.notificationKey).toBe(`presence:${dayId}:requested`);
+    await expect(respondWorkday(database,auth,dayId,randomUUID(),'check-in',true)).rejects.toMatchObject({statusCode:409});
+    const confirmationKey=randomUUID();
+    await respondWorkday(database,auth,dayId,confirmationKey,'confirm',false);
+    expect((await respondWorkday(database,auth,dayId,confirmationKey,'confirm',false)).replayed).toBe(true);
     await respondWorkday(database,auth,dayId,randomUUID(),'confirm',false);
+    const confirmationAudits=await pg.query("SELECT * FROM audit_logs WHERE entity_id=$1 AND action='workday.confirm'",[dayId]);
+    expect(confirmationAudits.rows).toHaveLength(1);
     await expect(createWorkdayTrackingSession(database,env,auth,dayId,'android')).rejects.toMatchObject({statusCode:422});
   });
   it('requires explicit consent; check-in is idempotent and only one store may be active',async()=>{

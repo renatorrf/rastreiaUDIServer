@@ -79,8 +79,13 @@ describe('app', () => {
     const response = await app.inject({ method: 'GET', url: '/public/tracking/invalido' });
     expect(response.statusCode).toBe(404);
     expect(response.json()).toEqual({
-      error: { code: 'NOT_FOUND', message: 'Acompanhamento indisponível.' },
+      error: {
+        code: 'NOT_FOUND',
+        message: 'Acompanhamento indisponível.',
+        correlation_id: expect.any(String),
+      },
     });
+    expect(response.headers['x-correlation-id']).toBe(response.json().error.correlation_id);
     expect(response.headers['cache-control']).toBe('no-store');
     expect(response.headers['referrer-policy']).toBe('no-referrer');
     await app.close();

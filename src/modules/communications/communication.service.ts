@@ -119,8 +119,8 @@ export async function removePushSubscription(database: Database, auth: AuthConte
 
 export async function getPushStatus(database: Database, auth: AuthContext, env: AppEnv) {
   return withTenantTransaction(database, auth, async (client) => {
-    const result = await client.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM push_subscriptions
+    const result = await client.query<{ count: string; last_success_at: Date | null }>(
+      `SELECT count(*)::text AS count,max(last_success_at) AS last_success_at FROM push_subscriptions
        WHERE tenant_id = $1 AND user_id = $2 AND active`,
       [auth.tenantId, auth.userId],
     );
@@ -128,8 +128,32 @@ export async function getPushStatus(database: Database, auth: AuthContext, env: 
       configured: Boolean(env.PUSH_VAPID_SUBJECT && env.PUSH_VAPID_PUBLIC_KEY && env.PUSH_VAPID_PRIVATE_KEY),
       publicKey: env.PUSH_VAPID_PUBLIC_KEY || null,
       activeDevices: Number(result.rows[0]?.count ?? 0),
+      lastSuccessAt: result.rows[0]?.last_success_at ?? null,
     };
   });
+}
+
+export async function getPushSubscriptionStatus(database: Database, auth: AuthContext, endpoint: string) {
+  return withTenantTransaction(database, auth, async (client) => {
+    const endpointHash = createHash('sha256').update(endpoint).digest('hex');
+    const row = (await client.query<{ active: boolean; last_success_at: Date | null }>(
+      `SELECT active,last_success_at FROM push_subscriptions
+       WHERE tenant_id=$1 AND user_id=$2 AND endpoint_hash=$3`, [auth.tenantId,auth.userId,endpointHash],
+    )).rows[0];
+    return { synchronized: row?.active === true, lastSuccessAt: row?.last_success_at ?? null };
+  });
+}
+
+export async function queuePushTest(database: Database, auth: AuthContext, key: string) {
+  return withTenantTransaction(database, auth, client => withIdempotency(client,auth,key,'push.test',{},async()=>{
+    const active=(await client.query('SELECT 1 FROM push_subscriptions WHERE tenant_id=$1 AND user_id=$2 AND active LIMIT 1',
+      [auth.tenantId,auth.userId])).rowCount;
+    if(!active)throw new AppError(409,'PUSH_SUBSCRIPTION_REQUIRED','Ative e sincronize as notificações neste dispositivo antes do teste.');
+    await client.query(`INSERT INTO outbox_events(tenant_id,aggregate_type,aggregate_id,event_type,payload)
+      VALUES($1,'user',$2,'push.test',$3::jsonb)`,[auth.tenantId,auth.userId,JSON.stringify({notificationKey:`push-test:${auth.userId}`})]);
+    await writeAudit(client,{tenantId:auth.tenantId,actorUserId:auth.userId,action:'push.test.queued',entityType:'user',entityId:auth.userId});
+    return {statusCode:202,body:{queued:true}};
+  }));
 }
 
 export async function queueTrackingMessage(

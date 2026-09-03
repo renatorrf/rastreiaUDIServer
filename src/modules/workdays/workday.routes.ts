@@ -26,7 +26,11 @@ export async function workdayRoutes(app: FastifyInstance, database: Database, en
     app.post(`/courier/workdays/:id/${action}`,{preHandler},async (request,reply) => {
       const {id} = params.parse(request.params);
       const input = z.object({consent:z.boolean().default(false)}).parse(request.body ?? {});
-      const result = await respondWorkday(database,request.auth,id,parseIdempotencyKey(request.headers['idempotency-key']),action,input.consent,request.ip);
+      const eventId=parseIdempotencyKey(request.headers['idempotency-key']);
+      const result = await respondWorkday(database,request.auth,id,eventId,action,input.consent,request.ip);
+      request.log.info({event_id:eventId,user_id:request.auth.userId,tenant_id:request.auth.tenantId,
+        store_id:result.body.storeId,courier_id:result.body.courierId,shift_assignment_id:id,
+        new_status:result.body.status,replayed:result.replayed},'Courier workday transition completed');
       return reply.header('Idempotency-Replayed',String(result.replayed)).status(result.statusCode).send(result.body);
     });
   }

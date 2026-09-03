@@ -12,8 +12,10 @@ describe('encrypted payload', () => {
 
   it('rejects tampered ciphertext', () => {
     const encrypted = encryptPayload({ ok: true }, 'a-secure-test-secret-with-more-than-32-characters');
-    const replacement = encrypted.endsWith('A') ? 'B' : 'A';
-    expect(() => decryptPayload(`${encrypted.slice(0, -1)}${replacement}`,
+    const index = Math.floor(encrypted.length / 2);
+    const replacement = encrypted[index] === 'A' ? 'B' : 'A';
+    const tampered = `${encrypted.slice(0, index)}${replacement}${encrypted.slice(index + 1)}`;
+    expect(() => decryptPayload(tampered,
       'a-secure-test-secret-with-more-than-32-characters')).toThrow();
   });
 });
