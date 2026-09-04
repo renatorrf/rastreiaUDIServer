@@ -80,10 +80,11 @@ export async function storeRoutes(app: FastifyInstance, database: Database, env:
       if (!current.rows[0]) throw notFound('Unidade não encontrada.');
 
       const updated = await client.query(
-        `WITH changed AS (
+         `WITH changed AS (
            UPDATE stores
               SET opening_time = $2, closing_time = $3, operating_weekdays = $4, updated_at = now()
-            WHERE id = $1 AND updated_at = $5::timestamptz
+            WHERE id = $1
+              AND date_trunc('milliseconds', updated_at) = date_trunc('milliseconds', $5::timestamptz)
             RETURNING id
          )
          ${storeSelect}
