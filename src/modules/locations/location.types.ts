@@ -18,6 +18,7 @@ export interface LocationReference {
 }
 
 export interface LocationUpdate {
+  eventId: string;
   tenantId: string;
   storeId: string;
   deliveryId: string;

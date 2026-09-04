@@ -68,7 +68,11 @@ class SocketLocationPublisher implements LocationPublisher, DriverEventPublisher
         try {
           const scope=await resolvePublicTrackingSocket(this.database,this.env,socket.data['trackingToken'] as string);
           if(scope.deliveryId!==deliveryId||scope.tenantId!==event.tenantId)throw new Error('scope mismatch');
-          socket.emit('tracking:changed');
+          socket.emit('tracking:changed', {
+            eventId: event.id,
+            version: event.occurredAt.getTime(),
+            occurredAt: event.occurredAt,
+          });
         }catch{socket.disconnect(true);}
       }
     }
@@ -77,6 +81,9 @@ class SocketLocationPublisher implements LocationPublisher, DriverEventPublisher
   async publish(update: LocationUpdate): Promise<void> {
     await this.state.put(update);
     const internalPayload = {
+      eventId: update.eventId,
+      version: update.capturedAt.getTime(),
+      occurredAt: update.capturedAt,
       deliveryId: update.deliveryId,
       courierId: update.courierId,
       storeId: update.storeId,
@@ -105,6 +112,9 @@ class SocketLocationPublisher implements LocationPublisher, DriverEventPublisher
 
     if (!update.publicVisible) return;
     const publicPayload = {
+      eventId: update.eventId,
+      version: update.capturedAt.getTime(),
+      occurredAt: update.capturedAt,
       latitude: update.latitude,
       longitude: update.longitude,
       accuracy: update.accuracy,

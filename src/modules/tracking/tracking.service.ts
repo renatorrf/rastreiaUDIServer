@@ -1,10 +1,12 @@
 import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
+import type { RouteDirectionsProvider, RouteDirectionsResult } from '../../integrations/geo/geo-provider.js';
+import { isValidGeoPoint } from '../../integrations/geo/geo-point.js';
 import {
   setTenantContext, withRuntimeTransaction, withTenantTransaction, type Database,
 } from '../../database/pool.js';
 import { writeAudit } from '../../shared/audit.js';
-import { conflict, forbidden, notFound } from '../../shared/errors.js';
+import { AppError, conflict, forbidden, notFound } from '../../shared/errors.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import type { DeliveryStatus } from '../deliveries/delivery.types.js';
 import type { LocationStateStore } from '../locations/location-state.store.js';
@@ -15,6 +17,50 @@ import {
 const anonymousUserId = '00000000-0000-0000-0000-000000000000';
 const publicLocationStatuses: DeliveryStatus[] = ['IN_ROUTE', 'NEXT_STOP'];
 const unavailableMessage = 'Acompanhamento indisponível.';
+const recentLocationMs = 120_000;
+
+interface TrackingRoute {
+  provider: RouteDirectionsResult['provider'];
+  distanceM: number;
+  durationS: number;
+  geometry: RouteDirectionsResult['geometry'];
+  calculatedAt: Date;
+}
+
+type TrackingRouteState = 'READY' | 'DESTINATION_PROTECTED' | 'POSITION_UNAVAILABLE' | 'ROUTE_UNAVAILABLE';
+
+interface TrackingRouteResult {
+  state: TrackingRouteState;
+  route: TrackingRoute | null;
+}
+
+interface RouteCandidate {
+  origin: { latitude: number; longitude: number };
+  destination: { latitude: number; longitude: number };
+}
+
+async function calculateTrackingRoute(
+  provider: RouteDirectionsProvider,
+  candidate: RouteCandidate | null,
+  unavailableState: Exclude<TrackingRouteState, 'READY' | 'ROUTE_UNAVAILABLE'>,
+): Promise<TrackingRouteResult> {
+  if (!candidate) return { state: unavailableState, route: null };
+  try {
+    const result = await provider.calculateRoute(candidate.origin, candidate.destination, 'motorcycle');
+    return {
+      state: 'READY',
+      route: {
+        provider: result.provider,
+        distanceM: result.distanceM,
+        durationS: result.durationS,
+        geometry: result.geometry,
+        calculatedAt: new Date(),
+      },
+    };
+  } catch {
+    return { state: 'ROUTE_UNAVAILABLE', route: null };
+  }
+}
 
 interface TrackingDeliveryRow {
   tenantId: string;
@@ -166,11 +212,12 @@ export async function getPublicTracking(
   database: Database,
   env: AppEnv,
   state: LocationStateStore,
+  directions: RouteDirectionsProvider,
   token: string,
   ip?: string,
 ) {
   const hash = trackingTokenHash(token, env.TRACKING_TOKEN_PEPPER);
-  return withRuntimeTransaction(database, async (client) => {
+  const result = await withRuntimeTransaction(database, async (client) => {
     await client.query("SELECT set_config('app.tracking_hash', $1, true)", [hash]);
     const lookup = await client.query<{ id: string; tenant_id: string; delivery_id: string }>(
       `SELECT id, tenant_id, delivery_id
@@ -276,7 +323,21 @@ export async function getPublicTracking(
       && (!databaseLocation || cachedLocation.capturedAt > databaseLocation.capturedAt)
       ? cachedLocation
       : databaseLocation;
-    return {
+    const locationIsRecent = selectedLocation
+      ? selectedLocation.capturedAt.getTime() >= Date.now() - recentLocationMs
+      : false;
+    const routeCandidate = revealDestination && publicLocationStatuses.includes(delivery.status)
+      && selectedLocation && locationIsRecent
+      ? {
+          origin: { latitude: selectedLocation.latitude, longitude: selectedLocation.longitude },
+          destination: {
+            latitude: delivery.destinationLatitude,
+            longitude: delivery.destinationLongitude,
+          },
+        }
+      : null;
+    return { routeCandidate, routeUnavailableState: revealDestination ? 'POSITION_UNAVAILABLE' as const
+      : 'DESTINATION_PROTECTED' as const, snapshot: {
       store: { name: delivery.storeName, contactPhone: delivery.storeContactPhone },
       reference: delivery.externalReference,
       status: delivery.status,
@@ -326,8 +387,60 @@ export async function getPublicTracking(
       updatedAt: delivery.updatedAt,
       expiresAt: delivery.expiresAt,
       history: history.rows,
+    } };
+  });
+  const routing = await calculateTrackingRoute(directions, result.routeCandidate, result.routeUnavailableState);
+  return { ...result.snapshot, routing };
+}
+
+export async function getOperationalDeliveryRoute(
+  database: Database,
+  state: LocationStateStore,
+  directions: RouteDirectionsProvider,
+  auth: AuthContext,
+  deliveryId: string,
+): Promise<TrackingRouteResult & { destination: { latitude: number; longitude: number } }> {
+  const candidate = await withTenantTransaction(database, auth, async (client) => {
+    const result = await client.query<{
+      storeId: string; status: DeliveryStatus; courierId: string | null;
+      latitude: number; longitude: number; locationLatitude: number | null;
+      locationLongitude: number | null; locationCapturedAt: Date | null;
+    }>(`SELECT delivery.store_id AS "storeId", delivery.status,
+              delivery.courier_profile_id AS "courierId", delivery.latitude, delivery.longitude,
+              location.latitude AS "locationLatitude", location.longitude AS "locationLongitude",
+              location.captured_at AS "locationCapturedAt"
+         FROM deliveries delivery
+         LEFT JOIN courier_last_locations location
+           ON location.tenant_id = delivery.tenant_id
+          AND location.delivery_id = delivery.id
+        WHERE delivery.id = $1`, [deliveryId]);
+    const delivery = result.rows[0];
+    if (!delivery) throw notFound('Entrega não encontrada.');
+    assertDeliveryAccess(auth, delivery.storeId);
+    const destination = { latitude: delivery.latitude, longitude: delivery.longitude };
+    if (!isValidGeoPoint(destination)) {
+      throw new AppError(422, 'DELIVERY_DESTINATION_COORDINATES_REQUIRED',
+        'A entrega não possui coordenadas de destino válidas.', { destination: 'Revise o endereço da entrega.' });
+    }
+    const cached = await state.getDelivery(auth.tenantId, deliveryId);
+    const databaseLocation = delivery.locationLatitude !== null && delivery.locationLongitude !== null
+      && delivery.locationCapturedAt
+      ? { latitude: delivery.locationLatitude, longitude: delivery.locationLongitude,
+          capturedAt: delivery.locationCapturedAt }
+      : null;
+    const location = cached && (!databaseLocation || cached.capturedAt > databaseLocation.capturedAt)
+      ? cached : databaseLocation;
+    const routeAllowed = publicLocationStatuses.includes(delivery.status);
+    const recent = location && location.capturedAt.getTime() >= Date.now() - recentLocationMs;
+    return {
+      destination,
+      routeCandidate: routeAllowed && recent
+        ? { origin: { latitude: location.latitude, longitude: location.longitude }, destination }
+        : null,
     };
   });
+  const routing = await calculateTrackingRoute(directions, candidate.routeCandidate, 'POSITION_UNAVAILABLE');
+  return { ...routing, destination: candidate.destination };
 }
 
 export async function resolvePublicTrackingSocket(

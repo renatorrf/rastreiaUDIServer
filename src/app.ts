@@ -166,7 +166,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await reputationRoutes(app, database, env);
   await routeRoutes(app, database, env, options.routeMatrixProvider ?? geoapify,
     options.routeDirectionsProvider ?? geoapify);
-  await trackingRoutes(app, database, env, locationState);
+  await trackingRoutes(app, database, env, locationState, options.routeDirectionsProvider ?? geoapify);
   await locationRoutes(app, database, env, realtime.publisher, locationState);
   await workdayRoutes(app, database, env, realtime.publisher);
   await operationalMetricsRoutes(app, database, env);

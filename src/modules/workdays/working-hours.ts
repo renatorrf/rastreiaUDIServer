@@ -1,10 +1,13 @@
 import { z } from 'zod';
 
+export const localTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+export const operatingWeekdaysSchema = z.array(z.number().int().min(0).max(6)).min(1).max(7)
+  .refine(days => new Set(days).size === days.length, 'Não repita dias da semana.');
+
 export const workingHoursFields = {
-  openingTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable().optional(),
-  closingTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable().optional(),
-  operatingWeekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7)
-    .refine(days => new Set(days).size === days.length, 'Não repita dias da semana.').default([0,1,2,3,4,5,6]),
+  openingTime: localTimeSchema.nullable().optional(),
+  closingTime: localTimeSchema.nullable().optional(),
+  operatingWeekdays: operatingWeekdaysSchema.default([0,1,2,3,4,5,6]),
 };
 export function validWorkingHours(input: { openingTime?: string | null | undefined; closingTime?: string | null | undefined }): boolean {
   return (!input.openingTime && !input.closingTime)

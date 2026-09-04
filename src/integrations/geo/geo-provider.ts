@@ -10,6 +10,8 @@ export interface AddressSuggestion {
   latitude: number;
   longitude: number;
   confidence: number | null;
+  countryCode: string | null;
+  resultType: string | null;
 }
 
 export interface AddressAutocompleteInput {

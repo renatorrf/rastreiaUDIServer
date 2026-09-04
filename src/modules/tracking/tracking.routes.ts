@@ -2,10 +2,13 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import type { Database } from '../../database/pool.js';
+import type { RouteDirectionsProvider } from '../../integrations/geo/geo-provider.js';
 import { notFound } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import type { LocationStateStore } from '../locations/location-state.store.js';
-import { getPublicTracking, issueTrackingLink, revokeTrackingLink } from './tracking.service.js';
+import {
+  getOperationalDeliveryRoute, getPublicTracking, issueTrackingLink, revokeTrackingLink,
+} from './tracking.service.js';
 import { trackingTokenHash } from './tracking-token.js';
 
 const deliveryIdSchema = z.object({ id: z.uuid() });
@@ -16,6 +19,7 @@ export async function trackingRoutes(
   database: Database,
   env: AppEnv,
   state: LocationStateStore,
+  directions: RouteDirectionsProvider,
 ): Promise<void> {
   const auth = authenticate(env, database);
 
@@ -31,6 +35,14 @@ export async function trackingRoutes(
   }, async (request) => {
     const { id } = deliveryIdSchema.parse(request.params);
     return revokeTrackingLink(database, request.auth, id, request.ip);
+  });
+
+  app.get('/deliveries/:id/tracking-route', {
+    preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR', 'COURIER')],
+  }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const { id } = deliveryIdSchema.parse(request.params);
+    return getOperationalDeliveryRoute(database, state, directions, request.auth, id);
   });
 
   app.get('/public/tracking/:token', {
@@ -49,6 +61,6 @@ export async function trackingRoutes(
     reply.header('Referrer-Policy', 'no-referrer');
     const parsed = publicTokenSchema.safeParse(request.params);
     if (!parsed.success) throw notFound('Acompanhamento indisponível.');
-    return getPublicTracking(database, env, state, parsed.data.token, request.ip);
+    return getPublicTracking(database, env, state, directions, parsed.data.token, request.ip);
   });
 }

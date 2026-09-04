@@ -2,9 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
-import { forbidden } from '../../shared/errors.js';
-import { authenticate } from '../auth/auth.guard.js';
-import { workingHoursFields, validWorkingHours } from '../workdays/working-hours.js';
+import { writeAudit } from '../../shared/audit.js';
+import { conflict, forbidden, notFound } from '../../shared/errors.js';
+import { authenticate, requireRoles } from '../auth/auth.guard.js';
+import type { AuthContext } from '../auth/auth.types.js';
+import {
+  localTimeSchema, operatingWeekdaysSchema, workingHoursFields, validWorkingHours,
+} from '../workdays/working-hours.js';
 
 export const storeSchema = z.object({
   ...workingHoursFields,
@@ -22,6 +26,21 @@ export const storeSchema = z.object({
   addressConfidence: z.number().min(0).max(1).nullable().optional(),
   contactPhone: z.string().trim().max(30).nullable().optional(),
 }).refine(validWorkingHours, { path: ['closingTime'], message: 'Informe início e fim diferentes, ou deixe ambos sem configuração.' });
+
+export const storeWorkingHoursSchema = z.object({
+  openingTime: localTimeSchema.nullable(),
+  closingTime: localTimeSchema.nullable(),
+  operatingWeekdays: operatingWeekdaysSchema,
+  updatedAt: z.iso.datetime(),
+}).refine(validWorkingHours, {
+  path: ['closingTime'],
+  message: 'Informe início e fim diferentes, ou deixe ambos sem configuração.',
+});
+
+export function canManageStoreWorkingHours(auth: AuthContext, storeId: string): boolean {
+  return auth.role === 'TENANT_MANAGER'
+    || (auth.role === 'STORE_OPERATOR' && auth.storeIds.includes(storeId));
+}
 
 const storeSelect = `
   SELECT id, name, external_reference AS "externalReference", address_line AS "addressLine",
@@ -45,5 +64,55 @@ export async function storeRoutes(app: FastifyInstance, database: Database, env:
 
   app.post('/stores', { preHandler: auth }, async () => {
     throw forbidden('Somente o Master pode cadastrar unidades pelo painel administrativo.');
+  });
+
+  app.patch('/stores/:id/working-hours', {
+    preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')],
+  }, async (request) => {
+    const { id } = z.object({ id: z.uuid() }).parse(request.params);
+    const input = storeWorkingHoursSchema.parse(request.body);
+    if (!canManageStoreWorkingHours(request.auth, id)) {
+      throw forbidden('Você só pode alterar os horários das unidades vinculadas ao seu acesso.');
+    }
+
+    return withTenantTransaction(database, request.auth, async (client) => {
+      const current = await client.query(`${storeSelect} WHERE id = $1`, [id]);
+      if (!current.rows[0]) throw notFound('Unidade não encontrada.');
+
+      const updated = await client.query(
+        `WITH changed AS (
+           UPDATE stores
+              SET opening_time = $2, closing_time = $3, operating_weekdays = $4, updated_at = now()
+            WHERE id = $1 AND updated_at = $5::timestamptz
+            RETURNING id
+         )
+         ${storeSelect}
+         JOIN changed ON changed.id = stores.id`,
+        [id, input.openingTime, input.closingTime, input.operatingWeekdays, input.updatedAt],
+      );
+      if (!updated.rows[0]) {
+        throw conflict('Os horários foram alterados em outra sessão. Recarregue os dados antes de tentar novamente.');
+      }
+
+      await writeAudit(client, {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'store.working_hours.updated',
+        entityType: 'store',
+        entityId: id,
+        beforeData: {
+          openingTime: current.rows[0].openingTime,
+          closingTime: current.rows[0].closingTime,
+          operatingWeekdays: current.rows[0].operatingWeekdays,
+        },
+        afterData: {
+          openingTime: input.openingTime,
+          closingTime: input.closingTime,
+          operatingWeekdays: input.operatingWeekdays,
+        },
+        ip: request.ip,
+      });
+      return updated.rows[0];
+    });
   });
 }

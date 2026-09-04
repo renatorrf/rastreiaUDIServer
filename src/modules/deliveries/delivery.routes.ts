@@ -2,7 +2,9 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import type { Database } from '../../database/pool.js';
+import { isValidGeoPoint } from '../../integrations/geo/geo-point.js';
 import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempotency.js';
+import { AppError } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
   assignDelivery, createDelivery, getDelivery, listDeliveries, transitionDelivery,
@@ -44,6 +46,26 @@ const listSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
+export function parseCreateDelivery(body: unknown): z.infer<typeof createDeliverySchema> {
+  const candidate = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+  const latitude = candidate['latitude'];
+  const longitude = candidate['longitude'];
+  if (typeof latitude !== 'number' || typeof longitude !== 'number'
+    || !isValidGeoPoint({ latitude, longitude })) {
+    throw new AppError(
+      422,
+      'DELIVERY_DESTINATION_COORDINATES_REQUIRED',
+      'Selecione novamente o endereço de entrega.',
+      {
+        destination: 'O endereço não possui coordenadas válidas.',
+        latitude: 'Selecione uma sugestão de endereço válida.',
+        longitude: 'Selecione uma sugestão de endereço válida.',
+      },
+    );
+  }
+  return createDeliverySchema.parse(body);
+}
+
 function keyFrom(request: FastifyRequest): string {
   return parseIdempotencyKey(request.headers['idempotency-key']);
 }
@@ -67,7 +89,7 @@ export async function deliveryRoutes(app: FastifyInstance, database: Database, e
   });
 
   app.post('/deliveries', { preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')] }, async (request, reply) => {
-    const input = createDeliverySchema.parse(request.body);
+    const input = parseCreateDelivery(request.body);
     const result = await createDelivery(database, request.auth, keyFrom(request), input, request.ip);
     return sendIdempotent(reply, result);
   });

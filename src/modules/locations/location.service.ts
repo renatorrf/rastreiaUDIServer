@@ -184,6 +184,7 @@ export async function processLocationPoints(
     previous = { ...point, deliveryId: delivery.id };
     results.push({ eventId: point.eventId, accepted: true, duplicate: false, sampled });
     updates.push({
+      eventId: point.eventId,
       tenantId: auth.tenantId, storeId: delivery.storeId, deliveryId: delivery.id, courierId,
       latitude: point.latitude, longitude: point.longitude, accuracy: point.accuracy,
       speed: point.speed ?? null, heading: point.heading ?? null, capturedAt: point.capturedAt,

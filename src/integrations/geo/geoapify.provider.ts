@@ -3,6 +3,7 @@ import type {
   RouteDirectionsProvider, RouteDirectionsResult, RouteGeometry, RouteMatrixLocation,
   RouteMatrixProvider, RouteMatrixResult,
 } from './geo-provider.js';
+import { toGeoapifyWaypoint } from './geo-point.js';
 
 interface GeoapifyFeature {
   properties?: {
@@ -22,6 +23,8 @@ interface GeoapifyFeature {
     postcode?: string;
     lat?: number;
     lon?: number;
+    country_code?: string;
+    result_type?: string;
     rank?: { confidence?: number };
   };
 }
@@ -103,6 +106,8 @@ export class GeoapifyProvider implements GeocodingProvider, MapTilesProvider, Ro
         latitude: item.lat,
         longitude: item.lon,
         confidence: item.rank?.confidence ?? null,
+        countryCode: item.country_code ?? null,
+        resultType: item.result_type ?? null,
       }];
     });
   }
@@ -131,7 +136,7 @@ export class GeoapifyProvider implements GeocodingProvider, MapTilesProvider, Ro
   ): Promise<RouteDirectionsResult> {
     if (!this.apiKey) throw new Error('GEOAPIFY_NOT_CONFIGURED');
     const url = new URL('https://api.geoapify.com/v1/routing');
-    url.searchParams.set('waypoints', `${origin.latitude},${origin.longitude}|${destination.latitude},${destination.longitude}`);
+    url.searchParams.set('waypoints', `${toGeoapifyWaypoint(origin)}|${toGeoapifyWaypoint(destination)}`);
     url.searchParams.set('mode', mode);
     url.searchParams.set('lang', 'pt-BR');
     url.searchParams.set('details', 'instruction_details');

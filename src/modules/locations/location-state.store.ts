@@ -26,6 +26,9 @@ function parseUpdate(value: string | null): LocationUpdate | null {
     const capturedAt = new Date(parsed.capturedAt);
     if (Number.isNaN(capturedAt.getTime())) return null;
     return {
+      eventId: typeof parsed.eventId === 'string'
+        ? parsed.eventId
+        : `location:${parsed.deliveryId}:${capturedAt.getTime()}`,
       tenantId: parsed.tenantId,
       storeId: parsed.storeId,
       deliveryId: parsed.deliveryId,

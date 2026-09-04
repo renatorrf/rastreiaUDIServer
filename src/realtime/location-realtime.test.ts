@@ -16,7 +16,7 @@ const active=new Set<string>();
 const clients:Socket[]=[];
 let realtime:Awaited<ReturnType<typeof createLocationRealtime>>|undefined;
 const update={tenantId:'tenant-a',storeId:'store-a',deliveryId:'delivery-a',courierId:'courier-a',latitude:-18.9,longitude:-48.2,
-  accuracy:10,speed:null,heading:null,capturedAt:new Date(),publicVisible:true};
+  eventId:'location-event-a',accuracy:10,speed:null,heading:null,capturedAt:new Date(),publicVisible:true};
 async function setup(){
   const server=createServer();
   const database={connect:async()=>({query:async(sql:string,values:unknown[]=[])=>({rows:sql.includes('tenant_session_is_current')?[{allowed:active.has(String(values[1]))}]:[]}),release:()=>{}})} as unknown as Database;
@@ -47,7 +47,9 @@ describe('location namespace isolation (local adapter, mocked authorization)',()
       if(revoked&&value===token)throw new Error('revoked');return {tokenId:value,tenantId:'tenant-a',deliveryId:value===token?'delivery-a':'delivery-b'};});
     const url=await setup(),a=await connect(url,'/tracking',{token}),b=await connect(url,'/tracking',{token:otherToken});const other=vi.fn();b.on('location:update',other);
     const received=new Promise<Record<string,unknown>>(resolve=>a.once('location:update',resolve));await realtime!.publisher.publish(update);
-    const payload=await received;expect(Object.keys(payload).sort()).toEqual(['accuracy','capturedAt','heading','latitude','longitude','stale']);expect(other).not.toHaveBeenCalled();
+    const payload=await received;expect(Object.keys(payload).sort()).toEqual([
+      'accuracy','capturedAt','eventId','heading','latitude','longitude','occurredAt','stale','version',
+    ]);expect(other).not.toHaveBeenCalled();
     revoked=true;const disconnected=new Promise<void>(resolve=>a.once('disconnect',()=>resolve()));await realtime!.publisher.publish(update);await disconnected;expect(a.connected).toBe(false);
   });
 });
