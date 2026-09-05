@@ -92,7 +92,7 @@ const envSchema = z.object({
   PUBLIC_TRACKING_BASE_URL: optionalSecret,
   TRACKING_TOKEN_PEPPER: z.string().min(32),
   TRACKING_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(604_800),
-  TRACKING_COMPLETED_GRACE_SECONDS: z.coerce.number().int().positive().default(3_600),
+  TRACKING_COMPLETED_GRACE_SECONDS: z.coerce.number().int().positive().default(86_400),
   BACKGROUND_TRACKING_SESSION_TTL_SECONDS: z.coerce.number().int().min(900).max(86_400).default(43_200),
   RETENTION_LOCATION_DAYS: z.coerce.number().int().min(7).max(730).default(90),
   RETENTION_AUDIT_DAYS: z.coerce.number().int().min(90).max(3_650).default(365),

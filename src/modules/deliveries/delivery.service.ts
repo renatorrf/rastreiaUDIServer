@@ -11,6 +11,7 @@ import type { DeliveryRecord, DeliveryStatus } from './delivery.types.js';
 import { completeOfferForDelivery } from '../offers/offer.service.js';
 import { createFailureIncident } from '../incidents/incident.repository.js';
 import { requireCourierCheckin } from '../workdays/workday.service.js';
+import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 
 export interface CreateDeliveryInput {
   storeId: string;
@@ -310,23 +311,30 @@ export async function createDeliveryInTransaction(client: PoolClient, auth: Auth
       if (!store.rowCount) throw notFound('Loja não encontrada.');
 
       const deliveryId = randomUUID();
+      const normalizedPhone = normalizeCustomerPhone(input.recipientWhatsapp ?? input.recipientPhone);
+      const customerProfileId = /^\d{10,11}$/.test(normalizedPhone)
+        ? (await client.query<{ id: string }>(`SELECT id FROM customer_profiles
+            WHERE tenant_id=$1 AND whatsapp_normalized=$2 AND status='ACTIVE' LIMIT 1`,
+          [auth.tenantId, normalizedPhone])).rows[0]?.id ?? null
+        : null;
       await client.query(
         `INSERT INTO deliveries
            (id, tenant_id, store_id, external_reference, recipient_name, recipient_phone,
             recipient_whatsapp, address_line, address_number, complement, neighborhood,
             city, state, postal_code, latitude, longitude, address_confidence,
             delivery_instructions, status, promised_window_start, promised_window_end,
-            created_by, updated_by)
+            created_by, updated_by, customer_profile_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15, $16, $17, $18, $22, $19, $20, $21, $21)`,
+                 $15, $16, $17, $18, $22, $19, $20, $21, $21, $23)`,
         [deliveryId, auth.tenantId, input.storeId, input.externalReference ?? null,
           input.recipientName, input.recipientPhone, input.recipientWhatsapp ?? null,
           input.addressLine, input.addressNumber ?? null, input.complement ?? null,
           input.neighborhood ?? null, input.city, input.state, input.postalCode ?? null,
           input.latitude, input.longitude, input.addressConfidence ?? null,
           input.deliveryInstructions ?? null, input.promisedWindowStart ?? null,
-          input.promisedWindowEnd ?? null, auth.userId, initialStatus],
+          input.promisedWindowEnd ?? null, auth.userId, initialStatus, customerProfileId],
       );
+      if(customerProfileId)await client.query('UPDATE customer_profiles SET last_order_at=now() WHERE id=$1',[customerProfileId]);
       const delivery = await loadCurrentRecord(client, auth, deliveryId);
       await appendHistory(client, auth, delivery, null);
       await writeAudit(client, {

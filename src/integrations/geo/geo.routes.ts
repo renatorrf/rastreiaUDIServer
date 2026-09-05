@@ -36,6 +36,21 @@ export async function geoRoutes(
   app.get('/maps/config', { preHandler: auth }, async () => publicMapConfig());
   app.get('/public/maps/config', async () => publicMapConfig());
 
+  app.get('/public/geo/autocomplete', { config:{rateLimit:{max:30,timeWindow:'1 minute'}} }, async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    const input=autocompleteSchema.omit({companyId:true}).parse(request.query);
+    try {
+      return {data:await geocoding.autocomplete({query:input.q,
+        ...(input.latitude===undefined?{}:{latitude:input.latitude}),
+        ...(input.longitude===undefined?{}:{longitude:input.longitude}),
+        ...(input.city===undefined?{}:{city:input.city})})};
+    } catch(error) {
+      if((error as Error).message==='GEOAPIFY_NOT_CONFIGURED')throw new AppError(503,'GEOAPIFY_NOT_CONFIGURED','Autocomplete ainda não foi configurado.');
+      request.log.warn({err:error},'Falha ao consultar provedor público de geocoding');
+      throw new AppError(502,'GEOCODING_UNAVAILABLE','Serviço de endereços temporariamente indisponível.');
+    }
+  });
+
   for(const [path,guard] of [['/geo/autocomplete',auth],['/platform/geo/autocomplete',authenticatePlatform(env,database)]] as const){
   app.get(path, { preHandler: guard, config:{rateLimit:{max:60,timeWindow:'1 minute'}} }, async (request,reply) => {
     reply.header('Cache-Control','no-store');

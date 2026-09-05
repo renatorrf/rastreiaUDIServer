@@ -455,11 +455,78 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
   }
 }
 
+function customerPushCopy(eventType: string): { title: string; body: string } | null {
+  const copy: Record<string, { title: string; body: string }> = {
+    'delivery.assigned': { title: 'Seu pedido está sendo preparado', body: 'A loja já organizou a entrega do seu pedido.' },
+    'delivery.collect': { title: 'Pedido coletado', body: 'Seu pedido foi retirado na loja e seguirá para o endereço informado.' },
+    'delivery.start': { title: 'Seu pedido saiu para entrega', body: 'Acompanhe o andamento pelo Rastreia.' },
+    'delivery.complete': { title: 'Pedido entregue', body: 'Maravilha, sua entrega foi concluída.' },
+    'delivery.fail': { title: 'Atualização da entrega', body: 'A loja registrou uma ocorrência na sua entrega.' },
+    'delivery.cancel': { title: 'Entrega cancelada', body: 'A entrega foi cancelada. Fale com a loja para mais informações.' },
+  };
+  return copy[eventType] ?? null;
+}
+
+async function processCustomerPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
+  const copy = customerPushCopy(event.event_type);
+  if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
+  const result = await database.query<{ id: string; endpoint: string; p256dh: string; auth_secret: string }>(
+    `SELECT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret
+     FROM rastreia.deliveries delivery
+     JOIN rastreia.customer_push_subscriptions subscription
+       ON subscription.tenant_id=delivery.tenant_id
+      AND subscription.customer_profile_id=delivery.customer_profile_id
+      AND subscription.active
+     WHERE delivery.id=$1 AND delivery.tenant_id=$2`,
+    [event.aggregate_id, event.tenant_id],
+  );
+  const notificationKey = `customer:${event.aggregate_id}:${event.event_type}`;
+  const customerAppUrl = (env.PUSH_APP_URL || env.PUSH_DEFAULT_OPEN_URL).replace(/\/+$/, '');
+  for (const subscription of result.rows) {
+    try {
+      await webpush.sendNotification({
+        endpoint: subscription.endpoint,
+        keys: { p256dh: subscription.p256dh, auth: subscription.auth_secret },
+      }, JSON.stringify({
+        notification: {
+          title: copy.title,
+          body: copy.body,
+          tag: notificationKey,
+          renotify: false,
+          icon: env.PUSH_NOTIFICATION_ICON_URL || undefined,
+          badge: env.PUSH_NOTIFICATION_BADGE_URL || undefined,
+          data: { onActionClick: { default: { operation: 'navigateLastFocusedOrOpen',
+            url: `${customerAppUrl}/cliente` } } },
+        },
+      }), {
+        vapidDetails: {
+          subject: env.PUSH_VAPID_SUBJECT,
+          publicKey: env.PUSH_VAPID_PUBLIC_KEY,
+          privateKey: env.PUSH_VAPID_PRIVATE_KEY,
+        },
+        TTL: 300,
+        urgency: 'high',
+        topic: createHash('sha256').update(notificationKey).digest('base64url').slice(0, 32),
+      });
+      await database.query(`UPDATE rastreia.customer_push_subscriptions
+        SET last_success_at=now(),failure_count=0 WHERE id=$1`, [subscription.id]);
+    } catch (error) {
+      const statusCode = (error as { statusCode?: number }).statusCode;
+      const invalid = statusCode === 404 || statusCode === 410;
+      await database.query(`UPDATE rastreia.customer_push_subscriptions
+        SET active=CASE WHEN $2 THEN false ELSE active END,last_failure_at=now(),failure_count=failure_count+1
+        WHERE id=$1`, [subscription.id, invalid]);
+      if (!invalid) throw new ProviderError('PUSH_UNAVAILABLE', statusCode);
+    }
+  }
+}
+
 async function processEvent(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   if (event.event_type === 'communication.tracking.requested') await processMessage(database, env, event);
   else if (event.event_type === 'push.test' || event.event_type.startsWith('delivery.') || event.event_type.startsWith('shift.')
       || event.event_type.startsWith('offer.') || event.event_type.startsWith('workday.')) {
     await processPush(database, env, event);
+    if (event.event_type.startsWith('delivery.')) await processCustomerPush(database, env, event);
   }
 }
 

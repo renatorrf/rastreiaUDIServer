@@ -24,6 +24,7 @@ import { billingRoutes } from './modules/billing/billing.routes.js';
 import { organizationRoutes } from './modules/organization/organization.routes.js';
 import { organizationOperationsRoutes } from './modules/organization/operations.routes.js';
 import { courierRoutes } from './modules/couriers/courier.routes.js';
+import { customerRoutes } from './modules/customers/customer.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
 import { deliveryRoutes } from './modules/deliveries/delivery.routes.js';
@@ -65,7 +66,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     logger: {
       level: env.LOG_LEVEL,
       redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-master-login-grant"]',
-        'res.headers.set-cookie', '*.password', '*.token', '*.grant', '*.apiKey'],
+        'req.headers.x-customer-token', 'res.headers.set-cookie', '*.password', '*.token', '*.grant', '*.apiKey'],
       serializers: {
         req(request) {
           const url = typeof request.url === 'string' && request.url.startsWith('/public/tracking/')
@@ -159,6 +160,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await storeRoutes(app, database, env);
   await userRoutes(app, database, env);
   await courierRoutes(app, database, env);
+  await customerRoutes(app, database, env);
   await communicationRoutes(app, database, env);
   await communicationWebhookRoutes(app, database, env);
   await deliveryRoutes(app, database, env);

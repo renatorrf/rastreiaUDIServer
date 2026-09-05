@@ -42,4 +42,9 @@ describe('Master geocoding route',()=>{
     autocomplete.mockRejectedValueOnce(new Error('GEOAPIFY_NOT_CONFIGURED'));
     expect((await app.inject({url:'/platform/geo/autocomplete?q=Avenida',headers:{authorization:'Bearer master'}})).statusCode).toBe(503);
   });
+  it('exposes a rate-limited public autocomplete without requiring an access token',async()=>{
+    const response=await app.inject('/public/geo/autocomplete?q=Avenida%20Brasil%2C%202662&city=Uberl%C3%A2ndia');
+    expect(response.statusCode).toBe(200);expect(response.headers['cache-control']).toBe('no-store');
+    expect(autocomplete).toHaveBeenCalledWith({query:'Avenida Brasil, 2662',city:'Uberlândia'});
+  });
 });
