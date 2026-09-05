@@ -43,11 +43,13 @@ export function canManageStoreWorkingHours(auth: AuthContext, storeId: string): 
 }
 
 const storeSelect = `
-  SELECT id, name, external_reference AS "externalReference", address_line AS "addressLine",
-         address_number AS "addressNumber", complement, neighborhood, city, state,
-         postal_code AS "postalCode", latitude, longitude, address_confidence AS "addressConfidence",
-         contact_phone AS "contactPhone", opening_time::text AS "openingTime", closing_time::text AS "closingTime",
-         operating_weekdays AS "operatingWeekdays", status, created_at AS "createdAt", updated_at AS "updatedAt"
+  SELECT stores.id, stores.name, stores.external_reference AS "externalReference", stores.address_line AS "addressLine",
+         stores.address_number AS "addressNumber", stores.complement, stores.neighborhood, stores.city, stores.state,
+         stores.postal_code AS "postalCode", stores.latitude::float8 AS latitude, stores.longitude::float8 AS longitude,
+         stores.address_confidence::float8 AS "addressConfidence", stores.contact_phone AS "contactPhone",
+         stores.opening_time::text AS "openingTime", stores.closing_time::text AS "closingTime",
+         stores.operating_weekdays AS "operatingWeekdays", stores.status, stores.created_at AS "createdAt",
+         stores.updated_at AS "updatedAt"
   FROM stores`;
 
 export async function storeRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {

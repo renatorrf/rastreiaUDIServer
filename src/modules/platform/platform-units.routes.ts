@@ -63,7 +63,11 @@ export async function platformUnitRoutes(app:FastifyInstance,database:Database,e
   const auth=authenticatePlatform(env,database);
   app.get('/platform/stores',{preHandler:auth},async request=>withPlatformTransaction(database,request.platformAuth,async client=>{
     const f=contextFilterSchema.parse(request.query);
-    const result=await client.query(`SELECT store.*,tenant.name AS tenant_name,company.name AS company_name,profile.id AS billing_profile_id,count(*) OVER()::int AS total_count,
+    const result=await client.query(`SELECT store.id,store.tenant_id,store.company_id,store.name,store.status,store.address_line,store.address_number,
+      store.complement,store.neighborhood,store.city,store.state,store.postal_code,store.latitude::float8 AS latitude,
+      store.longitude::float8 AS longitude,store.address_confidence::float8 AS address_confidence,store.contact_phone,
+      store.updated_at,store.opening_time::text AS opening_time,store.closing_time::text AS closing_time,store.operating_weekdays,
+      tenant.name AS tenant_name,company.name AS company_name,profile.id AS billing_profile_id,count(*) OVER()::int AS total_count,
       (hold.blocked_at IS NOT NULL AND hold.released_at IS NULL AND (hold.waiver_until IS NULL OR hold.waiver_until<=now())) AS financially_blocked
       FROM stores store JOIN tenants tenant ON tenant.id=store.tenant_id JOIN companies company ON company.id=store.company_id LEFT JOIN billing_profiles profile ON profile.store_id=store.id
       LEFT JOIN unit_financial_holds hold ON hold.store_id=store.id WHERE ($1::uuid IS NULL OR store.tenant_id=$1)
