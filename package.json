@@ -44,7 +44,8 @@
     "smoke:people-directory": "tsx src/smoke/people-directory.ts",
     "smoke:incidents": "tsx src/smoke/incidents-and-returns.ts",
     "smoke:tenant-settings": "tsx src/smoke/tenant-settings.ts",
-    "smoke:courier-onboarding": "tsx src/smoke/courier-onboarding.ts"
+    "smoke:courier-onboarding": "tsx src/smoke/courier-onboarding.ts",
+    "smoke:customer-portal": "tsx src/smoke/customer-portal.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1114.0",

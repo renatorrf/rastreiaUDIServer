@@ -12,7 +12,7 @@ import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { assertIdentity, passwordOptions, setIdentity } from '../auth/identity.service.js';
 import { trackingTokenHash } from '../tracking/tracking-token.js';
-import { customerPhoneMatches, normalizeCustomerPhone } from './customer-phone.js';
+import { customerPhoneMatches, customerPhoneStorageVariants, normalizeCustomerPhone } from './customer-phone.js';
 
 const anonymousUserId = '00000000-0000-0000-0000-000000000000';
 const publicTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
@@ -139,21 +139,22 @@ export async function customerRoutes(app: FastifyInstance, database: Database, s
     const trackingHash = trackingTokenHash(input.trackingToken, env.TRACKING_TOKEN_PEPPER);
     return withRuntimeTransaction(database, async client => {
       await client.query("SELECT set_config('app.tracking_hash',$1,true)", [trackingHash]);
-      const link = (await client.query<{ id: string; tenant_id: string; delivery_id: string }>(`
-        SELECT id,tenant_id,delivery_id FROM tracking_tokens
-        WHERE token_hash=$1 AND revoked_at IS NULL
-          AND expires_at + ($2::text || ' seconds')::interval > now()
-        LIMIT 1`, [trackingHash, env.CUSTOMER_REGISTRATION_GRACE_SECONDS])).rows[0];
+      const link = (await client.query<{
+        token_id: string;
+        tenant_id: string;
+        delivery_id: string;
+        recipient_phone: string;
+        recipient_whatsapp: string | null;
+      }>(`SELECT * FROM rastreia.customer_registration_context($1,$2)`,
+      [trackingHash, env.CUSTOMER_REGISTRATION_GRACE_SECONDS])).rows[0];
       if (!link) throw notFound('O prazo para criar a conta por este link encerrou ou o link foi substituído.');
       await setTenantContext(client, { tenantId: link.tenant_id, userId: anonymousUserId });
-      const delivery = (await client.query<{ recipient_phone: string; recipient_whatsapp: string | null }>(`
-        SELECT recipient_phone,recipient_whatsapp FROM deliveries WHERE id=$1`, [link.delivery_id])).rows[0];
-      if (!delivery) throw notFound('Entrega não encontrada.');
-      if (!customerPhoneMatches(input.whatsapp, delivery.recipient_whatsapp ?? delivery.recipient_phone)) {
+      if (!customerPhoneMatches(input.whatsapp, link.recipient_whatsapp ?? link.recipient_phone)) {
         throw validationError({ whatsapp: 'Use o WhatsApp informado para esta entrega.' });
       }
       const normalized = normalizeCustomerPhone(input.whatsapp);
       if (!/^\d{10,11}$/.test(normalized)) throw validationError({ whatsapp: 'Informe um WhatsApp brasileiro com DDD.' });
+      const phoneVariants = customerPhoneStorageVariants(input.whatsapp);
       const profile = (await client.query<{ id: string;user_id:string|null }>(`
         INSERT INTO customer_profiles(tenant_id,first_name,last_name,whatsapp,whatsapp_normalized,address_line,
           address_number,complement,neighborhood,city,state,postal_code,latitude,longitude,address_confidence,source_tracking_token_id,last_order_at)
@@ -165,11 +166,11 @@ export async function customerRoutes(app: FastifyInstance, database: Database, s
           address_confidence=EXCLUDED.address_confidence,status='ACTIVE',consent_at=now(),last_order_at=now()
         RETURNING id,user_id`, [link.tenant_id, input.firstName, input.lastName, input.whatsapp, normalized, input.addressLine,
         input.addressNumber, input.complement ?? null, input.neighborhood, input.city, input.state, input.postalCode,
-        input.latitude, input.longitude, input.addressConfidence ?? null, link.id])).rows[0]!;
-      await client.query(`UPDATE deliveries SET customer_profile_id=$2
-        WHERE tenant_id=$1 AND customer_profile_id IS NULL
-          AND regexp_replace(COALESCE(NULLIF(recipient_whatsapp,''),recipient_phone),'[^0-9]','','g') IN ($3,'55'||$3)`,
-      [link.tenant_id, profile.id, normalized]);
+        input.latitude, input.longitude, input.addressConfidence ?? null, link.token_id])).rows[0]!;
+      await client.query(
+        'SELECT rastreia.link_customer_delivery_history($1,$2,$3::text[],$4)',
+        [profile.id, link.token_id, phoneVariants, env.CUSTOMER_REGISTRATION_GRACE_SECONDS],
+      );
       if(profile.user_id)throw conflict('Este cliente já possui uma conta. Entre com o e-mail cadastrado ou redefina a senha.');
       const password=temporaryPassword();const userId=randomUUID();
       const created=(await client.query<{created:boolean}>(`SELECT rastreia.register_customer_identity($1,$2,$3,$4,$5) AS created`,
@@ -187,11 +188,7 @@ export async function customerRoutes(app: FastifyInstance, database: Database, s
   }));
 
   app.get('/customer/orders', async request => withCustomerSession(database, env, request, async (client, scope) => ({
-    data: (await client.query(`SELECT delivery.id,delivery.external_reference AS "reference",delivery.status,
-      delivery.created_at AS "createdAt",delivery.delivered_at AS "deliveredAt",delivery.address_line AS "addressLine",
-      delivery.address_number AS "addressNumber",store.name AS "storeName",store.contact_phone AS "storeWhatsapp"
-      FROM deliveries delivery JOIN stores store ON store.id=delivery.store_id
-      WHERE delivery.customer_profile_id=$1 ORDER BY delivery.created_at DESC LIMIT 100`, [scope.customerId])).rows,
+    data: (await client.query('SELECT * FROM rastreia.customer_order_history($1)', [scope.customerId])).rows,
   })));
 
   app.patch('/customer/profile',async request=>{
