@@ -160,7 +160,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await storeRoutes(app, database, env);
   await userRoutes(app, database, env);
   await courierRoutes(app, database, env);
-  await customerRoutes(app, database, env);
+  await customerRoutes(app, database, objectStorage, env);
   await communicationRoutes(app, database, env);
   await communicationWebhookRoutes(app, database, env);
   await deliveryRoutes(app, database, env);

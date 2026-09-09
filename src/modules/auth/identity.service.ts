@@ -11,7 +11,7 @@ import { createTokenPair, hashToken } from './token.service.js';
 import type { TenantRole } from './auth.types.js';
 
 export const passwordOptions = { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 } as const;
-export interface IdentityAccountRow { id:string; email:string; status:string; password_hash:string; email_verified_at:Date|null }
+export interface IdentityAccountRow { id:string; email:string; status:string; password_hash:string; email_verified_at:Date|null; must_change_password:boolean }
 const identityClaims = z.object({ sub: z.string().uuid(), sessionId: z.string().uuid(), tokenType: z.enum(['access','refresh']) });
 export type Identity = { userId: string; sessionId: string };
 export async function setIdentity(client: PoolClient, userId: string) {
@@ -48,7 +48,7 @@ export async function verifyIdentityToken(env: AppEnv, token: string, type: 'acc
   throw unauthorized('Sessão inválida ou expirada.');
 }
 export async function identitySnapshot(client: PoolClient, userId: string) {
-  const account = (await client.query(`SELECT id,name,email FROM users WHERE id=$1 AND status='ACTIVE'
+  const account = (await client.query(`SELECT id,name,email,must_change_password AS "mustChangePassword" FROM users WHERE id=$1 AND status='ACTIVE'
     AND email_verified_at IS NOT NULL`, [userId])).rows[0];
   if (!account) throw unauthorized('Verifique seu e-mail antes de acessar.');
   const units = await client.query('SELECT * FROM rastreia.identity_units($1)', [userId]);
@@ -56,7 +56,10 @@ export async function identitySnapshot(client: PoolClient, userId: string) {
     preferences.registration_status AS "registrationStatus"
     FROM courier_profiles profile LEFT JOIN courier_service_preferences preferences
     ON preferences.courier_profile_id=profile.id WHERE profile.user_id=$1`, [userId])).rows[0] ?? null;
-  return { user: account, units: units.rows, courier };
+  const customer = (await client.query(`SELECT id,tenant_id AS "tenantId",first_name AS "firstName",
+    last_name AS "lastName",whatsapp FROM customer_profiles WHERE user_id=$1 AND status='ACTIVE'
+    ORDER BY updated_at DESC LIMIT 1`, [userId])).rows[0] ?? null;
+  return { user: account, units: units.rows, courier, customer };
 }
 export async function signInIdentity(database: Database, env: AppEnv, email: string, password: string) {
   return withRuntimeTransaction(database, async client => {
@@ -96,6 +99,9 @@ export async function refreshIdentity(database: Database, env: AppEnv, token: st
 }
 export async function enterUnit(database: Database, env: AppEnv, identity: Identity, storeId: string) {
   return withIdentity(database, identity.userId, async client => {
+    const accountState=(await client.query<{must_change_password:boolean}>(
+      'SELECT must_change_password FROM users WHERE id=$1',[identity.userId])).rows[0];
+    if(accountState?.must_change_password) throw conflict('Defina sua senha pessoal antes de continuar.');
     const unit = (await client.query<{ id:string; name:string; tenant_id:string; tenant_slug:string; tenant_name:string; role:TenantRole }>(
       'SELECT * FROM rastreia.identity_units($1) WHERE id=$2', [identity.userId, storeId])).rows[0];
     if (!unit) throw unauthorized('Unidade indisponível para esta conta.');
@@ -107,6 +113,20 @@ export async function enterUnit(database: Database, env: AppEnv, identity: Ident
     const tenant = (await client.query('SELECT id,slug,name,timezone FROM tenants WHERE id=$1', [unit.tenant_id])).rows[0];
     return { ...tokens, expiresIn: env.ACCESS_TOKEN_TTL_SECONDS,
       user: { ...account, role: unit.role, storeIds: [unit.id] }, tenant };
+  });
+}
+
+export async function changeOwnPassword(database: Database, identity: Identity, currentPassword: string, newPassword: string) {
+  return withIdentity(database, identity.userId, async client => {
+    const account=(await client.query<{password_hash:string}>(
+      'SELECT password_hash FROM users WHERE id=$1 FOR UPDATE',[identity.userId])).rows[0];
+    if(!account || !await argon2.verify(account.password_hash,currentPassword)) throw unauthorized('A senha temporária não confere.');
+    if(currentPassword===newPassword) throw conflict('A nova senha deve ser diferente da senha temporária.');
+    await client.query('UPDATE users SET password_hash=$2,must_change_password=false,updated_at=now() WHERE id=$1',
+      [identity.userId,await argon2.hash(newPassword,passwordOptions)]);
+    await client.query('UPDATE identity_sessions SET revoked_at=now() WHERE user_id=$1 AND id<>$2 AND revoked_at IS NULL',
+      [identity.userId,identity.sessionId]);
+    return identitySnapshot(client,identity.userId);
   });
 }
 
@@ -140,7 +160,7 @@ export async function consumeIdentityAction(database: Database, env: AppEnv, tok
     if (inspect) return {requiresPassword:action.requires_password || kind==='RESET_PASSWORD'};
     if (kind==='RESET_PASSWORD' || action.requires_password) {
       if (!password || password.length<12) throw conflict('Informe uma senha de pelo menos 12 caracteres.');
-      await client.query('UPDATE users SET password_hash=$2 WHERE id=$1',[userId,await argon2.hash(password,passwordOptions)]);
+      await client.query('UPDATE users SET password_hash=$2,must_change_password=false WHERE id=$1',[userId,await argon2.hash(password,passwordOptions)]);
       // Reset all sessions/legacy per-company overrides via a narrow, token-authorized function.
       await client.query('SELECT rastreia.revoke_identity_credentials($1)',[userId]);
     }

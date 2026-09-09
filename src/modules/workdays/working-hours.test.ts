@@ -1,6 +1,7 @@
-import { describe,expect,it } from 'vitest';
+import type { PoolClient } from 'pg';
+import { describe,expect,it,vi } from 'vitest';
 import { storeSchema } from '../stores/store.routes.js';
-import { assertCheckinWindow, type Workday } from './workday.service.js';
+import { assertCheckinWindow, requireConfirmedCourierPresence, type Workday } from './workday.service.js';
 describe('working hours validation',()=>{
   const store={name:'Loja teste',addressLine:'Avenida Brasil',city:'Uberlândia',state:'MG',latitude:-18.9,longitude:-48.2};
   it('accepts overnight hours and rejects partial/equal/invalid times or weekdays',()=>{
@@ -13,5 +14,16 @@ describe('working hours validation',()=>{
     expect(()=>assertCheckinWindow(day,new Date('2026-09-03T18:00:00Z'))).not.toThrow();
     expect(()=>assertCheckinWindow(day,new Date('2026-09-04T02:00:00Z'))).toThrow();
     expect(()=>assertCheckinWindow({...day,status:'COMPLETED'},new Date('2026-09-03T21:00:00Z'))).toThrow();
+  });
+  it('requires a confirmed workday before a courier can receive an assignment',async()=>{
+    const query=vi.fn().mockResolvedValue({rowCount:1});
+    const allowed={query} as unknown as PoolClient;
+    await expect(requireConfirmedCourierPresence(allowed,'tenant','store','courier')).resolves.toBeUndefined();
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("day.status = 'CONFIRMED'"),
+      ['tenant','store','courier']);
+
+    const denied={query:vi.fn().mockResolvedValue({rowCount:0})} as unknown as PoolClient;
+    await expect(requireConfirmedCourierPresence(denied,'tenant','store','courier')).rejects
+      .toThrow(/não confirmou presença/);
   });
 });

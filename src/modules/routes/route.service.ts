@@ -1,5 +1,5 @@
 import type { PoolClient } from 'pg';
-import { requireCourierCheckin } from '../workdays/workday.service.js';
+import { requireConfirmedCourierPresence, requireCourierCheckin } from '../workdays/workday.service.js';
 import { efficientOrder } from './route-order.js';
 import type { Database } from '../../database/pool.js';
 import { withTenantTransaction } from '../../database/pool.js';
@@ -55,11 +55,16 @@ async function hydrate(client: PoolClient, bases: RouteBase[]): Promise<Delivery
   const raw = await client.query<RouteStopView & { routeId: string }>(
     `SELECT stop.id, stop.route_id AS "routeId", stop.delivery_id AS "deliveryId",
       delivery.external_reference AS "deliveryReference", delivery.recipient_name AS "recipientName",
+      delivery.recipient_phone AS "recipientPhone", delivery.recipient_whatsapp AS "recipientWhatsapp",
+      delivery.delivery_instructions AS "deliveryInstructions",
       stop.stop_type AS "stopType", stop.sequence, stop.status,
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.address_line ELSE delivery.address_line END AS "addressLine",
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.address_number ELSE delivery.address_number END AS "addressNumber",
+      CASE WHEN stop.stop_type = 'PICKUP' THEN store.complement ELSE delivery.complement END AS complement,
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.neighborhood ELSE delivery.neighborhood END AS neighborhood,
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.city ELSE delivery.city END AS city,
+      CASE WHEN stop.stop_type = 'PICKUP' THEN store.state ELSE delivery.state END AS state,
+      CASE WHEN stop.stop_type = 'PICKUP' THEN store.postal_code ELSE delivery.postal_code END AS "postalCode",
       delivery.promised_window_end AS "promisedWindowEnd", delivery.status AS "deliveryStatus",
       stop.completed_at AS "completedAt",
       stop.estimated_distance_from_previous_m AS "estimatedDistanceFromPreviousM",
@@ -71,8 +76,9 @@ async function hydrate(client: PoolClient, bases: RouteBase[]): Promise<Delivery
   );
   return bases.map((base) => {
     const stops = raw.rows.filter((stop) => stop.routeId === base.id);
-    return { ...base, stops, totalStops: stops.length,
-      completedStops: stops.filter((stop) => stop.status === 'COMPLETED').length };
+    const destinations = stops.filter((stop) => stop.stopType === 'DELIVERY');
+    return { ...base, stops, totalStops: destinations.length,
+      completedStops: destinations.filter((stop) => stop.status === 'COMPLETED').length };
   });
 }
 
@@ -248,6 +254,7 @@ export async function createRoute(
            AND link.store_id = $3 AND link.status = 'ACTIVE'`, [input.courierId, auth.tenantId, input.storeId],
       );
       if (!courier.rowCount) throw notFound('Entregador ativo e vinculado à loja não encontrado.');
+      await requireConfirmedCourierPresence(client, auth.tenantId, input.storeId, input.courierId);
       const deliveries = await client.query<{ id: string; version: number }>(
         `SELECT id, version FROM deliveries WHERE id = ANY($1::uuid[]) AND store_id = $2
            AND route_id IS NULL AND status = 'AWAITING_COURIER' FOR UPDATE`, [input.deliveryIds, input.storeId],

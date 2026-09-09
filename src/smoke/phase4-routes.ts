@@ -77,8 +77,8 @@ try {
     },
   }), 201, 'criar lote');
   routeId = route.id;
-  if (route.totalStops !== 4 || route.stops.filter((stop) => stop.stopType === 'PICKUP').length !== 2) {
-    throw new Error('O lote não criou coleta e destino para cada encomenda.');
+  if (route.totalStops !== 2 || route.stops.filter((stop) => stop.stopType === 'PICKUP').length !== 2) {
+    throw new Error('O lote não expôs somente os destinos na contagem de paradas.');
   }
   const directCollect = await app.inject({ method: 'POST', url: `/deliveries/${deliveryIds[0]}/collect`,
     headers: { ...courierHeaders, 'idempotency-key': `${prefix}-direct-collect` },
@@ -130,7 +130,7 @@ try {
       headers: { ...courierHeaders, 'idempotency-key': `${prefix}-delivery-stop-${stop.id}` },
     }), 200, 'confirmar destino');
   }
-  if (route.status !== 'COMPLETED' || route.completedStops !== 4) throw new Error('O lote não encerrou todas as paradas.');
+  if (route.status !== 'COMPLETED' || route.completedStops !== 2) throw new Error('O lote não encerrou todos os destinos.');
   const finalDeliveries = body<{ data: Array<{ id: string; status: string }> }>(await app.inject({
     method: 'GET', url: '/deliveries', headers: managerHeaders,
   }), 200, 'validar entregas');

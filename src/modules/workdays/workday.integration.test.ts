@@ -6,7 +6,9 @@ import type { Database } from '../../database/pool.js';
 import { withTenantTransaction } from '../../database/pool.js';
 import type { AppEnv } from '../../config/env.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import { getMyWorkdays, maintainWorkdays, reopenDeclinedWorkday, respondWorkday } from './workday.service.js';
+import {
+  getMyWorkdays, maintainWorkdays, reopenDeclinedWorkday, requireConfirmedCourierPresence, respondWorkday,
+} from './workday.service.js';
 import { createWorkdayTrackingSession, ingestNativeWorkdayPoint, ingestWorkdayPoints } from './workday-tracking.service.js';
 import type { LocationUpdate } from '../locations/location.types.js';
 
@@ -75,6 +77,8 @@ describe('courier workday SQL / authorization / tracking',()=>{
     const confirmationKey=randomUUID();
     await respondWorkday(database,auth,dayId,confirmationKey,'confirm',false);
     expect((await respondWorkday(database,auth,dayId,confirmationKey,'confirm',false)).replayed).toBe(true);
+    await expect(withTenantTransaction(database,auth,(client)=>
+      requireConfirmedCourierPresence(client,tenant,store,courier))).resolves.toBeUndefined();
     await respondWorkday(database,auth,dayId,randomUUID(),'confirm',false);
     const confirmationAudits=await pg.query("SELECT * FROM audit_logs WHERE entity_id=$1 AND action='workday.confirm'",[dayId]);
     expect(confirmationAudits.rows).toHaveLength(1);

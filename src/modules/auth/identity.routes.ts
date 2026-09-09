@@ -7,7 +7,7 @@ import { withRuntimeTransaction, type Database } from '../../database/pool.js';
 import { AppError, unauthorized } from '../../shared/errors.js';
 import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { emailConfigured } from '../../integrations/email/email.service.js';
-import { assertIdentity, consumeIdentityAction, createIdentityAction, enterUnit, identitySnapshot,
+import { assertIdentity, changeOwnPassword, consumeIdentityAction, createIdentityAction, enterUnit, identitySnapshot,
   passwordOptions, refreshIdentity, setIdentity, signInIdentity, verifyIdentityToken, withIdentity } from './identity.service.js';
 import { courierPreferencesSchema } from '../couriers/courier-account.routes.js';
 import type { IdentityAccountRow } from './identity.service.js';
@@ -58,6 +58,11 @@ export async function identityRoutes(app:FastifyInstance,database:Database,env:A
   app.get('/auth/identity/me',async request=>{
     const identity=await assertIdentity(database,env,request.headers.authorization);
     return withIdentity(database,identity.userId,client=>identitySnapshot(client,identity.userId));
+  });
+  app.patch('/auth/password',limited,async request=>{
+    const identity=await assertIdentity(database,env,request.headers.authorization);
+    const input=z.object({currentPassword:z.string().min(8).max(200),newPassword:z.string().min(12).max(200)}).parse(request.body);
+    return changeOwnPassword(database,identity,input.currentPassword,input.newPassword);
   });
   app.post('/auth/enter-unit',async(request,reply)=>{
     const identity=await assertIdentity(database,env,request.headers.authorization);

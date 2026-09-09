@@ -80,7 +80,7 @@ Mesmo quando `DATABASE_URL` pertence ao dono do schema ou a um superusuário, as
 
 Todas as mutações de entrega exigem `Idempotency-Key`. Repetir a mesma requisição com a mesma chave devolve o resultado persistido sem duplicar estado, histórico, auditoria ou evento outbox.
 
-Configure `PUBLIC_TRACKING_BASE_URL`, um `TRACKING_TOKEN_PEPPER` secreto com pelo menos 32 caracteres, `TRACKING_TOKEN_TTL_SECONDS` e `TRACKING_COMPLETED_GRACE_SECONDS`. O link público é devolvido somente no momento da emissão; apenas seu HMAC-SHA-256 é persistido. Por esse motivo, a emissão do link não usa a tabela de respostas idempotentes, que armazenaria o token em texto puro.
+Configure `PUBLIC_TRACKING_BASE_URL`, um `TRACKING_TOKEN_PEPPER` secreto com pelo menos 32 caracteres, `TRACKING_TOKEN_TTL_SECONDS`, `TRACKING_COMPLETED_GRACE_SECONDS` e `CUSTOMER_REGISTRATION_GRACE_SECONDS`. Esta última variável limita por quanto tempo, após o fim do acompanhamento, o mesmo link ainda pode validar o cadastro do cliente. O link público é devolvido somente no momento da emissão; apenas seu HMAC-SHA-256 é persistido. Por esse motivo, a emissão do link não usa a tabela de respostas idempotentes, que armazenaria o token em texto puro.
 
 Os pontos de localização aceitos têm precisão de até 100 metros, timestamp recente, ordem crescente e deslocamento fisicamente plausível. A última posição é atualizada a cada ponto válido; o histórico é amostrado a cada 30 segundos ou 100 metros. O cliente PWA mantém no máximo 100 pontos offline e tenta reenviá-los em lote ao recuperar conectividade.
 

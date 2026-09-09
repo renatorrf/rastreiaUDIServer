@@ -77,6 +77,22 @@ export async function courierRoutes(app: FastifyInstance, database: Database, en
                 profile.vehicle_type AS "vehicleType", profile.status, profile.status AS "profileStatus",
                 membership.status AS "membershipStatus",
                 COALESCE(array_agg(DISTINCT link.store_id) FILTER (WHERE link.status = 'ACTIVE'), '{}') AS "storeIds",
+                ARRAY(
+                  SELECT DISTINCT day.store_id
+                    FROM courier_workdays day
+                    JOIN tenants tenant ON tenant.id = day.tenant_id
+                   WHERE day.tenant_id = $1
+                     AND day.courier_profile_id = profile.id
+                     AND (
+                       day.status = 'CHECKED_IN'
+                       OR (
+                         day.status = 'CONFIRMED'
+                         AND day.service_date = (now() AT TIME ZONE tenant.timezone)::date
+                         AND day.ends_at > now()
+                       )
+                     )
+                   ORDER BY day.store_id
+                ) AS "confirmedStoreIds",
                 COALESCE(json_agg(DISTINCT jsonb_build_object(
                   'id', link.id, 'storeId', link.store_id, 'storeName', store.name, 'status', link.status
                 )), '[]') AS links,

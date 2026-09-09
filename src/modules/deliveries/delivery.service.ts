@@ -10,7 +10,7 @@ import { assertDeliveryTransition, nextOperationalActions } from './delivery-sta
 import type { DeliveryRecord, DeliveryStatus } from './delivery.types.js';
 import { completeOfferForDelivery } from '../offers/offer.service.js';
 import { createFailureIncident } from '../incidents/incident.repository.js';
-import { requireCourierCheckin } from '../workdays/workday.service.js';
+import { requireConfirmedCourierPresence, requireCourierCheckin } from '../workdays/workday.service.js';
 import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 
 export interface CreateDeliveryInput {
@@ -231,6 +231,7 @@ export async function assignDelivery(
         [courierId, auth.tenantId, delivery.storeId],
       );
       if (!courier.rowCount) throw notFound('Entregador ativo e vinculado à loja não encontrado.');
+      await requireConfirmedCourierPresence(client, auth.tenantId, delivery.storeId, courierId);
 
       await client.query('UPDATE deliveries SET courier_profile_id = $2, updated_by = $3 WHERE id = $1',
         [delivery.id, courierId, auth.userId]);

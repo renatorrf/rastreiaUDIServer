@@ -15,6 +15,39 @@ export interface Workday {
   declineReasonCode: string | null; declineReasonDetail: string | null; declinedAt: Date | null;
 }
 
+/**
+ * Assignment eligibility is intentionally stricter than the permanent store link:
+ * the courier must have accepted today's call or already be checked in.
+ */
+export async function requireConfirmedCourierPresence(
+  client: PoolClient,
+  tenantId: string,
+  storeId: string,
+  courierProfileId: string,
+): Promise<void> {
+  const eligible = await client.query(
+    `SELECT 1
+       FROM courier_workdays day
+       JOIN tenants tenant ON tenant.id = day.tenant_id
+      WHERE day.tenant_id = $1
+        AND day.store_id = $2
+        AND day.courier_profile_id = $3
+        AND (
+          day.status = 'CHECKED_IN'
+          OR (
+            day.status = 'CONFIRMED'
+            AND day.service_date = (now() AT TIME ZONE tenant.timezone)::date
+            AND day.ends_at > now()
+          )
+        )
+      LIMIT 1`,
+    [tenantId, storeId, courierProfileId],
+  );
+  if (!eligible.rowCount) {
+    throw conflict('Este entregador ainda não confirmou presença para a jornada de hoje nesta loja.');
+  }
+}
+
 export type DeclineReasonCode = 'PERSONAL_EMERGENCY' | 'HEALTH' | 'VEHICLE' | 'WEATHER' | 'OTHER';
 
 export async function loadOwnWorkday(client: PoolClient, auth: AuthContext, id: string, lock = false): Promise<Workday> {
