@@ -16,6 +16,8 @@ import { io } from 'socket.io-client';
 
 loadLocalEnv();const source=getEnv();if(source.NODE_ENV==='production')throw Error('Development only');
 const ui=process.argv.includes('--ui'),password='Synthetic-ifood-9821!';
+interface SmokeRouteStop { id:string; stopType:string; status:string; urgentAt?:string|null }
+interface SmokeRoute { id:string; stops:SmokeRouteStop[] }
 const env={...source,NODE_ENV:ui?'development' as const:'test' as const,LOG_LEVEL:'error' as const,IFOOD_ENABLED:true,IFOOD_MODE:'mock' as const,
   IFOOD_EVENTS_MODE:'polling' as const,REDIS_URL:'',REDIS_REQUIRED:false,APP_ORIGINS:source.APP_ORIGINS+',http://localhost:8101'};
 const pool=createPool(env),connection=await pool.connect();await connection.query('BEGIN');
@@ -33,6 +35,9 @@ try{
  await db.query(`INSERT INTO user_access_scopes(tenant_id,user_id,scope_level) VALUES($1,$2,'TENANT')`,[tenant,user]);
  await db.query(`INSERT INTO courier_profiles(id,user_id,phone,vehicle_type,status) VALUES($1,$2,'34999990000','MOTORCYCLE','ACTIVE')`,[driverId,driverUser]);
  await db.query(`INSERT INTO courier_store_links(tenant_id,store_id,courier_profile_id,status) VALUES($1,$2,$3,'ACTIVE')`,[tenant,store,driverId]);
+ await db.query(`INSERT INTO courier_workdays(tenant_id,store_id,courier_profile_id,service_date,starts_at,ends_at,status,
+   confirmed_at,checkin_at,location_consent_at) VALUES($1,$2,$3,(now() AT TIME ZONE 'America/Sao_Paulo')::date,
+   now()-interval '1 hour',now()+interval '8 hours','CHECKED_IN',now(),now(),now())`,[tenant,store,driverId]);
  await db.query("SELECT set_config('app.platform_admin_id','',true)");
  const token=async(id:string,storeId:string,role:'TENANT_MANAGER'|'COURIER')=>(await createTokenPair(env,{userId:id,tenantId:tenant,storeIds:[storeId],role})).accessToken;
  const manager=await token(user,store,'TENANT_MANAGER'),other=await token(user,sibling,'TENANT_MANAGER'),courier=await token(driverUser,store,'COURIER');
@@ -47,7 +52,7 @@ try{
    await pool.query("SELECT pg_notify('rastreia_operation_changed',$1)",[JSON.stringify({tenantId:tenant,storeId:store})]);
    assert.deepEqual(await changed,{storeId:store});checks++;await new Promise(resolve=>setTimeout(resolve,150));check(!siblingReceived,'Integration realtime isolates sibling stores and carries no customer data');
  }finally{scopedSocket.disconnect();siblingSocket.disconnect();}
- const call=async(method:'GET'|'POST'|'PUT',url:string,payload?:object,bearer=manager)=>{const r=await app!.inject({method,url,...(payload?{payload}:{}),headers:{authorization:'Bearer '+bearer,'idempotency-key':randomUUID()}});return {status:r.statusCode,body:r.json()};};
+ const call=async(method:'GET'|'POST'|'PUT'|'PATCH',url:string,payload?:object,bearer=manager)=>{const r=await app!.inject({method,url,...(payload?{payload}:{}),headers:{authorization:'Bearer '+bearer,'idempotency-key':randomUUID()}});return {status:r.statusCode,body:r.json()};};
  const configured=await call('PUT','/integrations/ifood/connection',{storeId:store,merchantId:merchant,enabled:true,autoImportOrders:true,autoCreateDelivery:true,deliveryDispatchMode:'IMMEDIATE',deliveryDispatchMinutesBefore:15});
  assert.equal(configured.status,200,JSON.stringify(configured.body));checks++;const integration=configured.body.id;
  check((await call('GET','/integrations/ifood',undefined,courier)).status===403,'Couriers cannot configure integrations');
@@ -82,6 +87,8 @@ try{
  const dispatch=(await db.query("SELECT attempts,status FROM integration_commands WHERE external_order_id=$1 AND operation='DISPATCH'",[id])).rows;
  check(dispatch.length===1&&dispatch[0].attempts===1&&dispatch[0].status==='REQUEST_SENT','Dispatch sent once and waits event');await service.processEvents();
  check((await call('POST',`/deliveries/${deliveryId}/complete`,{},courier)).status===200,'Internal completion independent of external conclusion');
+ const linkedWhatsapp=await call('PATCH',`/deliveries/${deliveryId}/customer-whatsapp`,{whatsapp:'+55 34 99999-9565'},courier);
+ check(linkedWhatsapp.status===200&&linkedWhatsapp.body.recipientWhatsapp==='34999999565','Courier links a sanitized customer WhatsApp after iFood completion');
  check((await db.query('SELECT external_status FROM external_orders WHERE id=$1',[id])).rows[0].external_status==='DISPATCHED','Internal/external status remain separate');
  const outsourced=mockOrder('ifood',merchant);await service.ingest(eventFor(outsourced));await service.processEvents();
  check((await db.query('SELECT delivery_id,own_delivery FROM external_orders WHERE external_order_id=$1',[outsourced.id])).rows[0].delivery_id===null,'IFOOD logistics never creates delivery');
@@ -155,6 +162,15 @@ try{
  for(const stop of routeStops.filter(s=>s.stopType==='PICKUP'))check((await call('POST',`/routes/${route.body.id}/stops/${stop.id}/complete`,{},courier)).status===200,'Batch pickup uses existing route flow');
  check((await db.query("SELECT 1 FROM integration_commands WHERE external_order_id=ANY($1::uuid[]) AND operation='DISPATCH'",[batchOrders.map(o=>o.id)])).rowCount===0,'Batch collection does not dispatch');
  check((await call('POST',`/routes/${route.body.id}/start`,{},courier)).status===200,'Batch route starts normally');
+ const activeRoutes=(await call('GET','/routes')).body as {data:SmokeRoute[]};
+ const activeRoute=activeRoutes.data.find(item=>item.id===route.body.id)!;
+ const currentStop=activeRoute.stops.find(item=>item.stopType==='DELIVERY'&&item.status==='PENDING')!;
+ const urgentStop=activeRoute.stops.find(item=>item.stopType==='DELIVERY'&&item.status==='PENDING'&&item.id!==currentStop.id)!;
+ check((await call('POST',`/routes/${route.body.id}/stops/${urgentStop.id}/prioritize`,{},courier)).status===403,'Courier cannot change an active route priority');
+ const prioritized=await call('POST',`/routes/${route.body.id}/stops/${urgentStop.id}/prioritize`,{reason:'Cliente com urgência'});
+ const prioritizedRoute=prioritized.body as SmokeRoute;
+ check(prioritized.status===200&&prioritizedRoute.stops.find(item=>item.stopType==='DELIVERY'&&item.status==='PENDING')?.id===urgentStop.id
+   &&Boolean(prioritizedRoute.stops.find(item=>item.id===urgentStop.id)?.urgentAt),'Manager promotes an urgent delivery to the next active stop');
  await service.processCommands();await service.processCommands();await service.processEvents();
  check((await db.query("SELECT count(*)::int AS n FROM integration_commands WHERE external_order_id=ANY($1::uuid[]) AND operation='DISPATCH' AND attempts=1",[batchOrders.map(o=>o.id)])).rows[0].n===2,'One dispatch per external order on batch start, including NEXT_STOP');
  const next=(await db.query("SELECT id,external_order_id FROM deliveries WHERE route_id=$1 AND status='NEXT_STOP'",[route.body.id])).rows[0];

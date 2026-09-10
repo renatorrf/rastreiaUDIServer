@@ -12,7 +12,8 @@ interface EntityBody { id: string }
 interface RouteBody { id: string; status: string; completedStops: number; totalStops: number;
   suggestedStopIds: string[] | null; suggestedCurrentDistanceM: number | null; suggestedTotalDistanceM: number | null;
   planAppliedAt: string | null; stops: Array<{ id: string; deliveryId: string; stopType: 'PICKUP' | 'DELIVERY';
-    status: string; sequence: number; estimatedArrivalAt: string | null }> }
+  status: string; sequence: number; estimatedArrivalAt: string | null; deliveryStatus: string;
+  urgentAt: string | null }> }
 interface TrackingBody { url: string }
 interface MetricsBody { summary: { pickup: { evaluated: number; onTime: number }; delivery: { evaluated: number; onTime: number };
   routes: { started: number; completed: number }; productivity: { delivered: number; deliveriesPerRouteHour: number | null } };
@@ -125,6 +126,20 @@ try {
   if (route.status !== 'ACTIVE' || route.stops.find((stop) => stop.status === 'PENDING')?.stopType !== 'DELIVERY') {
     throw new Error('A rota não liberou o primeiro destino após as coletas.');
   }
+  const previousNext = route.stops.find((stop) => stop.stopType === 'DELIVERY' && stop.status === 'PENDING')!;
+  const urgentTarget = route.stops.find((stop) => stop.stopType === 'DELIVERY' && stop.status === 'PENDING'
+    && stop.id !== previousNext.id)!;
+  const courierPriority = await app.inject({ method: 'POST', url: `/routes/${route.id}/stops/${urgentTarget.id}/prioritize`,
+    headers: { ...courierHeaders, 'idempotency-key': `${prefix}-priority-denied` }, payload: {} });
+  if (courierPriority.statusCode !== 403) throw new Error('O entregador conseguiu alterar a prioridade da rota.');
+  route = body<RouteBody>(await app.inject({ method: 'POST', url: `/routes/${route.id}/stops/${urgentTarget.id}/prioritize`,
+    headers: { ...managerHeaders, 'idempotency-key': `${prefix}-priority` }, payload: { reason: 'Pedido urgente' },
+  }), 200, 'priorizar destino em rota ativa');
+  const prioritized = route.stops.find((stop) => stop.stopType === 'DELIVERY' && stop.status === 'PENDING');
+  if (prioritized?.id !== urgentTarget.id || prioritized.deliveryId === previousNext.deliveryId
+      || prioritized.deliveryStatus !== 'NEXT_STOP' || !prioritized.urgentAt) {
+    throw new Error('A urgência não promoveu exatamente o destino selecionado para a próxima parada.');
+  }
   for (const stop of route.stops.filter((item) => item.stopType === 'DELIVERY')) {
     route = body<RouteBody>(await app.inject({ method: 'POST', url: `/routes/${route.id}/stops/${stop.id}/complete`,
       headers: { ...courierHeaders, 'idempotency-key': `${prefix}-delivery-stop-${stop.id}` },
@@ -185,7 +200,7 @@ try {
   }
   process.stdout.write(`${JSON.stringify({ ok: true, deliveries: 2, stops: 4, matrixPreviewWithoutMutation: true,
     explicitSuggestionApply: true, etaPerStop: true, genericPublicMessage: true,
-    directTransitionBlocked: true, oneNextStop: true, individualCompletion: true, publicPrivacy: true,
+    directTransitionBlocked: true, oneNextStop: true, urgentNextStop: true, individualCompletion: true, publicPrivacy: true,
     operationalMetrics: true, explicitSamplesAndRules: true, managementOnly: true, csvWithoutRecipientData: true }, null, 2)}\n`);
 } finally {
   await app.close(); const cleanup = createPool(env);

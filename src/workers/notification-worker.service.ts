@@ -265,6 +265,7 @@ function pushCopy(eventType: string): { title: string; body: string } | null {
     'delivery.complete': { title: 'Entrega concluída', body: 'A conclusão foi registrada na operação.' },
     'delivery.fail': { title: 'Ocorrência registrada', body: 'A falha da entrega foi registrada.' },
     'delivery.cancel': { title: 'Entrega cancelada', body: 'A entrega foi cancelada. Confira a operação e, se já coletou, combine a devolução com a loja.' },
+    'delivery.prioritized': { title: 'Parada urgente na sua rota', body: 'A loja alterou a sequência. Abra a rota e siga para o destino destacado como urgente.' },
     'shift.available': { title: 'Novo turno disponível', body: 'Uma vaga compatível com sua loja foi aberta.' },
     'shift.filled': { title: 'Turno confirmado', body: 'Sua participação no turno foi confirmada.' },
     'shift.checkin': { title: 'Check-in confirmado', body: 'Seu turno está ativo.' },
@@ -286,6 +287,7 @@ function pushCopy(eventType: string): { title: string; body: string } | null {
 async function processPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   const driverEvent=event.event_type==='driver-event.created';
   const cancellation=event.event_type==='delivery.cancel';
+  const priorityEvent=event.event_type==='delivery.prioritized';
   if(driverEvent&&event.payload['severity']!=='CRITICAL')return;
   const copy = pushCopy(event.event_type);
   if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
@@ -392,7 +394,9 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
       ? [event.aggregate_id, event.tenant_id, event.event_type]
       : [event.aggregate_id, event.tenant_id],
   );
-  const openUrl = testEvent ? '/app/configuracoes' : (workdayEvent || workdayDeclined) ? `/app/turnos?workdayId=${encodeURIComponent(event.aggregate_id)}` : driverEvent ? '/app/operacao' : offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos' : '/app/entregas';
+  const openUrl = testEvent ? '/app/configuracoes' : (workdayEvent || workdayDeclined) ? `/app/turnos?workdayId=${encodeURIComponent(event.aggregate_id)}` : driverEvent ? '/app/operacao' : offerEvent ? '/app/ofertas' : shiftEvent ? '/app/turnos'
+    : priorityEvent && typeof event.payload['routeId'] === 'string'
+      ? `/app/rotas?routeId=${encodeURIComponent(event.payload['routeId'])}` : '/app/entregas';
   const notificationKey = typeof event.payload['notificationKey']==='string' ? event.payload['notificationKey'] : `${event.aggregate_id}:${event.event_type}`;
   for (const subscription of result.rows) {
     try {

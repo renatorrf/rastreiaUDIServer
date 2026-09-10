@@ -57,6 +57,7 @@ async function hydrate(client: PoolClient, bases: RouteBase[]): Promise<Delivery
       delivery.external_reference AS "deliveryReference", delivery.recipient_name AS "recipientName",
       delivery.recipient_phone AS "recipientPhone", delivery.recipient_whatsapp AS "recipientWhatsapp",
       delivery.delivery_instructions AS "deliveryInstructions",
+      delivery.origin,
       stop.stop_type AS "stopType", stop.sequence, stop.status,
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.address_line ELSE delivery.address_line END AS "addressLine",
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.address_number ELSE delivery.address_number END AS "addressNumber",
@@ -69,7 +70,8 @@ async function hydrate(client: PoolClient, bases: RouteBase[]): Promise<Delivery
       stop.completed_at AS "completedAt",
       stop.estimated_distance_from_previous_m AS "estimatedDistanceFromPreviousM",
       stop.estimated_duration_from_previous_s AS "estimatedDurationFromPreviousS",
-      stop.estimated_arrival_at AS "estimatedArrivalAt"
+      stop.estimated_arrival_at AS "estimatedArrivalAt",
+      stop.urgent_at AS "urgentAt", stop.urgent_reason AS "urgentReason"
      FROM route_stops stop JOIN deliveries delivery ON delivery.id = stop.delivery_id
      JOIN stores store ON store.id = delivery.store_id
      WHERE stop.route_id = ANY($1::uuid[]) ORDER BY stop.route_id, stop.sequence`, [bases.map((item) => item.id)],
@@ -440,6 +442,92 @@ export async function completeRouteStop(
       await writeAudit(client, { tenantId: auth.tenantId, actorUserId: auth.userId,
         action: 'route.stop.completed', entityType: 'route_stop', entityId: stopId,
         afterData: { routeId, deliveryId: stop.deliveryId, stopType: stop.stopType }, ...(ip ? { ip } : {}) });
+      return { body: await loadRoute(client, auth, routeId), statusCode: 200 };
+    },
+  ));
+}
+
+export async function prioritizeRouteStop(
+  database: Database, auth: AuthContext, key: string, routeId: string, stopId: string,
+  reason?: string, ip?: string,
+): Promise<IdempotentResult<DeliveryRouteView>> {
+  return withTenantTransaction(database, auth, (client) => withIdempotency(
+    client, auth, key, `route.stop.prioritize:${stopId}`, { reason: reason ?? null }, async () => {
+      const route = await loadRoute(client, auth, routeId, true);
+      if (!canUseStore(auth, route.storeId)) throw forbidden('Somente a gestão da loja pode priorizar uma entrega.');
+      if (route.status !== 'ACTIVE') throw conflict('A urgência só pode alterar uma rota já iniciada.');
+      const target = route.stops.find((item) => item.id === stopId);
+      if (!target || target.stopType !== 'DELIVERY') throw notFound('Destino não encontrado nesta rota.');
+      if (target.status !== 'PENDING') throw conflict('Somente um destino pendente pode ser priorizado.');
+
+      const pending = route.stops
+        .filter((item) => item.stopType === 'DELIVERY' && item.status === 'PENDING')
+        .sort((left, right) => left.sequence - right.sequence);
+      const current = pending[0];
+      if (!current) throw conflict('A rota não possui destinos pendentes.');
+
+      const ordered = [target, ...pending.filter((item) => item.id !== target.id)];
+      const availableSequences = pending.map((item) => item.sequence);
+      await client.query(
+        `UPDATE route_stops
+         SET sequence = sequence + 10000, urgent_at = NULL, urgent_reason = NULL,
+             urgent_by_user_id = NULL, version = version + 1
+         WHERE route_id = $1 AND stop_type = 'DELIVERY' AND status = 'PENDING'`,
+        [routeId],
+      );
+      for (let index = 0; index < ordered.length; index += 1) {
+        const stop = ordered[index]!;
+        await client.query(
+          `UPDATE route_stops SET sequence = $2,
+             urgent_at = CASE WHEN id = $3 THEN now() ELSE NULL END,
+             urgent_reason = CASE WHEN id = $3 THEN $4::text ELSE NULL END,
+             urgent_by_user_id = CASE WHEN id = $3 THEN $5::uuid ELSE NULL END
+           WHERE id = $1`,
+          [stop.id, availableSequences[index], target.id, reason ?? null, auth.userId],
+        );
+      }
+
+      if (current.id !== target.id) {
+        const currentDelivery = await client.query<{ version: number; status: string }>(
+          'SELECT version, status FROM deliveries WHERE id = $1 FOR UPDATE', [current.deliveryId],
+        );
+        if (currentDelivery.rows[0]?.status === 'NEXT_STOP') {
+          await client.query(`UPDATE deliveries SET status = 'IN_ROUTE', version = version + 1,
+            updated_by = $2 WHERE id = $1`, [current.deliveryId, auth.userId]);
+          await appendDeliveryHistory(client, auth, current.deliveryId, 'NEXT_STOP', 'IN_ROUTE',
+            currentDelivery.rows[0].version + 1, routeId);
+          await publishDeliveryEvent(client, auth, current.deliveryId, 'delivery.priority-replaced', routeId);
+        }
+        const targetDelivery = await client.query<{ version: number; status: string }>(
+          'SELECT version, status FROM deliveries WHERE id = $1 FOR UPDATE', [target.deliveryId],
+        );
+        if (targetDelivery.rows[0]?.status !== 'IN_ROUTE') {
+          throw conflict('O destino urgente não está disponível para reordenação.');
+        }
+        await client.query(`UPDATE deliveries SET status = 'NEXT_STOP', version = version + 1,
+          updated_by = $2 WHERE id = $1`, [target.deliveryId, auth.userId]);
+        await appendDeliveryHistory(client, auth, target.deliveryId, 'IN_ROUTE', 'NEXT_STOP',
+          targetDelivery.rows[0].version + 1, routeId);
+      }
+
+      await client.query(`UPDATE route_stops SET estimated_distance_from_previous_m = NULL,
+        estimated_duration_from_previous_s = NULL, estimated_arrival_at = NULL
+        WHERE route_id = $1 AND status = 'PENDING'`, [routeId]);
+      await client.query(`UPDATE routes SET version = version + 1, updated_by = $2,
+        estimated_total_distance_m = NULL, estimated_total_duration_s = NULL, eta_calculated_at = NULL,
+        plan_applied_at = NULL WHERE id = $1`, [routeId, auth.userId]);
+      await publishDeliveryEvent(client, auth, target.deliveryId, 'delivery.prioritized', routeId);
+      await appendRouteEvent(client, auth, routeId, 'ROUTE_STOP_PRIORITIZED', {
+        stopId: target.id, deliveryId: target.deliveryId, previousNextDeliveryId: current.deliveryId,
+        reason: reason ?? null, storeId: route.storeId,
+      });
+      await client.query(`SELECT pg_notify('rastreia_operation_changed', $1)`, [JSON.stringify({
+        tenantId: auth.tenantId, storeId: route.storeId,
+      })]);
+      await writeAudit(client, { tenantId: auth.tenantId, actorUserId: auth.userId,
+        action: 'route.stop.prioritized', entityType: 'route_stop', entityId: target.id,
+        beforeData: { nextDeliveryId: current.deliveryId },
+        afterData: { nextDeliveryId: target.deliveryId, reason: reason ?? null }, ...(ip ? { ip } : {}) });
       return { body: await loadRoute(client, auth, routeId), statusCode: 200 };
     },
   ));

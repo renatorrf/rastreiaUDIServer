@@ -7,8 +7,9 @@ import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempot
 import { AppError } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
-  assignDelivery, createDelivery, getDelivery, listDeliveries, transitionDelivery,
+  assignDelivery, createDelivery, getDelivery, linkDeliveryCustomerWhatsapp, listDeliveries, transitionDelivery,
 } from './delivery.service.js';
+import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 import { deliveryStatuses } from './delivery.types.js';
 
 const deliveryIdSchema = z.object({ id: z.uuid() });
@@ -38,6 +39,10 @@ const createDeliverySchema = z.object({
 
 const assignSchema = z.object({ courierId: z.uuid() });
 const reasonSchema = z.object({ reason: z.string().trim().min(3).max(500) });
+const customerWhatsappSchema = z.object({
+  whatsapp: z.string().trim().min(10).max(24).transform(normalizeCustomerPhone)
+    .refine((value) => /^\d{10,11}$/.test(value), 'Informe DDD e número do WhatsApp.'),
+});
 const listSchema = z.object({
   view: z.enum(['all','active','history']).default('all'),
   offset: z.coerce.number().int().min(0).max(100000).default(0),
@@ -121,5 +126,15 @@ export async function deliveryRoutes(app: FastifyInstance, database: Database, e
     const { reason } = reasonSchema.parse(request.body);
     const result = await transitionDelivery(database, request.auth, keyFrom(request), id, 'cancel', reason, request.ip);
     return sendIdempotent(reply, result);
+  });
+
+  app.patch('/deliveries/:id/customer-whatsapp', {
+    preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR', 'COURIER')],
+  }, async (request, reply) => {
+    const { id } = deliveryIdSchema.parse(request.params);
+    const { whatsapp } = customerWhatsappSchema.parse(request.body);
+    return sendIdempotent(reply, await linkDeliveryCustomerWhatsapp(
+      database, request.auth, keyFrom(request), id, whatsapp, request.ip,
+    ));
   });
 }

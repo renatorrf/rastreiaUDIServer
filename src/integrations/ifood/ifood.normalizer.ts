@@ -35,7 +35,7 @@ export function deliveryInput(order: NormalizedIfoodOrder, storeId: string): Cre
   const destination = z.object({ street: z.string().min(3).max(240), city: z.string().min(2).max(120), state: z.string().length(2),
     latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) }).parse(a);
   return { storeId, recipientName: z.string().min(2).max(160).parse(order.customer.name),
-    recipientPhone: z.string().min(8).max(30).parse(order.customer.phone), externalReference: order.displayId || order.id,
+    recipientPhone: order.customer.phone || 'Não informado pelo iFood', externalReference: order.displayId || order.id,
     addressLine: destination.street, addressNumber: a.number.slice(0,30), complement: a.complement.slice(0,120),
     neighborhood: a.neighborhood.slice(0,120), city: destination.city, state: destination.state, postalCode: a.postalCode.slice(0,12),
     latitude: destination.latitude, longitude: destination.longitude,

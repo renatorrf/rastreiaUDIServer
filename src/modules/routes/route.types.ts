@@ -22,6 +22,9 @@ export interface RouteStopView {
   estimatedDistanceFromPreviousM: number | null;
   estimatedDurationFromPreviousS: number | null;
   estimatedArrivalAt: string | null;
+  origin: string;
+  urgentAt: string | null;
+  urgentReason: string | null;
 }
 
 export interface DeliveryRouteView {

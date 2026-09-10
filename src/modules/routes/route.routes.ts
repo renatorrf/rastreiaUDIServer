@@ -7,7 +7,7 @@ import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempot
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
   applyRouteSuggestion, completeRouteStop, createRoute, getRouteNavigation, listRoutes, optimizeRoute,
-  reorderRoute, startRoute,
+  prioritizeRouteStop, reorderRoute, startRoute,
 } from './route.service.js';
 
 const routeIdSchema = z.object({ id: z.uuid() });
@@ -20,6 +20,7 @@ const createSchema = z.object({
   path: ['deliveryIds'], message: 'Não repita entregas no lote.',
 });
 const reorderSchema = z.object({ stopIds: z.array(z.uuid()).min(4).max(100) });
+const prioritizeSchema = z.object({ reason: z.string().trim().min(3).max(240).nullable().optional() });
 
 function keyFrom(request: FastifyRequest): string { return parseIdempotencyKey(request.headers['idempotency-key']); }
 function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
@@ -64,6 +65,15 @@ export async function routeRoutes(
     const { id, stopId } = stopIdSchema.parse(request.params);
     return sendIdempotent(reply, await completeRouteStop(
       database, request.auth, keyFrom(request), id, stopId, request.ip,
+    ));
+  });
+  app.post('/routes/:id/stops/:stopId/prioritize', {
+    preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')],
+  }, async (request, reply) => {
+    const { id, stopId } = stopIdSchema.parse(request.params);
+    const { reason } = prioritizeSchema.parse(request.body ?? {});
+    return sendIdempotent(reply, await prioritizeRouteStop(
+      database, request.auth, keyFrom(request), id, stopId, reason ?? undefined, request.ip,
     ));
   });
 }

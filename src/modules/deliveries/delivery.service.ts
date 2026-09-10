@@ -304,6 +304,41 @@ export async function transitionDelivery(
   );
 }
 
+export async function linkDeliveryCustomerWhatsapp(
+  database: Database, auth: AuthContext, key: string, deliveryId: string, whatsapp: string, ip?: string,
+): Promise<IdempotentResult<DeliveryRecord & { nextActions: string[] }>> {
+  return withTenantTransaction(database, auth, async (client) => withIdempotency(
+    client, auth, key, `delivery.customer-whatsapp:${deliveryId}`, { whatsapp }, async () => {
+      const before = await loadDelivery(client, auth, deliveryId, true);
+      if (before.origin !== 'IFOOD') throw conflict('A coleta de WhatsApp é destinada a pedidos iFood.');
+      if (before.status !== 'DELIVERED') throw conflict('Conclua a entrega antes de vincular o WhatsApp do cliente.');
+      const normalized = normalizeCustomerPhone(whatsapp);
+      if (!/^\d{10,11}$/.test(normalized)) throw conflict('Informe DDD e número do WhatsApp.');
+      const customer = await client.query<{ id: string }>(
+        `SELECT id FROM customer_profiles
+         WHERE tenant_id = $1 AND whatsapp_normalized = $2 AND status = 'ACTIVE' LIMIT 1`,
+        [auth.tenantId, normalized],
+      );
+      await client.query(
+        `UPDATE deliveries SET recipient_whatsapp = $2,
+           customer_profile_id = COALESCE($3, customer_profile_id), version = version + 1, updated_by = $4
+         WHERE id = $1`,
+        [deliveryId, normalized, customer.rows[0]?.id ?? null, auth.userId],
+      );
+      const current = await loadCurrentRecord(client, auth, deliveryId);
+      await writeAudit(client, { tenantId: auth.tenantId, actorUserId: auth.userId,
+        action: 'delivery.customer-whatsapp-linked', entityType: 'delivery', entityId: deliveryId,
+        beforeData: { hadWhatsapp: Boolean(before.recipientWhatsapp) },
+        afterData: { hadWhatsapp: true, phoneEnding: normalized.slice(-4), customerLinked: Boolean(customer.rowCount) },
+        ...(ip === undefined ? {} : { ip }) });
+      await publishEvent(client, auth, deliveryId, 'delivery.customer-whatsapp-linked', {
+        deliveryId, storeId: current.storeId, courierId: current.courierId,
+      });
+      return { body: { ...current, nextActions: nextOperationalActions(current.status) }, statusCode: 200 };
+    },
+  ));
+}
+
 /** Shared entry point for manual and external orders; caller owns the transaction. */
 export async function createDeliveryInTransaction(client: PoolClient, auth: AuthContext, input: CreateDeliveryInput, ip?: string,
   initialStatus: 'DRAFT' | 'AWAITING_COURIER' = 'AWAITING_COURIER') {
@@ -312,7 +347,11 @@ export async function createDeliveryInTransaction(client: PoolClient, auth: Auth
       if (!store.rowCount) throw notFound('Loja não encontrada.');
 
       const deliveryId = randomUUID();
-      const normalizedPhone = normalizeCustomerPhone(input.recipientWhatsapp ?? input.recipientPhone);
+      const normalizedRecipientPhone = normalizeCustomerPhone(input.recipientPhone);
+      const recipientPhone = /^\d{10,11}$/.test(normalizedRecipientPhone)
+        ? normalizedRecipientPhone : input.recipientPhone.trim();
+      const recipientWhatsapp = input.recipientWhatsapp ? normalizeCustomerPhone(input.recipientWhatsapp) : null;
+      const normalizedPhone = normalizeCustomerPhone(recipientWhatsapp ?? recipientPhone);
       const customerProfileId = /^\d{10,11}$/.test(normalizedPhone)
         ? (await client.query<{ id: string }>(`SELECT id FROM customer_profiles
             WHERE tenant_id=$1 AND whatsapp_normalized=$2 AND status='ACTIVE' LIMIT 1`,
@@ -328,7 +367,7 @@ export async function createDeliveryInTransaction(client: PoolClient, auth: Auth
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                  $15, $16, $17, $18, $22, $19, $20, $21, $21, $23)`,
         [deliveryId, auth.tenantId, input.storeId, input.externalReference ?? null,
-          input.recipientName, input.recipientPhone, input.recipientWhatsapp ?? null,
+          input.recipientName, recipientPhone, recipientWhatsapp,
           input.addressLine, input.addressNumber ?? null, input.complement ?? null,
           input.neighborhood ?? null, input.city, input.state, input.postalCode ?? null,
           input.latitude, input.longitude, input.addressConfidence ?? null,

@@ -19,6 +19,8 @@ describe('iFood normalization',()=>{
  it('does not assume missing fields mean merchant delivery',()=>{expect(normalizeIfoodOrder({id:merchant,merchant:{id:merchant}}).ownDelivery).toBe(false);expect(normalizeIfoodOrder(mockOrder('ifood',merchant)).ownDelivery).toBe(false);});
  it('rejects incomplete destination instead of inventing coordinates',()=>{const o=mockOrder('own',merchant);delete (o.delivery.deliveryAddress as Partial<typeof o.delivery.deliveryAddress>).coordinates;expect(()=>deliveryInput(normalizeIfoodOrder(o),merchant)).toThrow();});
  it('normalizes missing optional fields and rejects malformed ids',()=>{const n=normalizeIfoodOrder({id:merchant,merchant:{id:merchant}});expect(n.items).toEqual([]);expect(n.totalCents).toBeNull();expect(()=>normalizeIfoodOrder({})).toThrow();});
+ it('keeps an importable placeholder when iFood omits the customer phone',()=>{const order=mockOrder('own',merchant);delete (order.customer as {phone?:unknown}).phone;
+   expect(deliveryInput(normalizeIfoodOrder(order),merchant).recipientPhone).toBe('Não informado pelo iFood');});
 });
 describe('iFood client and official contract',()=>{
  it('uses provider reason codes returned by the cancellation endpoint',async()=>{
