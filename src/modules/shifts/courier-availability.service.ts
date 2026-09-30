@@ -1,6 +1,6 @@
 import type { Database } from '../../database/pool.js';
 import { withTenantTransaction } from '../../database/pool.js';
-import { forbidden } from '../../shared/errors.js';
+import { conflict, forbidden } from '../../shared/errors.js';
 import type { AuthContext } from '../auth/auth.types.js';
 
 export interface AvailabilityInput {
@@ -33,6 +33,10 @@ export async function getCourierAvailability(database: Database, auth: AuthConte
 export async function setCourierAvailability(database: Database, auth: AuthContext, input: AvailabilityInput) {
   return withTenantTransaction(database, auth, async (client) => {
     const id = await courierId(client, auth);
+    if (!input.available && (await client.query(`SELECT 1 FROM courier_workdays WHERE courier_profile_id=$1
+      AND status='CHECKED_IN' AND ends_at>now() LIMIT 1`,[id])).rowCount) {
+      throw conflict('A localização não pode ser pausada enquanto a jornada estiver ativa.');
+    }
     if (input.available && (input.latitude === undefined || input.longitude === undefined || input.accuracy === undefined)) {
       throw forbidden('Informe a localização para ficar disponível.');
     }

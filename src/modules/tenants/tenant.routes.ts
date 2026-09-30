@@ -4,6 +4,9 @@ import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
 import { forbidden } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
+import { companyServiceConfigured,resolveCompanyService } from '../company-settings/company-settings.service.js';
+import type { PoolClient } from 'pg';
+import type { AuthContext } from '../auth/auth.types.js';
 
 export const updateTenantSchema = z.object({
   name: z.string().trim().min(2).max(160),
@@ -19,15 +22,18 @@ export const updateTenantSchema = z.object({
   }
 });
 
-function capabilities(env: AppEnv) {
+async function capabilities(client:PoolClient,env: AppEnv,auth:AuthContext) {
   const communicationsMock = env.NODE_ENV !== 'production' && env.COMMUNICATIONS_MOCK;
+  const company=(await client.query<{company_id:string}>(`SELECT company_id FROM stores WHERE tenant_id=$1 AND store_in_scope(id) ORDER BY id LIMIT 1`,[auth.tenantId])).rows[0];
+  const companyId=company?.company_id??'00000000-0000-0000-0000-000000000000';
+  const [push,whatsapp,sms]=await Promise.all(['WEB_PUSH','WHATSAPP','SMS'].map(provider=>
+    resolveCompanyService(client,env,companyId,provider as 'WEB_PUSH'|'WHATSAPP'|'SMS')));
   return {
     maps: Boolean(env.GEOAPIFY_API_KEY),
     realtime: Boolean(env.REDIS_URL),
-    webPush: Boolean(env.PUSH_VAPID_SUBJECT && env.PUSH_VAPID_PUBLIC_KEY && env.PUSH_VAPID_PRIVATE_KEY),
-    whatsapp: communicationsMock || Boolean(env.WHATSAPP_PHONE_NUMBER_ID && env.WHATSAPP_ACCESS_TOKEN
-      && env.WHATSAPP_TRACKING_TEMPLATE),
-    sms: communicationsMock || (env.SMS_PROVIDER === 'webhook' && Boolean(env.SMS_API_URL && env.SMS_API_KEY)),
+    webPush: companyServiceConfigured(push!),
+    whatsapp: communicationsMock || companyServiceConfigured(whatsapp!),
+    sms: communicationsMock || companyServiceConfigured(sms!),
     objectStorage: env.OBJECT_STORAGE_PROVIDER === 'local'
       || Boolean(env.S3_BUCKET && env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY),
   };
@@ -44,7 +50,7 @@ export async function tenantRoutes(app: FastifyInstance, database: Database, env
          FROM tenants WHERE id = $1`,
         [request.auth.tenantId],
       );
-      return { ...result.rows[0], capabilities: capabilities(env) };
+      return { ...result.rows[0], capabilities: await capabilities(client,env,request.auth) };
     }),
   );
 

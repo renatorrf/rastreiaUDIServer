@@ -1,7 +1,7 @@
 import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
 import { setTenantContext, withRuntimeTransaction, withTenantTransaction, type Database } from '../../database/pool.js';
-import { AppError, unauthorized } from '../../shared/errors.js';
+import { AppError, conflict, unauthorized } from '../../shared/errors.js';
 import { writeAudit } from '../../shared/audit.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { backgroundTrackingTokenHash, generateBackgroundTrackingToken, nativeLocationEventId } from '../locations/background-tracking-token.js';
@@ -41,6 +41,12 @@ export async function createWorkdayTrackingSession(database: Database, env: AppE
 
 export async function revokeWorkdayTrackingSession(database: Database, auth: AuthContext, id: string) {
   return withTenantTransaction(database,auth,async client => {
+    const session=(await client.query<{status:string;ends_at:Date}>(`SELECT day.status,day.ends_at
+      FROM courier_workday_tracking_sessions session JOIN courier_workdays day ON day.id=session.workday_id
+      WHERE session.id=$1 AND session.tenant_id=$2 AND session.user_id=$3 FOR UPDATE OF session`,[id,auth.tenantId,auth.userId])).rows[0];
+    if(session?.status==='CHECKED_IN'&&new Date(session.ends_at)>new Date()){
+      throw conflict('A localização permanece obrigatória até o encerramento da jornada.');
+    }
     await client.query('UPDATE courier_workday_tracking_sessions SET revoked_at=now() WHERE id=$1 AND tenant_id=$2 AND user_id=$3', [id,auth.tenantId,auth.userId]);
     return { revoked: true };
   });

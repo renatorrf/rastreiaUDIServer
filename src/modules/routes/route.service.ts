@@ -67,6 +67,7 @@ async function hydrate(client: PoolClient, bases: RouteBase[]): Promise<Delivery
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.state ELSE delivery.state END AS state,
       CASE WHEN stop.stop_type = 'PICKUP' THEN store.postal_code ELSE delivery.postal_code END AS "postalCode",
       delivery.promised_window_end AS "promisedWindowEnd", delivery.status AS "deliveryStatus",
+      delivery.arrived_at AS "arrivedAt", delivery.waiting_at_gate_at AS "waitingAtGateAt",
       stop.completed_at AS "completedAt",
       stop.estimated_distance_from_previous_m AS "estimatedDistanceFromPreviousM",
       stop.estimated_duration_from_previous_s AS "estimatedDurationFromPreviousS",
@@ -143,13 +144,22 @@ async function refreshEtas(client: PoolClient, routeId: string, baseAt = new Dat
   await client.query('UPDATE routes SET eta_calculated_at = now() WHERE id = $1', [routeId]);
 }
 
-export async function listRoutes(database: Database, auth: AuthContext): Promise<{ data: DeliveryRouteView[] }> {
+export async function getRoute(database:Database,auth:AuthContext,id:string){
+  return withTenantTransaction(database,auth,client=>loadRoute(client,auth,id));
+}
+
+export async function listRoutes(database: Database, auth: AuthContext,
+  filters: {period?: 'all'|'today'|'previous';view?: 'all'|'active'|'history';limit?:number;offset?:number} = {},
+): Promise<{ data: DeliveryRouteView[] }> {
   return withTenantTransaction(database, auth, async (client) => {
     const result = await client.query<RouteBase>(
-      `${routeSelect} WHERE ($1::text<>'COURIER' OR route.status IN ('DRAFT','ACTIVE')) ${routeListAccess}
+      `${routeSelect} WHERE ($1::text<>'COURIER' OR route.status IN ('DRAFT','ACTIVE') OR $5::text='history') ${routeListAccess}
+       AND ($4::text='all' OR ($4='today' AND (COALESCE(route.planned_start_at,route.created_at) AT TIME ZONE (SELECT timezone FROM tenants WHERE id=route.tenant_id))::date=(now() AT TIME ZONE (SELECT timezone FROM tenants WHERE id=route.tenant_id))::date)
+         OR ($4='previous' AND (COALESCE(route.planned_start_at,route.created_at) AT TIME ZONE (SELECT timezone FROM tenants WHERE id=route.tenant_id))::date<(now() AT TIME ZONE (SELECT timezone FROM tenants WHERE id=route.tenant_id))::date))
+       AND ($5::text='all' OR ($5='active' AND route.status IN ('DRAFT','ACTIVE')) OR ($5='history' AND route.status IN ('COMPLETED','CANCELLED')))
        ORDER BY CASE route.status WHEN 'ACTIVE' THEN 0 WHEN 'DRAFT' THEN 1 ELSE 2 END,
-         route.planned_start_at NULLS LAST, route.created_at DESC`,
-      [auth.role, auth.storeIds, auth.userId],
+         route.planned_start_at NULLS LAST, route.created_at DESC,route.id DESC LIMIT $6 OFFSET $7`,
+      [auth.role, auth.storeIds, auth.userId, filters.period ?? 'all', filters.view ?? 'all',filters.limit ?? 50,filters.offset ?? 0],
     );
     return { data: await hydrate(client, result.rows) };
   });

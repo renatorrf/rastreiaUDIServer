@@ -8,9 +8,7 @@ import { trackingTokenHash } from '../modules/tracking/tracking-token.js';
 
 interface RegistrationBody {
   accountCreated: true;
-  email: string;
-  temporaryPassword: string;
-  customer: { id: string };
+  whatsapp: string;
 }
 
 interface IdentityBody {
@@ -44,8 +42,8 @@ const storeId = randomUUID();
 const deliveryId = randomUUID();
 const trackingId = randomUUID();
 const trackingToken = randomBytes(32).toString('base64url');
-const email = `customer-portal-${runId}@example.invalid`;
 const permanentPassword = `Customer-${runId}-safe`;
+const customerPhone = `119${String(Number.parseInt(suffix,16)).padStart(8,'0').slice(-8)}`;
 let customerProfileId: string | undefined;
 let customerUserId: string | undefined;
 
@@ -71,9 +69,9 @@ await withTransaction(database, async client => {
   await client.query(
     `INSERT INTO rastreia.deliveries(id,tenant_id,store_id,external_reference,recipient_name,
        recipient_phone,address_line,address_number,neighborhood,city,state,postal_code,latitude,longitude,status)
-     VALUES($1,$2,$3,$4,'Cliente Smoke','(11) 9888-8888','Rua Vergueiro','100','Liberdade',
+     VALUES($1,$2,$3,$4,'Cliente Smoke',$5,'Rua Vergueiro','100','Liberdade',
        'São Paulo','SP','01504-000',-23.5733,-46.6404,'DELIVERED')`,
-    [deliveryId, tenantId, storeId, `customer-${runId}`],
+    [deliveryId, tenantId, storeId, `customer-${runId}`, customerPhone],
   );
   await client.query(
     `INSERT INTO rastreia.tracking_tokens(id,tenant_id,delivery_id,token_hash,created_at,expires_at)
@@ -84,29 +82,17 @@ await withTransaction(database, async client => {
 
 const app = await buildApp({ env: smokeEnv });
 try {
-  const wrongPhone = await app.inject({
+  const shortPassword = await app.inject({
     method: 'POST',
     url: '/public/customers/register',
     payload: {
       trackingToken,
-      email: `wrong-${email}`,
-      firstName: 'Cliente',
-      lastName: 'Incorreto',
-      whatsapp: '(11) 97777-7777',
-      addressLine: 'Rua Vergueiro',
-      addressNumber: '100',
-      neighborhood: 'Liberdade',
-      city: 'São Paulo',
-      state: 'SP',
-      postalCode: '01504-000',
-      latitude: -23.5733,
-      longitude: -46.6404,
-      addressConfidence: 1,
+      password: 'short',
       consent: true,
     },
   });
-  if (wrongPhone.statusCode !== 422) {
-    throw new Error(`WhatsApp diferente da entrega deveria retornar 422, recebeu ${wrongPhone.statusCode}: ${wrongPhone.body}`);
+  if (shortPassword.statusCode !== 422) {
+    throw new Error(`Senha curta deveria retornar 422, recebeu ${shortPassword.statusCode}.`);
   }
 
   const registration = body<RegistrationBody>(await app.inject({
@@ -114,59 +100,52 @@ try {
     url: '/public/customers/register',
     payload: {
       trackingToken,
-      email,
-      firstName: 'Cliente',
-      lastName: 'Smoke',
-      whatsapp: '(11) 99888-8888',
-      addressLine: 'Rua Vergueiro',
-      addressNumber: '100',
-      complement: null,
-      neighborhood: 'Liberdade',
-      city: 'São Paulo',
-      state: 'SP',
-      postalCode: '01504-000',
-      latitude: -23.5733,
-      longitude: -46.6404,
-      addressConfidence: 1,
+      password: permanentPassword,
       consent: true,
     },
-  }), 200, 'cadastrar cliente com WhatsApp legado da entrega');
-  customerProfileId = registration.customer.id;
-  if (!registration.accountCreated || registration.email !== email || registration.temporaryPassword.length !== 8) {
-    throw new Error('O cadastro não retornou a conta e a senha temporária esperadas.');
+  }), 200, 'ativar cliente com os dados da entrega');
+  if (!registration.accountCreated || registration.whatsapp !== customerPhone) {
+    throw new Error('O cadastro não retornou a conta esperada.');
   }
 
   const temporaryIdentity = body<IdentityBody>(await app.inject({
     method: 'POST',
-    url: '/auth/sign-in',
-    payload: { email, password: registration.temporaryPassword },
-  }), 200, 'entrar com a senha temporária');
+    url: '/auth/customer/sign-in',
+    payload: { whatsapp: `+55 ${customerPhone}`, password: permanentPassword },
+  }), 200, 'entrar com WhatsApp e senha escolhida');
   customerUserId = temporaryIdentity.user.id;
-  if (!temporaryIdentity.user.mustChangePassword || temporaryIdentity.customer?.id !== customerProfileId) {
-    throw new Error('O primeiro login não exigiu a troca de senha ou perdeu o perfil do cliente.');
+  customerProfileId = temporaryIdentity.customer?.id;
+  if (temporaryIdentity.user.mustChangePassword || !customerProfileId) {
+    throw new Error('O login não retornou o perfil do cliente ou exigiu troca de senha indevida.');
   }
 
-  const blockedProfile = await app.inject({
-    method: 'GET',
-    url: '/customer/me',
-    headers: { authorization: `Bearer ${temporaryIdentity.accessToken}` },
-  });
-  if (blockedProfile.statusCode !== 409) {
-    throw new Error(`O perfil deveria permanecer bloqueado antes da troca de senha, recebeu ${blockedProfile.statusCode}.`);
+  const duplicate = await app.inject({method:'POST',url:'/public/customers/register',
+    payload:{trackingToken,password:'Different123',consent:true}});
+  if (duplicate.statusCode !== 409) {
+    throw new Error(`Nova ativação deveria retornar 409, recebeu ${duplicate.statusCode}.`);
   }
-
-  body(await app.inject({
-    method: 'PATCH',
-    url: '/auth/password',
-    headers: { authorization: `Bearer ${temporaryIdentity.accessToken}` },
-    payload: { currentPassword: registration.temporaryPassword, newPassword: permanentPassword },
-  }), 200, 'trocar a senha temporária');
 
   body(await app.inject({
     method: 'GET',
     url: '/customer/me',
     headers: { authorization: `Bearer ${temporaryIdentity.accessToken}` },
   }), 200, 'abrir as informações pessoais do cliente');
+  const customerTracking = body<{ status: string; reference: string | null }>(await app.inject({
+    method: 'GET',
+    url: `/customer/orders/${deliveryId}/tracking`,
+    headers: { authorization: `Bearer ${temporaryIdentity.accessToken}` },
+  }), 200, 'abrir o rastreio autenticado do pedido');
+  if (customerTracking.status !== 'DELIVERED' || customerTracking.reference !== `customer-${runId}`) {
+    throw new Error('O rastreio autenticado não retornou o pedido vinculado ao cliente.');
+  }
+  const unrelatedTracking = await app.inject({
+    method: 'GET',
+    url: `/customer/orders/${randomUUID()}/tracking`,
+    headers: { authorization: `Bearer ${temporaryIdentity.accessToken}` },
+  });
+  if (unrelatedTracking.statusCode !== 404) {
+    throw new Error(`Um pedido não vinculado ao cliente deveria retornar 404, recebeu ${unrelatedTracking.statusCode}.`);
+  }
   const orders = body<{ data: Array<{ id: string }> }>(await app.inject({
     method: 'GET',
     url: '/customer/orders',
@@ -178,31 +157,32 @@ try {
 
   const permanentIdentity = body<IdentityBody>(await app.inject({
     method: 'POST',
-    url: '/auth/sign-in',
-    payload: { email, password: permanentPassword },
+    url: '/auth/customer/sign-in',
+    payload: { whatsapp: customerPhone, password: permanentPassword },
   }), 200, 'entrar com a senha definitiva');
   if (permanentIdentity.user.mustChangePassword || permanentIdentity.customer?.id !== customerProfileId) {
     throw new Error('O login definitivo retornou um contexto incorreto.');
   }
   const oldPassword = await app.inject({
     method: 'POST',
-    url: '/auth/sign-in',
-    payload: { email, password: registration.temporaryPassword },
+    url: '/auth/customer/sign-in',
+    payload: { whatsapp: customerPhone, password: 'Different123' },
   });
   if (oldPassword.statusCode !== 401) {
-    throw new Error(`A senha temporária deveria ter sido invalidada, recebeu ${oldPassword.statusCode}.`);
+    throw new Error(`A senha não cadastrada deveria ser rejeitada, recebeu ${oldPassword.statusCode}.`);
   }
 
   process.stdout.write(`${JSON.stringify({
     ok: true,
     expiredTrackingLinkAcceptedWithinGrace: true,
-    differentWhatsappRejected: true,
-    legacyTenDigitMobileMatched: true,
-    temporaryPasswordLength: registration.temporaryPassword.length,
-    passwordChangeRequired: true,
-    temporaryPasswordInvalidated: true,
+    shortPasswordRejected: true,
+    formattedWhatsappAccepted: true,
+    duplicateActivationRejected: true,
+    wrongPasswordRejected: true,
     customerProfileAccessible: true,
     orderHistoryLinked: true,
+    authenticatedTrackingAvailable: true,
+    unrelatedTrackingRejected: true,
     permanentLoginSuccessful: true,
   }, null, 2)}\n`);
 } finally {
@@ -211,7 +191,7 @@ try {
     await withTransaction(database, async client => {
       if (!customerUserId) {
         customerUserId = (await client.query<{ id: string }>(
-          'SELECT id FROM rastreia.users WHERE email=$1::citext', [email],
+          'SELECT account.id FROM rastreia.users account JOIN rastreia.customer_profiles profile ON profile.user_id=account.id WHERE profile.tenant_id=$1', [tenantId],
         )).rows[0]?.id;
       }
       if (!customerProfileId) {

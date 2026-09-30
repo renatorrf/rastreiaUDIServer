@@ -27,6 +27,7 @@ import { courierRoutes } from './modules/couriers/courier.routes.js';
 import { customerRoutes } from './modules/customers/customer.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
+import { companySettingsRoutes } from './modules/company-settings/company-settings.routes.js';
 import { deliveryRoutes } from './modules/deliveries/delivery.routes.js';
 import { locationRoutes } from './modules/locations/location.routes.js';
 import { workdayRoutes } from './modules/workdays/workday.routes.js';
@@ -160,7 +161,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await storeRoutes(app, database, env);
   await userRoutes(app, database, env);
   await courierRoutes(app, database, env);
-  await customerRoutes(app, database, objectStorage, env);
+  await customerRoutes(app, database, objectStorage, env, locationState, options.routeDirectionsProvider ?? geoapify);
+  await companySettingsRoutes(app, database, env);
   await communicationRoutes(app, database, env);
   await communicationWebhookRoutes(app, database, env);
   await deliveryRoutes(app, database, env);

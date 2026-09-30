@@ -19,39 +19,44 @@ export interface Connection {
  enabled: boolean; auto_import_orders: boolean; auto_create_delivery: boolean; mode: string; events_mode: string;
  delivery_dispatch_mode: 'IMMEDIATE' | 'BEFORE_READY_TIME' | 'MANUAL'; delivery_dispatch_minutes_before: number;
 }
-interface OrderRow { id: string; external_order_id: string; delivery_id: string | null; external_status: string; external_status_at: Date; own_delivery: boolean; payload_encrypted: string; import_state: string }
+interface OrderRow { id: string; company_id?: string; external_order_id: string; delivery_id: string | null; external_status: string; external_status_at: Date; own_delivery: boolean; payload_encrypted: string; import_state: string }
 interface EventRow { id: string; integration_id: string | null; external_order_id: string; event_code: string; event_full_code: string; event_created_at: Date; attempts: number }
 const commandForStatus: Record<string, ExternalOrderAction> = { CONFIRMED:'CONFIRM', PREPARATION_STARTED:'PREPARE', DISPATCHED:'DISPATCH', CANCELLED:'CANCEL' };
 const safeError = (error: unknown): string => error instanceof IfoodHttpError ? error.message : error instanceof z.ZodError ? 'IFOOD_INVALID_ORDER_DATA' : error instanceof Error && /^[A-Z_0-9]+$/.test(error.message) ? error.message : 'IFOOD_PROCESSING_ERROR';
 export class IfoodIntegrationService {
   readonly secret: string;
-  constructor(readonly db: Database, readonly env: AppEnv, readonly provider: ExternalOrderProvider) { this.secret = integrationSecret(env); }
+  constructor(readonly db: Database, readonly env: AppEnv, readonly provider: ExternalOrderProvider,
+    private readonly resolveProvider: (companyId:string,mode?:string)=>Promise<ExternalOrderProvider> = async()=>provider) { this.secret = integrationSecret(env); }
 
-  async ingest(payload: unknown): Promise<string[]> {
+  providerForCompany(companyId:string,mode?:string):Promise<ExternalOrderProvider>{return this.resolveProvider(companyId,mode);}
+
+  async ingest(payload: unknown,mode:string=this.env.IFOOD_MODE): Promise<string[]> {
     const values = Array.isArray(payload) ? payload : [payload];
     const events = values.map(value => ({ event: ifoodEventSchema.parse(value), raw: value }));
     await withTransaction(this.db, async client => {
       for (const { event, raw } of events) {
         await client.query(`INSERT INTO integration_events(integration_id,provider,mode,external_event_id,merchant_id,external_order_id,event_code,event_full_code,payload_encrypted,event_created_at)
           VALUES((SELECT id FROM integration_connections WHERE provider='IFOOD' AND mode=$1 AND merchant_id=$2),'IFOOD',$1,$3,$2,$4,$5,$6,$7,$8)
-          ON CONFLICT(provider,external_event_id) DO NOTHING`, [this.env.IFOOD_MODE,event.merchantId,event.id,event.orderId,event.code,event.fullCode,encryptPayload(raw,this.secret),event.createdAt]);
-        await client.query(`UPDATE integration_connections SET last_event_at=now() WHERE mode=$1 AND merchant_id=$2`, [this.env.IFOOD_MODE,event.merchantId]);
+          ON CONFLICT(provider,external_event_id) DO NOTHING`, [mode,event.merchantId,event.id,event.orderId,event.code,event.fullCode,encryptPayload(raw,this.secret),event.createdAt]);
+        await client.query(`UPDATE integration_connections SET last_event_at=now() WHERE mode=$1 AND merchant_id=$2`, [mode,event.merchantId]);
       }
     });
     return events.map(({event}) => event.id); // COMMIT precedes ACK, including duplicates/unknown codes.
   }
 
   async poll(): Promise<void> {
-    if (!this.env.IFOOD_ENABLED || this.env.IFOOD_EVENTS_MODE !== 'polling') return;
-    const connections = (await this.db.query<Connection>(`UPDATE integration_connections SET next_poll_at=now()+($2::text||' milliseconds')::interval
-      WHERE id IN (SELECT id FROM integration_connections WHERE enabled AND mode=$1 AND events_mode='polling' AND next_poll_at<=now() FOR UPDATE SKIP LOCKED)
-      RETURNING *`,[this.env.IFOOD_MODE,this.env.IFOOD_POLLING_INTERVAL_MS])).rows;
-    for (let i=0;i<connections.length;i+=100) {
-      const batch=connections.slice(i,i+100);
+    const connections = (await this.db.query<Connection>(`UPDATE integration_connections SET next_poll_at=now()+($1::text||' milliseconds')::interval
+      WHERE id IN (SELECT id FROM integration_connections WHERE enabled AND events_mode='polling' AND next_poll_at<=now() FOR UPDATE SKIP LOCKED)
+      RETURNING *`,[this.env.IFOOD_POLLING_INTERVAL_MS])).rows;
+    const groups=new Map<string,Connection[]>();
+    for(const connection of connections){const key=`${connection.company_id}:${connection.mode}`;groups.set(key,[...(groups.get(key)??[]),connection]);}
+    for (const batchGroup of groups.values()) for (let i=0;i<batchGroup.length;i+=100) {
+      const batch=batchGroup.slice(i,i+100);
       try {
-        const events = await this.provider.pollEvents(batch.map(c=>c.merchant_id));
-        const ids = await this.ingest(events);
-        await this.provider.acknowledge(ids);
+        const provider=await this.providerForCompany(batch[0]!.company_id,batch[0]!.mode);
+        const events = await provider.pollEvents(batch.map(c=>c.merchant_id));
+        const ids = await this.ingest(events,batch[0]!.mode);
+        await provider.acknowledge(ids);
         await this.db.query(`UPDATE integration_connections SET last_success_at=now(),last_error_message=NULL,status='CONNECTED' WHERE id=ANY($1::uuid[])`,[batch.map(c=>c.id)]);
       } catch(error) {
         await this.db.query(`UPDATE integration_connections SET status='ERROR',last_error_at=now(),last_error_message=$2,next_poll_at=GREATEST(next_poll_at,now()+($3::text||' seconds')::interval) WHERE id=ANY($1::uuid[])`,[batch.map(c=>c.id),safeError(error),error instanceof IfoodHttpError?error.retryAfterSeconds:0]);
@@ -70,18 +75,19 @@ export class IfoodIntegrationService {
   }
 
   async processEvents(limit=25): Promise<number> {
-    if (!this.env.IFOOD_ENABLED) return 0;
     await this.db.query(`UPDATE integration_events e SET integration_id=c.id,status='RECEIVED',attempts=0,next_attempt_at=now(),last_error=NULL
-      FROM integration_connections c WHERE e.integration_id IS NULL AND c.merchant_id=e.merchant_id AND c.mode=e.mode AND c.provider=e.provider AND c.enabled AND e.mode=$1`,[this.env.IFOOD_MODE]);
+      FROM integration_connections c WHERE e.integration_id IS NULL AND c.merchant_id=e.merchant_id AND c.mode=e.mode AND c.provider=e.provider AND c.enabled`);
     const pending = (await this.db.query<EventRow>(`SELECT e.* FROM integration_events e LEFT JOIN integration_connections c ON c.id=e.integration_id
       WHERE e.mode=$1 AND e.status IN ('RECEIVED','ERROR') AND e.attempts<5 AND e.next_attempt_at<=now()
-      AND (c.id IS NULL OR (c.enabled AND (c.auto_import_orders OR EXISTS(SELECT 1 FROM external_orders o WHERE o.integration_id=c.id AND o.external_order_id=e.external_order_id)))) ORDER BY e.event_created_at,e.received_at LIMIT $2`,[this.env.IFOOD_MODE,limit])).rows;
+      AND (c.id IS NULL OR (c.enabled AND (c.auto_import_orders OR EXISTS(SELECT 1 FROM external_orders o WHERE o.integration_id=c.id AND o.external_order_id=e.external_order_id)))) ORDER BY e.event_created_at,e.received_at LIMIT $1`,[limit])).rows;
     for (const event of pending) {
       try {
         const status=externalStatus(event.event_code,event.event_full_code);
         const rejected=event.event_full_code==='CANCELLATION_REQUEST_FAILED'||event.event_code==='CANCELLATION_REQUEST_FAILED';
         // Details always obtained from provider, not from event metadata.
-        const raw=event.integration_id && status ? await this.provider.getOrder(event.external_order_id) : null;
+        const connection=event.integration_id?(await this.db.query<Connection>('SELECT * FROM integration_connections WHERE id=$1',[event.integration_id])).rows[0]:undefined;
+        const eventProvider=connection?await this.providerForCompany(connection.company_id,connection.mode):null;
+        const raw=eventProvider&&status ? await eventProvider.getOrder(event.external_order_id) : null;
         if(raw!==null)await this.db.query('UPDATE integration_events SET order_payload_encrypted=$2 WHERE id=$1 AND order_payload_encrypted IS NULL',[event.id,encryptPayload(raw,this.secret)]);
         await withTransaction(this.db,async client=>{
           const locked=(await client.query<EventRow & {status:string}>(`SELECT * FROM integration_events WHERE id=$1 FOR UPDATE`,[event.id])).rows[0]!;
@@ -95,7 +101,7 @@ export class IfoodIntegrationService {
             await client.query(`UPDATE integration_events SET status='IGNORED',processed_at=now(),last_error=$2 WHERE id=$1`,[event.id,!event.integration_id?'IFOOD_MERCHANT_NOT_CONFIGURED':'IFOOD_EVENT_NOT_USED']);return;
           }
           const c=(await client.query<Connection>(`SELECT * FROM integration_connections WHERE id=$1 FOR UPDATE`,[event.integration_id])).rows[0]!;
-          if (!c.enabled || c.mode!==this.env.IFOOD_MODE) return;
+          if (!c.enabled) return;
           if (!c.auto_import_orders && !(await client.query('SELECT id FROM external_orders WHERE integration_id=$1 AND external_order_id=$2',[c.id,event.external_order_id])).rowCount) return;
           const auth=await this.authFor(client,c);
           const normalized=normalizeIfoodOrder(raw);
@@ -142,9 +148,9 @@ export class IfoodIntegrationService {
 
   async releaseDue(): Promise<void> {
     const due=(await this.db.query<{id:string;integration_id:string}>(`SELECT o.id,o.integration_id FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id JOIN deliveries d ON d.id=o.delivery_id
-      WHERE c.enabled AND c.mode=$1 AND o.own_delivery
+      WHERE c.enabled AND o.own_delivery
       AND CASE WHEN c.delivery_dispatch_mode='IMMEDIATE' THEN now() WHEN c.delivery_dispatch_mode='BEFORE_READY_TIME' THEN o.ready_at-(c.delivery_dispatch_minutes_before::text||' minutes')::interval ELSE NULL END<=now()
-      AND o.external_status IN ('CONFIRMED','PREPARATION_STARTED') AND d.status='DRAFT' LIMIT 25`,[this.env.IFOOD_MODE])).rows;
+      AND o.external_status IN ('CONFIRMED','PREPARATION_STARTED') AND d.status='DRAFT' LIMIT 25`)).rows;
     for(const order of due) await withTransaction(this.db,async client=>{
       const c=(await client.query<Connection>('SELECT * FROM integration_connections WHERE id=$1 FOR UPDATE',[order.integration_id])).rows[0]!;
       if(!c.enabled)return;
@@ -153,7 +159,7 @@ export class IfoodIntegrationService {
     });
   }
   async releaseDelivery(client:PoolClient,auth:AuthContext,id:string):Promise<void>{
-    const order=(await client.query<OrderRow>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled AND c.mode=$2 FOR UPDATE OF o,c`,[id,this.env.IFOOD_MODE])).rows[0];
+    const order=(await client.query<OrderRow>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled FOR UPDATE OF o,c`,[id])).rows[0];
     if(!order?.own_delivery||!order.delivery_id)throw conflict('Pedido sem entrega própria criada.');
     if(!['CONFIRMED','PREPARATION_STARTED'].includes(order.external_status))throw conflict('Aguarde a confirmação do pedido pelo iFood.');
     const delivery=await loadDelivery(client,auth,order.delivery_id,true);
@@ -164,7 +170,7 @@ export class IfoodIntegrationService {
   }
 
   async createManualDelivery(client:PoolClient,auth:AuthContext,id:string){
-    const order=(await client.query<OrderRow & {store_id:string}>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled AND c.mode=$2 FOR UPDATE OF o,c`,[id,this.env.IFOOD_MODE])).rows[0];
+    const order=(await client.query<OrderRow & {store_id:string}>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled FOR UPDATE OF o,c`,[id])).rows[0];
     if(!order?.own_delivery)throw conflict('Pedido sem logística própria.');
     if(order.delivery_id)return {deliveryId:order.delivery_id};
     if(['CANCELLED','CONCLUDED','DISPATCHED'].includes(order.external_status))throw conflict('Pedido não está disponível para nova entrega.');
@@ -176,16 +182,17 @@ export class IfoodIntegrationService {
   }
 
   async requestAction(auth:AuthContext,id:string,action:Exclude<ExternalOrderAction,'DISPATCH'>,cancellationCode?:string){
-    const order=await withTenantTransaction(this.db,auth,async client=>(await client.query<OrderRow>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled AND c.mode=$2`,[id,this.env.IFOOD_MODE])).rows[0]);
+    const order=await withTenantTransaction(this.db,auth,async client=>(await client.query<OrderRow>(`SELECT o.*,c.company_id FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled`,[id])).rows[0]);
     if(!order)throw notFound('Pedido externo não encontrado.');
+    const provider=await this.providerForCompany(order.company_id!);
     let payload={};
     if(action==='CANCEL'){
-      const reason=(await this.provider.getCancellationReasons(order.external_order_id)).find(item=>item.cancellationCode===cancellationCode);
+      const reason=(await provider.getCancellationReasons(order.external_order_id)).find(item=>item.cancellationCode===cancellationCode);
       if(!reason)throw conflict('Selecione uma razão de cancelamento disponível no iFood.');
       payload=reason;
     }
     return withTenantTransaction(this.db,auth,async client=>{
-      const current=(await client.query<OrderRow>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled AND c.mode=$2 FOR UPDATE OF o,c`,[id,this.env.IFOOD_MODE])).rows[0];
+      const current=(await client.query<OrderRow>(`SELECT o.* FROM external_orders o JOIN integration_connections c ON c.id=o.integration_id WHERE o.id=$1 AND c.enabled FOR UPDATE OF o,c`,[id])).rows[0];
       if(!current?.own_delivery)throw conflict('Somente pedidos de entrega própria podem ser operados aqui.');
       if(['CANCELLED','CONCLUDED'].includes(current.external_status))throw conflict('Pedido externo encerrado.');
       if(action==='CONFIRM'&&current.external_status!=='PLACED')throw conflict('Este pedido já foi confirmado pelo iFood.');
@@ -202,25 +209,26 @@ export class IfoodIntegrationService {
     await this.db.query(`UPDATE integration_commands SET status='UNCERTAIN',last_error='IFOOD_SEND_OUTCOME_UNKNOWN' WHERE status='SENDING' AND updated_at<now()-interval '2 minutes'`);
     for(let n=0;n<25;n++){
       const command=await withTransaction(this.db,async client=>{
-        const row=(await client.query<{id:string;external_order_id:string;provider_order_id:string;operation:ExternalOrderAction;payload:{cancellationCode:string;description:string};attempts:number;merchant_id:string}>(`SELECT cmd.*,o.external_order_id AS provider_order_id,c.merchant_id FROM integration_commands cmd JOIN external_orders o ON o.id=cmd.external_order_id JOIN integration_connections c ON c.id=o.integration_id
-          WHERE cmd.status='REQUESTED' AND cmd.next_attempt_at<=now() AND cmd.attempts<5 AND c.enabled AND c.mode=$1 AND o.own_delivery
-          AND o.external_status NOT IN ('CANCELLED','CONCLUDED') ORDER BY cmd.created_at FOR UPDATE OF cmd SKIP LOCKED LIMIT 1`,[this.env.IFOOD_MODE])).rows[0];
+        const row=(await client.query<{id:string;external_order_id:string;provider_order_id:string;operation:ExternalOrderAction;payload:{cancellationCode:string;description:string};attempts:number;merchant_id:string;company_id:string;mode:string}>(`SELECT cmd.*,o.external_order_id AS provider_order_id,c.merchant_id,c.company_id,c.mode FROM integration_commands cmd JOIN external_orders o ON o.id=cmd.external_order_id JOIN integration_connections c ON c.id=o.integration_id
+          WHERE cmd.status='REQUESTED' AND cmd.next_attempt_at<=now() AND cmd.attempts<5 AND c.enabled AND o.own_delivery
+          AND o.external_status NOT IN ('CANCELLED','CONCLUDED') ORDER BY cmd.created_at FOR UPDATE OF cmd SKIP LOCKED LIMIT 1`)).rows[0];
         if(row)await client.query(`UPDATE integration_commands SET status='SENDING',attempts=attempts+1,updated_at=now() WHERE id=$1`,[row.id]);return row;
       });
       if(!command)break;
       try{
+        const provider=await this.providerForCompany(command.company_id,command.mode);
         switch(command.operation){
-          case 'CONFIRM':await this.provider.confirmOrder(command.provider_order_id);break;
-          case 'PREPARE':await this.provider.startPreparation(command.provider_order_id);break;
-          case 'DISPATCH':await this.provider.dispatchOrder(command.provider_order_id);break;
-          case 'CANCEL':await this.provider.requestCancellation(command.provider_order_id,command.payload);break;
+          case 'CONFIRM':await provider.confirmOrder(command.provider_order_id);break;
+          case 'PREPARE':await provider.startPreparation(command.provider_order_id);break;
+          case 'DISPATCH':await provider.dispatchOrder(command.provider_order_id);break;
+          case 'CANCEL':await provider.requestCancellation(command.provider_order_id,command.payload);break;
         }
         await this.db.query(`UPDATE integration_commands SET status='REQUEST_SENT',sent_at=now(),updated_at=now(),last_error=NULL WHERE id=$1 AND status='SENDING'`,[command.id]);
-        if(this.env.IFOOD_MODE==='mock'){
+        if(command.mode==='mock'){
           const codes={CONFIRM:['CFM','CONFIRMED'],PREPARE:['PRP','PREPARATION_STARTED'],DISPATCH:['DSP','DISPATCHED'],CANCEL:['CAN','CANCELLED']} as const;
           const [code,fullCode]=codes[command.operation];
           const event:ExternalEvent={id:`mock-command-${command.id}`,orderId:command.provider_order_id,merchantId:command.merchant_id,code,fullCode,createdAt:new Date().toISOString()};
-          await this.ingest(event);
+          await this.ingest(event,command.mode);
         }
       }catch(error){
         const knownRejection=error instanceof IfoodHttpError&&[400,401,403,404,409,422,429].includes(error.status);

@@ -30,7 +30,8 @@ describe('courier workday SQL / authorization / tracking',()=>{
       CREATE TABLE courier_profiles(id uuid PRIMARY KEY,user_id uuid REFERENCES users(id),status text DEFAULT 'ACTIVE');
       CREATE TABLE courier_store_links(store_id uuid REFERENCES stores(id),courier_profile_id uuid REFERENCES courier_profiles(id),status text DEFAULT 'ACTIVE');
       CREATE TABLE tenant_users(tenant_id uuid,user_id uuid,role text DEFAULT 'COURIER',status text DEFAULT 'ACTIVE');
-      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,courier_profile_id uuid,status text,route_id uuid,out_for_delivery_at timestamptz,updated_at timestamptz DEFAULT now(),created_at timestamptz DEFAULT now());
+      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,courier_profile_id uuid,status text,route_id uuid,out_for_delivery_at timestamptz,updated_at timestamptz DEFAULT now(),created_at timestamptz DEFAULT now(),
+        external_reference text,recipient_name text,address_line text,address_number text,city text,collected_at timestamptz,delivered_at timestamptz);
       CREATE TABLE outbox_events(id uuid DEFAULT gen_random_uuid(),tenant_id uuid,aggregate_type text,aggregate_id uuid,event_type text,payload jsonb);
       CREATE TABLE audit_logs(tenant_id uuid,actor_user_id uuid,action text,entity_type text,entity_id uuid,before_data jsonb,after_data jsonb,ip inet);
       CREATE TABLE idempotency_keys(tenant_id uuid,idempotency_key text,operation text,actor_user_id uuid,request_hash text,response_status int,response_body jsonb,UNIQUE(tenant_id,idempotency_key,operation));
@@ -142,9 +143,25 @@ describe('courier workday SQL / authorization / tracking',()=>{
     await expect(ingestNativeWorkdayPoint(database,publisher,env,token.token,{latitude:-18.9,longitude:-48.2,accuracy:10,time:Date.now()})).rejects.toMatchObject({statusCode:404});
     await pg.query("UPDATE courier_store_links SET status='ACTIVE' WHERE store_id=$1",[store]);
     await pg.exec("UPDATE deliveries SET status='DELIVERED'");
+    await expect(respondWorkday(database,auth,dayId,randomUUID(),'check-out',false)).rejects.toMatchObject({statusCode:409});
+    await pg.query("UPDATE courier_workdays SET starts_at=now()-interval '1 minute',ends_at=now()-interval '1 second' WHERE id=$1",[dayId]);
     await respondWorkday(database,auth,dayId,randomUUID(),'check-out',false);
     await expect(ingestNativeWorkdayPoint(database,publisher,env,token.token,{latitude:-18.9,longitude:-48.2,accuracy:10,time:Date.now()})).rejects.toMatchObject({statusCode:401});
     const result=await pg.query<{latitude:number|null;status:string}>('SELECT latitude,status FROM courier_workdays WHERE id=$1',[dayId]);
     expect(result.rows[0]).toEqual({latitude:null,status:'COMPLETED'});
+  });
+  it('daily summaries include local times and exclude other couriers, tenants and previous days',async()=>{
+    const own=randomUUID(),outsider=randomUUID();
+    await pg.query('INSERT INTO courier_profiles(id,user_id) VALUES($1,$2)',[outsider,otherUser]);
+    await pg.query(`INSERT INTO deliveries(id,tenant_id,store_id,courier_profile_id,status,recipient_name,created_at,collected_at,delivered_at)
+      VALUES($1,$2,$3,$4,'DELIVERED','Cliente autorizado',now(),now(),now()),
+      ($5,$2,$3,$6,'DELIVERED','Outro entregador',now(),now(),now()),
+      ($7,$8,$3,$4,'DELIVERED','Outra empresa',now(),now(),now()),
+      ($9,$2,$3,$4,'DELIVERED','Dia anterior',now()-interval '2 days',now(),now())`,
+      [own,tenant,store,courier,randomUUID(),outsider,randomUUID(),otherTenant,randomUUID()]);
+    const summary=await getMyWorkdays(database,auth);
+    expect(summary.deliveries.find(d=>d.id===own)).toMatchObject({recipientName:'Cliente autorizado',status:'DELIVERED',timezone:'America/Sao_Paulo'});
+    expect(summary.deliveries.some(d=>['Outro entregador','Outra empresa','Dia anterior'].includes(d.recipientName))).toBe(false);
+    expect(summary.deliveries.length).toBe(summary.statistics!.total);
   });
 });

@@ -7,6 +7,8 @@ export const deliveryStatuses = [
 export type DeliveryStatus = (typeof deliveryStatuses)[number];
 
 export interface DeliveryRecord {
+  arrivedAt?: string | null;
+  waitingAtGateAt?: string | null;
   id: string;
   tenantId: string;
   storeId: string;

@@ -6,9 +6,11 @@ import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
 import { withRuntimeTransaction, type Database } from '../../database/pool.js';
 import { enqueueEmail } from '../../integrations/email/email.service.js';
-import { conflict, unauthorized } from '../../shared/errors.js';
+import { AppError, conflict, unauthorized } from '../../shared/errors.js';
 import { createTokenPair, hashToken } from './token.service.js';
 import type { TenantRole } from './auth.types.js';
+import { normalizeCustomerPhone } from '../customers/customer-phone.js';
+import { linkActivationHistory, prepareCustomerActivation } from '../customers/customer-activation.js';
 
 export const passwordOptions = { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 } as const;
 export interface IdentityAccountRow { id:string; email:string; status:string; password_hash:string; email_verified_at:Date|null; must_change_password:boolean }
@@ -49,7 +51,8 @@ export async function verifyIdentityToken(env: AppEnv, token: string, type: 'acc
 }
 export async function identitySnapshot(client: PoolClient, userId: string) {
   const account = (await client.query(`SELECT id,name,email,must_change_password AS "mustChangePassword" FROM users WHERE id=$1 AND status='ACTIVE'
-    AND email_verified_at IS NOT NULL`, [userId])).rows[0];
+    AND (email_verified_at IS NOT NULL OR (email IS NULL AND customer_login_phone IS NOT NULL
+      AND EXISTS(SELECT 1 FROM customer_profiles WHERE user_id=users.id AND status='ACTIVE')))`, [userId])).rows[0];
   if (!account) throw unauthorized('Verifique seu e-mail antes de acessar.');
   const units = await client.query('SELECT * FROM rastreia.identity_units($1)', [userId]);
   const courier = (await client.query(`SELECT profile.id, profile.status,
@@ -70,13 +73,38 @@ export async function signInIdentity(database: Database, env: AppEnv, email: str
     return { ...snapshot, ...await identityTokens(client, env, account.id) };
   });
 }
+export async function signInCustomer(database: Database, env: AppEnv, whatsapp: string, password: string, trackingToken?: string) {
+  const phone = normalizeCustomerPhone(whatsapp);
+  return withRuntimeTransaction(database, async client => {
+    const account = (await client.query<{ id: string; password_hash: string; status: string }>(
+      'SELECT * FROM rastreia.customer_identity_by_phone($1)', [phone])).rows[0];
+    if (!account || account.status !== 'ACTIVE' || !await argon2.verify(account.password_hash, password)) throw unauthorized();
+    await setIdentity(client, account.id);
+    if (trackingToken) {
+      try {
+        const { profile, tokenId } = await prepareCustomerActivation(client, env, trackingToken, account.id);
+        if (profile.whatsapp_normalized !== phone || (profile.user_id && profile.user_id !== account.id)) throw unauthorized();
+        await client.query('UPDATE customer_profiles SET user_id=$2,consent_at=COALESCE(consent_at,now()) WHERE id=$1', [profile.id, account.id]);
+        await linkActivationHistory(client, env, profile, tokenId);
+      } catch (error) {
+        // A stale optional order link must not lock an existing account out.
+        // No profile or order is linked when its capability has expired.
+        if (!(error instanceof AppError) || error.statusCode !== 404) throw error;
+      }
+    }
+    const snapshot = await identitySnapshot(client, account.id);
+    return { ...snapshot, ...await identityTokens(client, env, account.id) };
+  });
+}
 export async function assertIdentity(database: Database, env: AppEnv, bearer: string | undefined) {
   if (!bearer?.startsWith('Bearer ')) throw unauthorized();
   const claims = await verifyIdentityToken(env, bearer.slice(7), 'access');
   return withIdentity(database, claims.userId, async client => {
     const result = await client.query(`SELECT 1 FROM identity_sessions session JOIN users account ON account.id=session.user_id
       WHERE session.id=$1 AND session.user_id=$2 AND session.revoked_at IS NULL AND session.expires_at>now()
-      AND account.status='ACTIVE' AND account.email_verified_at IS NOT NULL`, [claims.sessionId, claims.userId]);
+      AND account.status='ACTIVE' AND (account.email_verified_at IS NOT NULL OR
+        (account.email IS NULL AND account.customer_login_phone IS NOT NULL AND EXISTS
+          (SELECT 1 FROM customer_profiles WHERE user_id=account.id AND status='ACTIVE')))`, [claims.sessionId, claims.userId]);
     if (!result.rowCount) throw unauthorized();
     return claims;
   });

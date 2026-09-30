@@ -9,6 +9,7 @@ import { AppError, forbidden, notFound } from '../../shared/errors.js';
 import { withIdempotency } from '../../shared/idempotency.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { generateTrackingToken, trackingTokenHash } from '../tracking/tracking-token.js';
+import { companyServiceConfigured, resolveCompanyService, type ResolvedCompanyService } from '../company-settings/company-settings.service.js';
 
 export type CustomerMessageChannel = 'WHATSAPP' | 'SMS';
 
@@ -20,6 +21,7 @@ export interface PushSubscriptionInput {
 
 interface DeliveryMessageScope {
   id: string;
+  companyId: string;
   storeId: string;
   storeName: string;
   externalReference: string | null;
@@ -42,12 +44,16 @@ function publicTrackingUrl(baseUrl: string, token: string): string {
   return base ? `${base}/${token}` : `/rastrear/${token}`;
 }
 
-function providerConfigured(env: AppEnv, channel: CustomerMessageChannel): boolean {
+function providerConfigured(env: AppEnv, service:ResolvedCompanyService): boolean {
   if (env.COMMUNICATIONS_MOCK) return true;
-  if (channel === 'WHATSAPP') {
-    return Boolean(env.WHATSAPP_PHONE_NUMBER_ID && env.WHATSAPP_ACCESS_TOKEN && env.WHATSAPP_TRACKING_TEMPLATE);
-  }
-  return env.SMS_PROVIDER === 'webhook' && Boolean(env.SMS_API_URL && env.SMS_API_KEY);
+  return companyServiceConfigured(service);
+}
+
+async function scopedCompanyId(client:PoolClient,auth:AuthContext):Promise<string|null>{
+  const available=(await client.query<{available:boolean}>("SELECT to_regclass('rastreia.stores') IS NOT NULL AS available")).rows[0]?.available;
+  if(!available)return null;
+  return (await client.query<{company_id:string}>(`SELECT company_id FROM stores WHERE tenant_id=$1 AND store_in_scope(id)
+    ORDER BY id LIMIT 1`,[auth.tenantId])).rows[0]?.company_id??null;
 }
 
 async function loadDeliveryScope(
@@ -56,10 +62,10 @@ async function loadDeliveryScope(
   deliveryId: string,
 ): Promise<DeliveryMessageScope> {
   const result = await client.query<{
-    id: string; store_id: string; store_name: string; external_reference: string | null;
+    id: string; company_id:string; store_id: string; store_name: string; external_reference: string | null;
     recipient_phone: string; recipient_whatsapp: string | null; delivered_at: Date | null;
   }>(
-    `SELECT delivery.id, delivery.store_id, store.name AS store_name,
+    `SELECT delivery.id, delivery.company_id,delivery.store_id, store.name AS store_name,
             delivery.external_reference, delivery.recipient_phone,
             delivery.recipient_whatsapp, delivery.delivered_at
      FROM deliveries delivery
@@ -73,7 +79,7 @@ async function loadDeliveryScope(
     throw forbidden('Você não possui acesso à loja desta entrega.');
   }
   return {
-    id: row.id, storeId: row.store_id, storeName: row.store_name,
+    id: row.id,companyId:row.company_id, storeId: row.store_id, storeName: row.store_name,
     externalReference: row.external_reference, recipientPhone: row.recipient_phone,
     recipientWhatsapp: row.recipient_whatsapp, deliveredAt: row.delivered_at,
   };
@@ -119,14 +125,16 @@ export async function removePushSubscription(database: Database, auth: AuthConte
 
 export async function getPushStatus(database: Database, auth: AuthContext, env: AppEnv) {
   return withTenantTransaction(database, auth, async (client) => {
+    const companyId=await scopedCompanyId(client,auth);
+    const push=await resolveCompanyService(client,env,companyId??'00000000-0000-0000-0000-000000000000','WEB_PUSH');
     const result = await client.query<{ count: string; last_success_at: Date | null }>(
       `SELECT count(*)::text AS count,max(last_success_at) AS last_success_at FROM push_subscriptions
        WHERE tenant_id = $1 AND user_id = $2 AND active`,
       [auth.tenantId, auth.userId],
     );
     return {
-      configured: Boolean(env.PUSH_VAPID_SUBJECT && env.PUSH_VAPID_PUBLIC_KEY && env.PUSH_VAPID_PRIVATE_KEY),
-      publicKey: env.PUSH_VAPID_PUBLIC_KEY || null,
+      configured: companyServiceConfigured(push),
+      publicKey: companyServiceConfigured(push) ? String(push.values['publicKey']??'') : null,
       activeDevices: Number(result.rows[0]?.count ?? 0),
       lastSuccessAt: result.rows[0]?.last_success_at ?? null,
     };
@@ -149,8 +157,9 @@ export async function queuePushTest(database: Database, auth: AuthContext, key: 
     const active=(await client.query('SELECT 1 FROM push_subscriptions WHERE tenant_id=$1 AND user_id=$2 AND active LIMIT 1',
       [auth.tenantId,auth.userId])).rowCount;
     if(!active)throw new AppError(409,'PUSH_SUBSCRIPTION_REQUIRED','Ative e sincronize as notificações neste dispositivo antes do teste.');
+    const companyId=await scopedCompanyId(client,auth);
     await client.query(`INSERT INTO outbox_events(tenant_id,aggregate_type,aggregate_id,event_type,payload)
-      VALUES($1,'user',$2,'push.test',$3::jsonb)`,[auth.tenantId,auth.userId,JSON.stringify({notificationKey:`push-test:${auth.userId}`})]);
+      VALUES($1,'user',$2,'push.test',$3::jsonb)`,[auth.tenantId,auth.userId,JSON.stringify({notificationKey:`push-test:${auth.userId}`,...(companyId?{companyId}:{})})]);
     await writeAudit(client,{tenantId:auth.tenantId,actorUserId:auth.userId,action:'push.test.queued',entityType:'user',entityId:auth.userId});
     return {statusCode:202,body:{queued:true}};
   }));
@@ -165,13 +174,12 @@ export async function queueTrackingMessage(
   channel: CustomerMessageChannel,
   ip?: string,
 ) {
-  if (!providerConfigured(env, channel)) {
-    throw new AppError(503, 'MESSAGE_PROVIDER_NOT_CONFIGURED',
-      `O provedor ${channel === 'WHATSAPP' ? 'WhatsApp' : 'SMS'} ainda não foi configurado.`);
-  }
   return withTenantTransaction(database, auth, async (client) =>
     withIdempotency(client, auth, key, 'communication.tracking-message', { deliveryId, channel }, async () => {
       const delivery = await loadDeliveryScope(client, auth, deliveryId);
+      const service=await resolveCompanyService(client,env,delivery.companyId,channel);
+      if(!providerConfigured(env,service))throw new AppError(503,'MESSAGE_PROVIDER_NOT_CONFIGURED',
+        `O provedor ${channel === 'WHATSAPP' ? 'WhatsApp' : 'SMS'} ainda não foi configurado para esta empresa.`);
       const destination = channel === 'WHATSAPP'
         ? delivery.recipientWhatsapp ?? delivery.recipientPhone
         : delivery.recipientPhone;

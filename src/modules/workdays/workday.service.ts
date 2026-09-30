@@ -104,7 +104,15 @@ export async function getMyWorkdays(database: Database, auth: AuthContext) {
       FROM deliveries d JOIN courier_profiles p ON p.id=d.courier_profile_id JOIN tenants t ON t.id=d.tenant_id
       WHERE d.tenant_id=$1 AND p.user_id=$2
         AND (d.created_at AT TIME ZONE t.timezone)::date=(now() AT TIME ZONE t.timezone)::date`, [auth.tenantId, auth.userId])).rows[0];
-    return { data, current, active, statistics, serverTime: new Date().toISOString() };
+    const deliveries = (await client.query<{id:string;externalReference:string|null;recipientName:string;status:string;
+      addressLine:string;addressNumber:string|null;city:string;timezone:string;createdAt:Date;collectedAt:Date|null;deliveredAt:Date|null}>(`SELECT d.id,d.external_reference AS "externalReference",
+      d.recipient_name AS "recipientName",d.status,d.address_line AS "addressLine",d.address_number AS "addressNumber",
+      d.city,d.created_at AS "createdAt",d.collected_at AS "collectedAt",d.delivered_at AS "deliveredAt",
+      t.timezone FROM deliveries d JOIN courier_profiles p ON p.id=d.courier_profile_id JOIN tenants t ON t.id=d.tenant_id
+      WHERE d.tenant_id=$1 AND p.user_id=$2
+        AND (d.created_at AT TIME ZONE t.timezone)::date=(now() AT TIME ZONE t.timezone)::date
+      ORDER BY d.created_at DESC,d.id LIMIT 20`, [auth.tenantId, auth.userId])).rows;
+    return { data, current, active, statistics, deliveries, serverTime: new Date().toISOString() };
   });
 }
 
@@ -126,6 +134,9 @@ export async function respondWorkday(database: Database, auth: AuthContext, id: 
               checkin_at=now(),location_consent_at=now(),version=version+1,updated_at=now() WHERE id=$1`, [id]);
         } else if (action === 'check-out') {
           if (day.status !== 'CHECKED_IN') throw conflict('Não há check-in ativo nesta jornada.');
+          if (new Date() < new Date(day.endsAt)) {
+            throw conflict('O check-out será liberado somente após o horário de fechamento do estabelecimento.');
+          }
           const deliveries = await client.query(`SELECT id FROM deliveries WHERE tenant_id=$1 AND courier_profile_id=$2
             AND status IN ('COLLECTED','IN_ROUTE','NEXT_STOP','RETURN_STARTED') LIMIT 1`, [auth.tenantId, day.courierId]);
           if (deliveries.rowCount) throw conflict('Conclua ou transfira as entregas em andamento antes do check-out.');

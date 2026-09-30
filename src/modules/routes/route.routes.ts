@@ -6,7 +6,7 @@ import type { RouteDirectionsProvider, RouteMatrixProvider } from '../../integra
 import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempotency.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
-  applyRouteSuggestion, completeRouteStop, createRoute, getRouteNavigation, listRoutes, optimizeRoute,
+  applyRouteSuggestion, completeRouteStop, createRoute, getRoute, getRouteNavigation, listRoutes, optimizeRoute,
   prioritizeRouteStop, reorderRoute, startRoute,
 } from './route.service.js';
 
@@ -33,7 +33,13 @@ export async function routeRoutes(
   directionsProvider: RouteDirectionsProvider,
 ): Promise<void> {
   const auth = authenticate(env, database);
-  app.get('/routes', { preHandler: auth }, async (request) => listRoutes(database, request.auth));
+  app.get('/routes/:id', {preHandler:auth},async request=>getRoute(database,request.auth,routeIdSchema.parse(request.params).id));
+  app.get('/routes', { preHandler: auth }, async (request) => listRoutes(database, request.auth, z.object({
+    period: z.enum(['all','today','previous']).default('all'),
+    view: z.enum(['all','active','history']).default('all'),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    offset: z.coerce.number().int().min(0).max(100000).default(0),
+  }).parse(request.query)));
   app.get('/routes/:id/navigation', { preHandler: auth }, async (request) => {
     const { id } = routeIdSchema.parse(request.params);
     return getRouteNavigation(database, request.auth, id, directionsProvider);

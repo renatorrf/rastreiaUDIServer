@@ -8,7 +8,7 @@ import { AppError, unauthorized } from '../../shared/errors.js';
 import { sessionCookieOptions } from '../../shared/session-cookie.js';
 import { emailConfigured } from '../../integrations/email/email.service.js';
 import { assertIdentity, changeOwnPassword, consumeIdentityAction, createIdentityAction, enterUnit, identitySnapshot,
-  passwordOptions, refreshIdentity, setIdentity, signInIdentity, verifyIdentityToken, withIdentity } from './identity.service.js';
+  passwordOptions, refreshIdentity, setIdentity, signInIdentity, signInCustomer, verifyIdentityToken, withIdentity } from './identity.service.js';
 import { courierPreferencesSchema } from '../couriers/courier-account.routes.js';
 import type { IdentityAccountRow } from './identity.service.js';
 import { logout } from './auth.service.js';
@@ -35,6 +35,11 @@ export async function identityRoutes(app:FastifyInstance,database:Database,env:A
   app.post('/auth/sign-in',limited,async(request,reply)=>{
     const input=emailSchema.extend({password:z.string().min(8).max(200)}).parse(request.body);
     return sendIdentity(reply,await signInIdentity(database,env,input.email,input.password));
+  });
+  app.post('/auth/customer/sign-in',limited,async(request,reply)=>{
+    const input=z.object({whatsapp:z.string().trim().min(10).max(25),password:z.string().min(8).max(200),
+      trackingToken:z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional()}).parse(request.body);
+    return sendIdentity(reply,await signInCustomer(database,env,input.whatsapp,input.password,input.trackingToken));
   });
   app.post('/auth/identity/refresh',async(request,reply)=>{
     const token=request.cookies['rastreia_identity_refresh']; if(!token) throw unauthorized();

@@ -12,6 +12,7 @@ import { completeOfferForDelivery } from '../offers/offer.service.js';
 import { createFailureIncident } from '../incidents/incident.repository.js';
 import { requireConfirmedCourierPresence, requireCourierCheckin } from '../workdays/workday.service.js';
 import { normalizeCustomerPhone } from '../customers/customer-phone.js';
+import { preregisterCustomer } from '../customers/customer-preregistration.js';
 
 export interface CreateDeliveryInput {
   storeId: string;
@@ -35,6 +36,7 @@ export interface CreateDeliveryInput {
 }
 
 interface ListFilters {
+  period?: 'all' | 'today' | 'previous' | undefined;
   view?: 'all' | 'active' | 'history' | undefined;
   offset?: number | undefined;
   status?: DeliveryStatus | undefined;
@@ -52,6 +54,7 @@ const deliverySelect = `
          d.address_confidence::float8 AS "addressConfidence",
          d.delivery_instructions AS "deliveryInstructions", d.status,
          d.promised_window_start AS "promisedWindowStart", d.promised_window_end AS "promisedWindowEnd",
+         d.arrived_at AS "arrivedAt", d.waiting_at_gate_at AS "waitingAtGateAt",
          d.collected_at AS "collectedAt", d.out_for_delivery_at AS "outForDeliveryAt",
          d.delivered_at AS "deliveredAt", d.cancelled_at AS "cancelledAt", d.failed_at AS "failedAt",
          d.failure_reason AS "failureReason", d.version,
@@ -173,11 +176,13 @@ export async function listDeliveries(
        WHERE ($1::delivery_status IS NULL OR d.status = $1)
        ${accessPredicate}
        AND ($5::uuid IS NULL OR d.store_id = $5)
-       AND ($7::text='all' OR ($7='active' AND d.status IN ('ASSIGNED','AWAITING_PICKUP','COLLECTED','IN_ROUTE','NEXT_STOP','RETURN_STARTED'))
+       AND ($9::text='all' OR ($9='today' AND (d.created_at AT TIME ZONE (SELECT timezone FROM tenants WHERE id=d.tenant_id))::date=(now() AT TIME ZONE (SELECT timezone FROM tenants WHERE id=d.tenant_id))::date)
+         OR ($9='previous' AND (d.created_at AT TIME ZONE (SELECT timezone FROM tenants WHERE id=d.tenant_id))::date<(now() AT TIME ZONE (SELECT timezone FROM tenants WHERE id=d.tenant_id))::date))
+       AND ($7::text='all' OR ($7='active' AND d.status IN ('ASSIGNED','AWAITING_PICKUP','COLLECTED','IN_ROUTE','NEXT_STOP','RETURN_STARTED','DRAFT','AWAITING_COURIER'))
          OR ($7='history' AND d.status IN ('DELIVERED','DELIVERY_FAILED','CANCELLED','RETURNED')))
-       ORDER BY d.created_at DESC
+       ORDER BY d.created_at DESC,d.id DESC
        LIMIT $6 OFFSET $8`,
-      [filters.status ?? null, ...accessParameters(auth), filters.storeId ?? null, filters.limit,filters.view ?? 'all',filters.offset ?? 0],
+      [filters.status ?? null, ...accessParameters(auth), filters.storeId ?? null, filters.limit,filters.view ?? 'all',filters.offset ?? 0,filters.period ?? 'all'],
     );
     return { data: result.rows.map((delivery) => ({ ...delivery, nextActions: nextOperationalActions(delivery.status) })) };
   });
@@ -314,22 +319,24 @@ export async function linkDeliveryCustomerWhatsapp(
       if (before.status !== 'DELIVERED') throw conflict('Conclua a entrega antes de vincular o WhatsApp do cliente.');
       const normalized = normalizeCustomerPhone(whatsapp);
       if (!/^\d{10,11}$/.test(normalized)) throw conflict('Informe DDD e número do WhatsApp.');
-      const customer = await client.query<{ id: string }>(
-        `SELECT id FROM customer_profiles
-         WHERE tenant_id = $1 AND whatsapp_normalized = $2 AND status = 'ACTIVE' LIMIT 1`,
-        [auth.tenantId, normalized],
-      );
+      if (before.recipientWhatsapp && normalizeCustomerPhone(before.recipientWhatsapp) !== normalized) {
+        throw conflict('Este pedido já possui WhatsApp vinculado. Solicite a correção à loja.');
+      }
+      const customerId = await preregisterCustomer(client, auth.tenantId, {
+        ...before, recipientWhatsapp: normalized, recipientPhone: normalized,
+      });
+      if (!customerId) throw conflict('Não foi possível preparar o cadastro com este número. Solicite a conferência à loja.');
       await client.query(
-        `UPDATE deliveries SET recipient_whatsapp = $2,
+        `UPDATE deliveries SET recipient_whatsapp = $2, recipient_phone = $2,
            customer_profile_id = COALESCE($3, customer_profile_id), version = version + 1, updated_by = $4
          WHERE id = $1`,
-        [deliveryId, normalized, customer.rows[0]?.id ?? null, auth.userId],
+        [deliveryId, normalized, customerId, auth.userId],
       );
       const current = await loadCurrentRecord(client, auth, deliveryId);
       await writeAudit(client, { tenantId: auth.tenantId, actorUserId: auth.userId,
         action: 'delivery.customer-whatsapp-linked', entityType: 'delivery', entityId: deliveryId,
         beforeData: { hadWhatsapp: Boolean(before.recipientWhatsapp) },
-        afterData: { hadWhatsapp: true, phoneEnding: normalized.slice(-4), customerLinked: Boolean(customer.rowCount) },
+        afterData: { hadWhatsapp: true, phoneEnding: normalized.slice(-4), customerLinked: true },
         ...(ip === undefined ? {} : { ip }) });
       await publishEvent(client, auth, deliveryId, 'delivery.customer-whatsapp-linked', {
         deliveryId, storeId: current.storeId, courierId: current.courierId,
@@ -351,12 +358,7 @@ export async function createDeliveryInTransaction(client: PoolClient, auth: Auth
       const recipientPhone = /^\d{10,11}$/.test(normalizedRecipientPhone)
         ? normalizedRecipientPhone : input.recipientPhone.trim();
       const recipientWhatsapp = input.recipientWhatsapp ? normalizeCustomerPhone(input.recipientWhatsapp) : null;
-      const normalizedPhone = normalizeCustomerPhone(recipientWhatsapp ?? recipientPhone);
-      const customerProfileId = /^\d{10,11}$/.test(normalizedPhone)
-        ? (await client.query<{ id: string }>(`SELECT id FROM customer_profiles
-            WHERE tenant_id=$1 AND whatsapp_normalized=$2 AND status='ACTIVE' LIMIT 1`,
-          [auth.tenantId, normalizedPhone])).rows[0]?.id ?? null
-        : null;
+      const customerProfileId = await preregisterCustomer(client, auth.tenantId, input);
       await client.query(
         `INSERT INTO deliveries
            (id, tenant_id, store_id, external_reference, recipient_name, recipient_phone,

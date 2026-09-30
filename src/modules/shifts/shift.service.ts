@@ -548,14 +548,21 @@ export async function checkoutShiftPosition(
     client, auth, key, `shift-position.checkout:${positionId}`, {}, async () => {
       const courierId = await ownCourierId(client, auth);
       await lockCourier(client, courierId);
-      const result = await client.query<{ slot_id: string; status: string; assigned_courier_id: string | null }>(
-        `SELECT slot_id, status, assigned_courier_id FROM shift_positions WHERE id = $1 FOR UPDATE`,
+      const result = await client.query<{ slot_id: string; status: string; assigned_courier_id: string | null; ends_at: Date }>(
+        `SELECT position.slot_id, position.status, position.assigned_courier_id, slot.ends_at
+           FROM shift_positions position
+           JOIN shift_slots slot ON slot.id = position.slot_id
+          WHERE position.id = $1
+          FOR UPDATE OF position`,
         [positionId],
       );
       const position = result.rows[0];
       if (!position || position.assigned_courier_id !== courierId) throw notFound('Turno ativo não encontrado.');
       if (position.status === 'COMPLETED') return { body: await loadPosition(client, auth, positionId), statusCode: 200 };
       if (position.status !== 'ACTIVE') throw conflict('Este turno não está ativo.');
+      if (new Date() < new Date(position.ends_at)) {
+        throw conflict('O encerramento do turno será liberado após o horário de fechamento da unidade.');
+      }
       const activeDelivery = await client.query(
         `SELECT 1 FROM deliveries WHERE courier_profile_id = $1
            AND status IN ('ASSIGNED', 'AWAITING_PICKUP', 'COLLECTED', 'IN_ROUTE', 'NEXT_STOP') LIMIT 1`,

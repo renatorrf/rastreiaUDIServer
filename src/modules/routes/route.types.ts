@@ -1,4 +1,6 @@
 export interface RouteStopView {
+  arrivedAt?: string | null;
+  waitingAtGateAt?: string | null;
   id: string;
   deliveryId: string;
   deliveryReference: string | null;

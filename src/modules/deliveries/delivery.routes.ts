@@ -11,6 +11,7 @@ import {
 } from './delivery.service.js';
 import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 import { deliveryStatuses } from './delivery.types.js';
+import { notifyDeliveryCustomer } from './delivery-customer-alert.service.js';
 
 const deliveryIdSchema = z.object({ id: z.uuid() });
 const createDeliverySchema = z.object({
@@ -44,6 +45,7 @@ const customerWhatsappSchema = z.object({
     .refine((value) => /^\d{10,11}$/.test(value), 'Informe DDD e número do WhatsApp.'),
 });
 const listSchema = z.object({
+  period: z.enum(['all','today','previous']).default('all'),
   view: z.enum(['all','active','history']).default('all'),
   offset: z.coerce.number().int().min(0).max(100000).default(0),
   status: z.enum(deliveryStatuses).optional(),
@@ -82,6 +84,13 @@ function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
 
 export async function deliveryRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {
   const auth = authenticate(env, database);
+
+  app.post('/deliveries/:id/customer-alert', { preHandler: [auth, requireRoles('COURIER')],
+    config: { rateLimit: { max: 12, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const { id } = deliveryIdSchema.parse(request.params);
+    const { action } = z.object({ action: z.enum(['ARRIVED', 'WAITING_AT_GATE']) }).parse(request.body);
+    return sendIdempotent(reply, await notifyDeliveryCustomer(database, request.auth, id, keyFrom(request), action));
+  });
 
   app.get('/deliveries', { preHandler: auth }, async (request) => {
     const filters = listSchema.parse(request.query);

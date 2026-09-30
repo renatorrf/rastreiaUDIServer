@@ -4,6 +4,7 @@ import type { AppEnv } from '../config/env.js';
 import type { Database } from '../database/pool.js';
 import { withTransaction } from '../database/pool.js';
 import { decryptPayload } from '../shared/encrypted-payload.js';
+import { companyServiceConfigured, resolveCompanyService, type ResolvedCompanyService } from '../modules/company-settings/company-settings.service.js';
 
 interface OutboxEvent {
   id: string;
@@ -27,6 +28,7 @@ interface SensitiveMessagePayload {
 interface MessageRow {
   id: string;
   tenant_id: string;
+  company_id: string;
   delivery_id: string;
   channel: 'WHATSAPP' | 'SMS';
   status: string;
@@ -51,25 +53,26 @@ function masked(value: string): string {
   return digits.length > 4 ? `****${digits.slice(-4)}` : '****';
 }
 
-function smsConfigured(env: AppEnv): boolean {
-  return env.COMMUNICATIONS_MOCK
-    || (env.SMS_PROVIDER === 'webhook' && Boolean(env.SMS_API_URL && env.SMS_API_KEY));
+function field(service:ResolvedCompanyService,key:string):string{return String(service.values[key]??'').trim();}
+
+function smsConfigured(env: AppEnv,service:ResolvedCompanyService): boolean {
+  return env.COMMUNICATIONS_MOCK || companyServiceConfigured(service);
 }
 
-async function sendWhatsApp(env: AppEnv, payload: SensitiveMessagePayload): Promise<ProviderResult> {
+async function sendWhatsApp(env: AppEnv, service:ResolvedCompanyService,payload: SensitiveMessagePayload): Promise<ProviderResult> {
   if (env.COMMUNICATIONS_MOCK) return { messageId: `mock-wa-${crypto.randomUUID()}`, statusCode: 200 };
   const response = await fetch(
-    `https://graph.facebook.com/${env.WHATSAPP_GRAPH_VERSION}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    `https://graph.facebook.com/${field(service,'graphVersion')}/${field(service,'phoneNumberId')}/messages`,
     {
       method: 'POST',
-      headers: { authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${field(service,'accessToken')}`, 'content-type': 'application/json' },
       body: JSON.stringify({
         messaging_product: 'whatsapp',
         to: payload.whatsappTo.replace(/\D/g, ''),
         type: 'template',
         template: {
-          name: env.WHATSAPP_TRACKING_TEMPLATE,
-          language: { code: env.WHATSAPP_TEMPLATE_LANGUAGE },
+          name: field(service,'trackingTemplate'),
+          language: { code: field(service,'templateLanguage') },
           components: [{ type: 'body', parameters: [{ type: 'text', text: payload.trackingUrl }] }],
         },
       }),
@@ -83,12 +86,12 @@ async function sendWhatsApp(env: AppEnv, payload: SensitiveMessagePayload): Prom
   return { messageId, statusCode: response.status };
 }
 
-async function sendSms(env: AppEnv, payload: SensitiveMessagePayload): Promise<ProviderResult> {
+async function sendSms(env: AppEnv, service:ResolvedCompanyService,payload: SensitiveMessagePayload): Promise<ProviderResult> {
   if (env.COMMUNICATIONS_MOCK) return { messageId: `mock-sms-${crypto.randomUUID()}`, statusCode: 200 };
-  if (!env.SMS_API_URL) throw new ProviderError('SMS_NOT_CONFIGURED');
-  const response = await fetch(env.SMS_API_URL, {
+  const apiUrl=field(service,'apiUrl');if (!apiUrl) throw new ProviderError('SMS_NOT_CONFIGURED');
+  const response = await fetch(apiUrl, {
     method: 'POST',
-    headers: { authorization: `Bearer ${env.SMS_API_KEY}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${field(service,'apiKey')}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       to: payload.smsTo,
       message: `${payload.storeName}: acompanhe sua entrega${payload.reference ? ` ${payload.reference}` : ''} em ${payload.trackingUrl}`,
@@ -195,8 +198,10 @@ async function markRetry(
 
 async function processMessage(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   const result = await database.query<MessageRow>(
-    `SELECT id, tenant_id, delivery_id, channel, status, encrypted_payload, attempt_count
-     FROM rastreia.message_deliveries WHERE id = $1`,
+    `SELECT message.id,message.tenant_id,message.delivery_id,delivery.company_id,message.channel,message.status,
+            message.encrypted_payload,message.attempt_count
+     FROM rastreia.message_deliveries message JOIN rastreia.deliveries delivery ON delivery.id=message.delivery_id
+     WHERE message.id = $1`,
     [event.aggregate_id],
   );
   const message = result.rows[0];
@@ -208,9 +213,11 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
     [message.id, attempt],
   );
   try {
+    const providerService=await resolveCompanyService(database,env,message.company_id,message.channel==='WHATSAPP'?'WHATSAPP':'SMS');
+    if(!env.COMMUNICATIONS_MOCK&&!companyServiceConfigured(providerService))throw new ProviderError(`${message.channel}_NOT_CONFIGURED`);
     const provider = message.channel === 'WHATSAPP'
-      ? await sendWhatsApp(env, payload)
-      : await sendSms(env, payload);
+      ? await sendWhatsApp(env,providerService,payload)
+      : await sendSms(env,providerService,payload);
     await withTransaction(database, async (client) => {
       await client.query(
         `UPDATE rastreia.message_deliveries
@@ -229,7 +236,8 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
     });
   } catch (error) {
     const providerError = error instanceof ProviderError ? error : new ProviderError('PROVIDER_UNAVAILABLE');
-    const fallback = message.channel === 'WHATSAPP' && smsConfigured(env);
+    const smsService=await resolveCompanyService(database,env,message.company_id,'SMS');
+    const fallback = message.channel === 'WHATSAPP' && smsConfigured(env,smsService);
     await withTransaction(database, async (client) => {
       await client.query(
         `INSERT INTO rastreia.notification_attempts
@@ -284,13 +292,31 @@ function pushCopy(eventType: string): { title: string; body: string } | null {
   return copy[eventType] ?? null;
 }
 
+async function companyIdForEvent(database:Database,event:OutboxEvent):Promise<string|null>{
+  const explicit=event.payload['companyId'];if(typeof explicit==='string'&&/^[0-9a-f-]{36}$/i.test(explicit))return explicit;
+  const query=event.event_type.startsWith('delivery.')
+    ? 'SELECT company_id FROM rastreia.deliveries WHERE id=$1 AND tenant_id=$2'
+    : event.event_type.startsWith('workday.')
+      ? 'SELECT store.company_id FROM rastreia.courier_workdays day JOIN rastreia.stores store ON store.id=day.store_id WHERE day.id=$1 AND day.tenant_id=$2'
+      : event.event_type.startsWith('shift.')
+        ? 'SELECT store.company_id FROM rastreia.shift_positions position JOIN rastreia.shift_slots slot ON slot.id=position.slot_id JOIN rastreia.stores store ON store.id=slot.store_id WHERE position.id=$1 AND position.tenant_id=$2'
+        : event.event_type==='driver-event.created'
+          ? 'SELECT company_id FROM rastreia.driver_operational_events WHERE id=$1 AND tenant_id=$2'
+          : null;
+  if(!query)return null;
+  return (await database.query<{company_id:string}>(query,[event.aggregate_id,event.tenant_id])).rows[0]?.company_id??null;
+}
+
 async function processPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   const driverEvent=event.event_type==='driver-event.created';
   const cancellation=event.event_type==='delivery.cancel';
   const priorityEvent=event.event_type==='delivery.prioritized';
   if(driverEvent&&event.payload['severity']!=='CRITICAL')return;
   const copy = pushCopy(event.event_type);
-  if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
+  if (!copy)return;
+  const companyId=await companyIdForEvent(database,event);
+  const push=await resolveCompanyService(database,env,companyId??'00000000-0000-0000-0000-000000000000','WEB_PUSH');
+  if(!companyServiceConfigured(push))return;
   const shiftEvent = event.event_type.startsWith('shift.');
   const workdayEvent = event.event_type === 'workday.confirmation.requested';
   const workdayDeclined = event.event_type === 'workday.presence.declined';
@@ -408,16 +434,16 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
           title: copy.title, body: copy.body,
           tag: notificationKey,
           renotify: false,
-          icon: env.PUSH_NOTIFICATION_ICON_URL || undefined,
-          badge: env.PUSH_NOTIFICATION_BADGE_URL || undefined,
+          icon: field(push,'iconUrl') || undefined,
+          badge: field(push,'badgeUrl') || undefined,
           data: { onActionClick: { default: { operation: 'navigateLastFocusedOrOpen',
-            url: `${env.PUSH_APP_URL || env.PUSH_DEFAULT_OPEN_URL}${openUrl}` } } },
+            url: `${field(push,'appUrl')}${openUrl}` } } },
         },
       }), {
         vapidDetails: {
-          subject: env.PUSH_VAPID_SUBJECT,
-          publicKey: env.PUSH_VAPID_PUBLIC_KEY,
-          privateKey: env.PUSH_VAPID_PRIVATE_KEY,
+          subject: field(push,'subject'),
+          publicKey: field(push,'publicKey'),
+          privateKey: field(push,'privateKey'),
         },
         TTL: 300,
         urgency: 'high',
@@ -464,6 +490,8 @@ function customerPushCopy(eventType: string): { title: string; body: string } | 
     'delivery.assigned': { title: 'Seu pedido está sendo preparado', body: 'A loja já organizou a entrega do seu pedido.' },
     'delivery.collect': { title: 'Pedido coletado', body: 'Seu pedido foi retirado na loja e seguirá para o endereço informado.' },
     'delivery.start': { title: 'Seu pedido saiu para entrega', body: 'Acompanhe o andamento pelo Rastreia.' },
+    'delivery.arrived': { title: 'Seu entregador chegou', body: 'O entregador está no endereço do pedido. Prepare-se para recebê-lo.' },
+    'delivery.waiting-at-gate': { title: 'Entregador na portaria', body: 'Seu entregador está aguardando na portaria. Verifique a liberação da entrada.' },
     'delivery.complete': { title: 'Pedido entregue', body: 'Maravilha, sua entrega foi concluída.' },
     'delivery.fail': { title: 'Atualização da entrega', body: 'A loja registrou uma ocorrência na sua entrega.' },
     'delivery.cancel': { title: 'Entrega cancelada', body: 'A entrega foi cancelada. Fale com a loja para mais informações.' },
@@ -471,9 +499,12 @@ function customerPushCopy(eventType: string): { title: string; body: string } | 
   return copy[eventType] ?? null;
 }
 
-async function processCustomerPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
+export async function processCustomerPush(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
   const copy = customerPushCopy(event.event_type);
-  if (!copy || !env.PUSH_VAPID_SUBJECT || !env.PUSH_VAPID_PUBLIC_KEY || !env.PUSH_VAPID_PRIVATE_KEY) return;
+  if (!copy)return;
+  const companyId=await companyIdForEvent(database,event);
+  const push=await resolveCompanyService(database,env,companyId??'00000000-0000-0000-0000-000000000000','WEB_PUSH');
+  if(!companyServiceConfigured(push))return;
   const result = await database.query<{ id: string; endpoint: string; p256dh: string; auth_secret: string }>(
     `SELECT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret
      FROM rastreia.deliveries delivery
@@ -481,11 +512,12 @@ async function processCustomerPush(database: Database, env: AppEnv, event: Outbo
        ON subscription.tenant_id=delivery.tenant_id
       AND subscription.customer_profile_id=delivery.customer_profile_id
       AND subscription.active
-     WHERE delivery.id=$1 AND delivery.tenant_id=$2`,
-    [event.aggregate_id, event.tenant_id],
+     WHERE delivery.id=$1 AND delivery.tenant_id=$2
+       AND (NOT $3::boolean OR delivery.status IN ('IN_ROUTE','NEXT_STOP'))`,
+    [event.aggregate_id, event.tenant_id, ['delivery.arrived','delivery.waiting-at-gate'].includes(event.event_type)],
   );
   const notificationKey = `customer:${event.aggregate_id}:${event.event_type}`;
-  const customerAppUrl = (env.PUSH_APP_URL || env.PUSH_DEFAULT_OPEN_URL).replace(/\/+$/, '');
+  const customerAppUrl = field(push,'appUrl').replace(/\/+$/, '');
   for (const subscription of result.rows) {
     try {
       await webpush.sendNotification({
@@ -497,16 +529,16 @@ async function processCustomerPush(database: Database, env: AppEnv, event: Outbo
           body: copy.body,
           tag: notificationKey,
           renotify: false,
-          icon: env.PUSH_NOTIFICATION_ICON_URL || undefined,
-          badge: env.PUSH_NOTIFICATION_BADGE_URL || undefined,
+          icon: field(push,'iconUrl') || undefined,
+          badge: field(push,'badgeUrl') || undefined,
           data: { onActionClick: { default: { operation: 'navigateLastFocusedOrOpen',
             url: `${customerAppUrl}/cliente` } } },
         },
       }), {
         vapidDetails: {
-          subject: env.PUSH_VAPID_SUBJECT,
-          publicKey: env.PUSH_VAPID_PUBLIC_KEY,
-          privateKey: env.PUSH_VAPID_PRIVATE_KEY,
+          subject: field(push,'subject'),
+          publicKey: field(push,'publicKey'),
+          privateKey: field(push,'privateKey'),
         },
         TTL: 300,
         urgency: 'high',

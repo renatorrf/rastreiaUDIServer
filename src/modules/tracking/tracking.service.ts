@@ -96,6 +96,8 @@ interface TrackingDeliveryRow {
   hasPreviousStops: boolean;
 }
 
+type CustomerTrackingDeliveryRow = Omit<TrackingDeliveryRow, 'tokenId'>;
+
 export function distanceMeters(
   from: { latitude: number; longitude: number },
   to: { latitude: number; longitude: number },
@@ -391,6 +393,169 @@ export async function getPublicTracking(
   });
   const routing = await calculateTrackingRoute(directions, result.routeCandidate, result.routeUnavailableState);
   return { ...result.snapshot, routing };
+}
+
+export async function getCustomerTracking(
+  client: PoolClient,
+  env: AppEnv,
+  state: LocationStateStore,
+  directions: RouteDirectionsProvider,
+  tenantId: string,
+  customerId: string,
+  deliveryId: string,
+) {
+  const deliveryResult = await client.query<CustomerTrackingDeliveryRow>(
+    `SELECT delivery.tenant_id AS "tenantId",
+            store.name AS "storeName", store.contact_phone AS "storeContactPhone",
+            delivery.external_reference AS "externalReference",
+            courier_user.name AS "courierName", delivery.status,
+            delivery.address_line AS "addressLine", delivery.address_number AS "addressNumber",
+            delivery.neighborhood, delivery.city, delivery.state,
+            delivery.postal_code AS "postalCode",
+            delivery.latitude AS "destinationLatitude",
+            delivery.longitude AS "destinationLongitude",
+            delivery.promised_window_start AS "promisedWindowStart",
+            delivery.promised_window_end AS "promisedWindowEnd",
+            delivery.delivered_at AS "deliveredAt", delivery.updated_at AS "updatedAt",
+            last_location.latitude AS "locationLatitude",
+            last_location.longitude AS "locationLongitude",
+            last_location.accuracy AS "locationAccuracy",
+            last_location.heading AS "locationHeading",
+            last_location.captured_at AS "locationCapturedAt",
+            proof.id AS "proofId", proof.recipient_name AS "proofRecipientName",
+            proof.created_at AS "proofCreatedAt",
+            route_stop.estimated_arrival_at AS "estimatedArrivalAt",
+            route.eta_calculated_at AS "etaCalculatedAt",
+            EXISTS (SELECT 1 FROM route_stops previous_stop
+              WHERE previous_stop.route_id = delivery.route_id AND previous_stop.stop_type = 'DELIVERY'
+                AND previous_stop.status = 'PENDING' AND previous_stop.sequence < route_stop.sequence) AS "hasPreviousStops",
+            COALESCE(
+              delivery.delivered_at + ($4::text || ' seconds')::interval,
+              now() + ($5::text || ' seconds')::interval
+            ) AS "expiresAt"
+     FROM deliveries delivery
+     JOIN stores store ON store.id = delivery.store_id
+     LEFT JOIN courier_profiles courier ON courier.id = delivery.courier_profile_id
+     LEFT JOIN users courier_user ON courier_user.id = courier.user_id
+     LEFT JOIN routes route ON route.id = delivery.route_id
+     LEFT JOIN route_stops route_stop ON route_stop.route_id = delivery.route_id
+       AND route_stop.delivery_id = delivery.id AND route_stop.stop_type = 'DELIVERY'
+     LEFT JOIN courier_last_locations last_location
+       ON last_location.tenant_id = delivery.tenant_id
+      AND last_location.courier_profile_id = delivery.courier_profile_id
+      AND last_location.delivery_id = delivery.id
+     LEFT JOIN LATERAL (
+       SELECT candidate.id, candidate.recipient_name, candidate.created_at
+       FROM delivery_proofs candidate
+       WHERE candidate.delivery_id = delivery.id AND candidate.public_visible
+       ORDER BY candidate.created_at DESC LIMIT 1
+     ) proof ON true
+     WHERE delivery.id = $1 AND delivery.customer_profile_id = $2 AND delivery.tenant_id = $3`,
+    [deliveryId, customerId, tenantId, env.TRACKING_COMPLETED_GRACE_SECONDS, env.TRACKING_TOKEN_TTL_SECONDS],
+  );
+  const delivery = deliveryResult.rows[0];
+  if (!delivery) throw notFound('Pedido não encontrado para este cliente.');
+
+  const history = await client.query<{ status: DeliveryStatus; occurredAt: Date }>(
+    `SELECT to_status AS status, created_at AS "occurredAt"
+     FROM delivery_status_history
+     WHERE delivery_id = $1
+     ORDER BY delivery_version`,
+    [deliveryId],
+  );
+  const revealDestination = shouldRevealPublicDestination(delivery.status, delivery.hasPreviousStops);
+  const operationalNotices = (await client.query(
+    `SELECT status,message,occurred_at AS "occurredAt",resolved_at AS "resolvedAt",affects_eta AS "affectsEta"
+     FROM rastreia.public_driver_event_notices($1)`,
+    [deliveryId],
+  )).rows;
+  const cachedLocation = await state.getDelivery(tenantId, deliveryId);
+  const databaseLocation = delivery.locationLatitude !== null
+    && delivery.locationLongitude !== null
+    && delivery.locationAccuracy !== null
+    && delivery.locationCapturedAt !== null
+    ? {
+        latitude: delivery.locationLatitude,
+        longitude: delivery.locationLongitude,
+        accuracy: delivery.locationAccuracy,
+        heading: delivery.locationHeading,
+        capturedAt: delivery.locationCapturedAt,
+      }
+    : null;
+  const selectedLocation = cachedLocation?.publicVisible
+    && (!databaseLocation || cachedLocation.capturedAt > databaseLocation.capturedAt)
+    ? cachedLocation
+    : databaseLocation;
+  const locationIsRecent = selectedLocation
+    ? selectedLocation.capturedAt.getTime() >= Date.now() - recentLocationMs
+    : false;
+  const routeCandidate = revealDestination && publicLocationStatuses.includes(delivery.status)
+    && selectedLocation && locationIsRecent
+    ? {
+        origin: { latitude: selectedLocation.latitude, longitude: selectedLocation.longitude },
+        destination: {
+          latitude: delivery.destinationLatitude,
+          longitude: delivery.destinationLongitude,
+        },
+      }
+    : null;
+  const routing = await calculateTrackingRoute(
+    directions,
+    routeCandidate,
+    revealDestination ? 'POSITION_UNAVAILABLE' : 'DESTINATION_PROTECTED',
+  );
+
+  return {
+    store: { name: delivery.storeName, contactPhone: delivery.storeContactPhone },
+    reference: delivery.externalReference,
+    status: delivery.status,
+    operationalNotices,
+    etaSubjectToChange: operationalNotices.some(notice => notice.affectsEta === true),
+    courier: { displayName: abbreviateCourierName(delivery.courierName) },
+    destination: {
+      addressLine: revealDestination ? delivery.addressLine : null,
+      addressNumber: revealDestination ? delivery.addressNumber : null,
+      neighborhood: revealDestination ? delivery.neighborhood : null,
+      city: delivery.city,
+      state: delivery.state,
+      postalCode: revealDestination ? delivery.postalCode : null,
+      latitude: revealDestination ? delivery.destinationLatitude : null,
+      longitude: revealDestination ? delivery.destinationLongitude : null,
+      protectedUntilInRoute: !revealDestination,
+    },
+    distanceM: revealDestination && selectedLocation
+      ? distanceMeters(selectedLocation, {
+          latitude: delivery.destinationLatitude,
+          longitude: delivery.destinationLongitude,
+        })
+      : null,
+    promisedWindow: { start: delivery.promisedWindowStart, end: delivery.promisedWindowEnd },
+    eta: delivery.estimatedArrivalAt ? {
+      estimatedArrivalAt: delivery.estimatedArrivalAt,
+      calculatedAt: delivery.etaCalculatedAt,
+      message: delivery.hasPreviousStops
+        ? 'O entregador está concluindo entregas anteriores.'
+        : 'Sua entrega é a próxima parada.',
+    } : null,
+    location: publicLocationStatuses.includes(delivery.status) && !delivery.hasPreviousStops && selectedLocation
+      ? {
+          latitude: selectedLocation.latitude,
+          longitude: selectedLocation.longitude,
+          accuracy: selectedLocation.accuracy,
+          heading: selectedLocation.heading,
+          capturedAt: selectedLocation.capturedAt,
+          stale: selectedLocation.capturedAt.getTime() < Date.now() - recentLocationMs,
+        }
+      : null,
+    proof: delivery.status === 'DELIVERED' && delivery.proofId !== null
+      ? { available: true, recipientName: delivery.proofRecipientName, capturedAt: delivery.proofCreatedAt }
+      : { available: false, recipientName: null, capturedAt: null },
+    deliveredAt: delivery.deliveredAt,
+    updatedAt: delivery.updatedAt,
+    expiresAt: delivery.expiresAt,
+    history: history.rows,
+    routing,
+  };
 }
 
 export async function getOperationalDeliveryRoute(

@@ -3,7 +3,7 @@ import { listRoutes } from '../src/modules/routes/route.service.js';
 
 describe('route list query', () => {
   it('numera os parâmetros do escopo sem deixar placeholder sem tipo', async () => {
-    const query = vi.fn(async (sql: string) => {
+    const query = vi.fn(async (sql: string, _params?: unknown[]) => {
       if (sql.includes('FROM routes route')) return { rows: [] };
       if (sql.includes('FROM route_stops')) return { rows: [] };
       return { rows: [] };
@@ -19,7 +19,10 @@ describe('route list query', () => {
     });
 
     const routeQuery = query.mock.calls.find(([sql]) => sql.includes('FROM routes route'));
-    expect(routeQuery?.[1]).toEqual(['TENANT_MANAGER', [], '22222222-2222-4222-8222-222222222222']);
+    expect(routeQuery?.[1]).toEqual(['TENANT_MANAGER', [], '22222222-2222-4222-8222-222222222222','all','all',50,0]);
     expect(routeQuery?.[0]).toContain("$1::text = 'TENANT_MANAGER'");
+    expect(routeQuery?.[0]).toContain("route.status IN ('COMPLETED','CANCELLED')");
+    expect(routeQuery?.[0]).toContain('COALESCE(route.planned_start_at,route.created_at) AT TIME ZONE');
+    expect(routeQuery?.[0]).toContain('LIMIT $6 OFFSET $7');
   });
 });

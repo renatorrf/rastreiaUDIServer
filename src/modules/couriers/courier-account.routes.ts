@@ -56,6 +56,10 @@ export async function courierAccountRoutes(app:FastifyInstance,database:Database
         if(action==='start' && (profile.status!=='ACTIVE'||profile.registration_status!=='APPROVED')) {
           throw forbidden('Seu cadastro precisa estar aprovado para ficar disponível.');
         }
+        if(action!=='start'&&(await client.query(`SELECT 1 FROM courier_workdays WHERE courier_profile_id=$1
+          AND status='CHECKED_IN' AND ends_at>now() LIMIT 1`,[profile.id])).rowCount){
+          throw conflict('A localização não pode ser pausada enquanto a jornada estiver ativa.');
+        }
         await client.query(`UPDATE courier_service_preferences SET availability_status=$2,latitude=$3,longitude=$4,accuracy=$5,
           location_authorized_at=CASE WHEN $2='AVAILABLE' THEN now() ELSE NULL END,
           location_expires_at=CASE WHEN $2='AVAILABLE' THEN now()+interval '5 minutes' ELSE NULL END,updated_at=now()
