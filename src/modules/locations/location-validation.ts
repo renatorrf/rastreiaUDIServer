@@ -48,6 +48,11 @@ export function validateLocationPoint(
     if (elapsedSeconds <= 0) {
       return { code: 'OUT_OF_ORDER', message: 'Ponto anterior à última posição aceita.' };
     }
+    // Hold overlapping low-quality fixes only briefly; don't freeze moving couriers.
+    if (point.accuracy > 50 && previous.accuracy <= 25 && elapsedSeconds < 30
+        && distanceMeters(previous, point) <= previous.accuracy + point.accuracy) {
+      return { code: 'INACCURATE', message: 'Leitura menos precisa; mantendo a posição recente de melhor qualidade.' };
+    }
     const uncertainty = previous.accuracy + point.accuracy;
     const effectiveDistance = Math.max(0, distanceMeters(previous, point) - uncertainty);
     if (effectiveDistance / elapsedSeconds > maxLocationSpeedMetersPerSecond) {

@@ -37,4 +37,12 @@ describe('location validation', () => {
     expect(shouldSampleLocation(base, previous)).toBe(true);
     expect(shouldSampleLocation({ ...base, capturedAt: new Date('2026-08-19T01:59:50.000Z') }, previous)).toBe(false);
   });
+  it('preserva GPS recente bom sem congelar indefinidamente o sinal reduzido', () => {
+    const at = (seconds: number) => new Date(base.capturedAt.getTime() + seconds * 1000);
+    const weak = { ...base, accuracy: 80, capturedAt: at(5) };
+    expect(validateLocationPoint(weak, base, at(5))?.code).toBe('INACCURATE');
+    expect(validateLocationPoint({ ...weak, capturedAt: at(30) }, base, at(30))).toBeNull();
+    expect(validateLocationPoint({ ...weak, latitude: base.latitude + 0.002 }, base, at(5))).toBeNull();
+    expect(validateLocationPoint({ ...weak, accuracy: 20 }, base, at(5))).toBeNull();
+  });
 });
