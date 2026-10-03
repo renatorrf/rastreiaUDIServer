@@ -7,7 +7,7 @@ import { parseIdempotencyKey, type IdempotentResult } from '../../shared/idempot
 import { AppError } from '../../shared/errors.js';
 import { authenticate, requireRoles } from '../auth/auth.guard.js';
 import {
-  assignDelivery, createDelivery, getDelivery, linkDeliveryCustomerWhatsapp, listDeliveries, transitionDelivery,
+  assignDelivery, createDelivery, getDelivery, linkDeliveryCustomerWhatsapp, listDeliveries, transitionDelivery, unassignDelivery,
 } from './delivery.service.js';
 import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 import { deliveryStatuses } from './delivery.types.js';
@@ -39,6 +39,7 @@ const createDeliverySchema = z.object({
 );
 
 const assignSchema = z.object({ courierId: z.uuid() });
+const unassignSchema = z.object({ courierId: z.uuid(), version: z.number().int().min(0), reason: z.string().trim().min(3).max(500) });
 const reasonSchema = z.object({ reason: z.string().trim().min(3).max(500) });
 const customerWhatsappSchema = z.object({
   whatsapp: z.string().trim().min(10).max(24).transform(normalizeCustomerPhone)
@@ -113,6 +114,12 @@ export async function deliveryRoutes(app: FastifyInstance, database: Database, e
     const { courierId } = assignSchema.parse(request.body);
     const result = await assignDelivery(database, request.auth, keyFrom(request), id, courierId, request.ip);
     return sendIdempotent(reply, result);
+  });
+
+  app.post('/deliveries/:id/unassign', { preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')] }, async (request, reply) => {
+    const { id } = deliveryIdSchema.parse(request.params);
+    const input = unassignSchema.parse(request.body);
+    return sendIdempotent(reply, await unassignDelivery(database, request.auth, keyFrom(request), id, input, request.ip));
   });
 
   for (const action of ['collect', 'start', 'complete'] as const) {

@@ -257,6 +257,47 @@ export async function assignDelivery(
   );
 }
 
+export async function unassignDelivery(
+  database: Database, auth: AuthContext, key: string, deliveryId: string,
+  input: { courierId: string; version: number; reason: string }, ip?: string,
+): Promise<IdempotentResult<DeliveryRecord & { nextActions: string[] }>> {
+  if (!['TENANT_MANAGER', 'STORE_OPERATOR'].includes(auth.role)) throw forbidden('Somente a loja pode desvincular o entregador.');
+  return withTenantTransaction(database, auth, client => withIdempotency(
+    client, auth, key, 'delivery.unassign', { deliveryId, ...input }, async () => {
+      const before = await loadDelivery(client, auth, deliveryId, true);
+      if (!canUseStore(auth, before.storeId)) throw forbidden('Você não administra esta loja.');
+      // Never remove a replacement courier based on an old screen or retry.
+      if (before.version !== input.version || before.courierId !== input.courierId) {
+        throw conflict('A atribuição foi alterada. Atualize o pedido antes de desvincular.');
+      }
+      if (before.routeId) throw conflict('Esta entrega pertence a um lote. Não é possível desvincular seu entregador individualmente.');
+      if (!['ASSIGNED', 'AWAITING_PICKUP'].includes(before.status) || before.collectedAt || before.outForDeliveryAt) {
+        throw conflict('Só é possível desvincular o entregador antes da coleta.');
+      }
+      const marketplace = await client.query(
+        "SELECT 1 FROM delivery_offers WHERE delivery_id=$1 AND status IN ('PUBLISHED','ACCEPTED') LIMIT 1", [deliveryId],
+      );
+      if (marketplace.rowCount) throw conflict('Esta entrega possui uma oferta ativa. Resolva o vínculo pelo Marketplace.');
+      await client.query('UPDATE deliveries SET courier_profile_id=NULL, updated_by=$2 WHERE id=$1', [deliveryId, auth.userId]);
+      await applyTransition(client, auth, before, 'AWAITING_COURIER', input.reason, { previousCourierId: before.courierId, action: 'unassign' });
+      // Keep the check-in/workday alive; only this delivery loses its authorization.
+      await client.query('UPDATE background_tracking_sessions SET revoked_at=now() WHERE delivery_id=$1 AND revoked_at IS NULL', [deliveryId]);
+      const current = await loadCurrentRecord(client, auth, deliveryId);
+      await writeAudit(client, {
+        tenantId: auth.tenantId, actorUserId: auth.userId, action: 'delivery.unassigned', entityType: 'delivery', entityId: deliveryId,
+        beforeData: { status: before.status, courierId: before.courierId, version: before.version },
+        afterData: { status: current.status, courierId: null, version: current.version, reason: input.reason },
+        ...(ip === undefined ? {} : { ip }),
+      });
+      await publishEvent(client, auth, deliveryId, 'delivery.unassigned', {
+        deliveryId, storeId: before.storeId, previousCourierId: before.courierId, status: current.status, version: current.version,
+      });
+      await client.query("SELECT pg_notify('rastreia_operation_changed', $1)", [JSON.stringify({ tenantId: auth.tenantId, storeId: before.storeId })]);
+      return { body: { ...current, nextActions: nextOperationalActions(current.status) }, statusCode: 200 };
+    },
+  ));
+}
+
 type TransitionAction = 'collect' | 'start' | 'complete' | 'fail' | 'cancel';
 
 const actionTarget: Record<TransitionAction, DeliveryStatus> = {
