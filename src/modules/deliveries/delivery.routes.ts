@@ -12,6 +12,7 @@ import {
 import { normalizeCustomerPhone } from '../customers/customer-phone.js';
 import { deliveryStatuses } from './delivery.types.js';
 import { notifyDeliveryCustomer } from './delivery-customer-alert.service.js';
+import { getCourierPendingSummary } from './courier-pending.service.js';
 
 const deliveryIdSchema = z.object({ id: z.uuid() });
 const createDeliverySchema = z.object({
@@ -85,6 +86,9 @@ function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
 
 export async function deliveryRoutes(app: FastifyInstance, database: Database, env: AppEnv): Promise<void> {
   const auth = authenticate(env, database);
+
+  app.get('/courier/pending-summary', { preHandler: [auth, requireRoles('COURIER')] }, request =>
+    getCourierPendingSummary(database, request.auth));
 
   app.post('/deliveries/:id/customer-alert', { preHandler: [auth, requireRoles('COURIER')],
     config: { rateLimit: { max: 12, timeWindow: '1 minute' } } }, async (request, reply) => {
