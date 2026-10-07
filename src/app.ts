@@ -67,7 +67,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     logger: {
       level: env.LOG_LEVEL,
       redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-master-login-grant"]',
-        'req.headers.x-customer-token', 'res.headers.set-cookie', '*.password', '*.token', '*.grant', '*.apiKey'],
+        'req.headers.x-customer-token', 'res.headers.set-cookie', '*.password', '*.confirmationPassword', 'req.body.confirmationPassword', '*.token', '*.grant', '*.apiKey'],
       serializers: {
         req(request) {
           const url = typeof request.url === 'string' && request.url.startsWith('/public/tracking/')

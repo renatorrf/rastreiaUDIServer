@@ -5,6 +5,7 @@ import { withTenantTransaction,type Database } from '../../database/pool.js';
 import { forbidden,notFound } from '../../shared/errors.js';
 import { writeAudit } from '../../shared/audit.js';
 import { authenticate,requireRoles } from '../auth/auth.guard.js';
+import { confirmationPasswordSchema,confirmManagerPassword } from '../auth/confirm-manager-password.js';
 import { companyProviders,resolveCompanyService,safeCompanyService,saveCompanyService } from './company-settings.service.js';
 
 const id=z.object({id:z.uuid()});
@@ -22,17 +23,17 @@ const schemas={
     webhookEnabled:z.boolean(),requestTimeoutMs:z.number().int().min(1000).max(30000),clientId:z.string().trim().max(200)}),
     secrets:z.object({clientSecret:z.string().trim().max(2048).default(''),webhookSecret:z.string().trim().max(2048).default('')})}),
 };
-const input=z.discriminatedUnion('provider',[schemas.WEB_PUSH,schemas.WHATSAPP,schemas.SMS,schemas.IFOOD]);
+const input=z.discriminatedUnion('provider',[schemas.WHATSAPP.extend({confirmationPassword:confirmationPasswordSchema}),schemas.IFOOD.extend({confirmationPassword:confirmationPasswordSchema})]);
 
 export async function companySettingsRoutes(app:FastifyInstance,database:Database,env:AppEnv){
-  const auth=authenticate(env,database);const staff=[auth,requireRoles('TENANT_MANAGER','STORE_OPERATOR')];const manager=[auth,requireRoles('TENANT_MANAGER')];
-  app.get('/company-service-settings',{preHandler:staff},request=>withTenantTransaction(database,request.auth,async client=>{
+  const auth=authenticate(env,database);const manager=[auth,requireRoles('TENANT_MANAGER')];
+  app.get('/company-service-settings',{preHandler:manager},request=>withTenantTransaction(database,request.auth,async client=>{
     const companies=(await client.query<{id:string;name:string}>(`SELECT DISTINCT company.id,company.name FROM companies company JOIN stores store ON store.company_id=company.id
       WHERE company.tenant_id=$1 AND store_in_scope(store.id) ORDER BY company.name`,[request.auth.tenantId])).rows;
-    return {data:await Promise.all(companies.map(async company=>({company,services:await Promise.all(companyProviders.map(async item=>
+    return {data:await Promise.all(companies.map(async company=>({company,services:await Promise.all(companyProviders.filter(item=>item==='WHATSAPP'||item==='IFOOD').map(async item=>
       safeCompanyService(await resolveCompanyService(client,env,company.id,item))))})))};
   }));
-  app.put('/companies/:id/service-settings',{preHandler:manager},async request=>{
+  app.put('/companies/:id/service-settings',{preHandler:[...manager,confirmManagerPassword(database)],config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async request=>{
     const companyId=id.parse(request.params).id;const value=input.parse(request.body);
     return withTenantTransaction(database,request.auth,async client=>{
       const company=(await client.query<{id:string}>(`SELECT company.id FROM companies company WHERE company.id=$1 AND company.tenant_id=$2

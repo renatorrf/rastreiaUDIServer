@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction, type Database } from '../../database/pool.js';
+import { confirmManagerPassword } from '../../modules/auth/confirm-manager-password.js';
 import { authenticate, requireRoles } from '../../modules/auth/auth.guard.js';
 import { companyServiceConfigured,resolveCompanyService } from '../../modules/company-settings/company-settings.service.js';
 import { AppError, conflict, notFound, unauthorized } from '../../shared/errors.js';
@@ -24,14 +25,16 @@ export async function ifoodRoutes(app:FastifyInstance,db:Database,env:AppEnv):Pr
   const provider=createIfoodProvider(db,env),service=new IfoodIntegrationService(db,env,provider,
     (companyId,mode)=>createIfoodProviderForCompany(db,env,companyId,mode));
   const auth=authenticate(env,db),staff=[auth,requireRoles('TENANT_MANAGER','STORE_OPERATOR')],manager=[auth,requireRoles('TENANT_MANAGER')];
-  app.get('/integrations/ifood/health',{preHandler:staff},async request=>withTenantTransaction(db,request.auth,async client=>({
+  const protectedManager=[...manager,confirmManagerPassword(db)];
+  const confirmationLimit={rateLimit:{max:5,timeWindow:'1 minute'}};
+  app.get('/integrations/ifood/health',{preHandler:manager},async request=>withTenantTransaction(db,request.auth,async client=>({
     enabled:true,mode:'company',
     data:(await client.query(`SELECT c.id,c.store_id,c.status,c.last_worker_at,c.last_event_at,c.last_success_at,c.last_error_at,c.last_error_message,
       CASE WHEN NOT c.enabled THEN 'DISABLED' WHEN c.last_worker_at>now()-interval '90 seconds' THEN 'RUNNING' ELSE 'WORKER_NOT_SEEN' END AS worker_status,
       (SELECT count(*)::int FROM integration_events e WHERE e.integration_id=c.id AND e.status IN ('RECEIVED','ERROR')) AS pending_events
       FROM integration_connections c`)).rows,
   })));
-  app.get('/integrations/ifood',{preHandler:staff},async request=>withTenantTransaction(db,request.auth,async client=>({
+  app.get('/integrations/ifood',{preHandler:manager},async request=>withTenantTransaction(db,request.auth,async client=>({
     enabled:true,mode:'company',eventsMode:'company',
     canSimulate:env.NODE_ENV==='development',
     data:(await client.query(`SELECT c.*,s.name AS store_name,
@@ -40,8 +43,9 @@ export async function ifoodRoutes(app:FastifyInstance,db:Database,env:AppEnv):Pr
       (SELECT count(*)::int FROM integration_commands cmd JOIN external_orders o ON o.id=cmd.external_order_id WHERE o.integration_id=c.id AND cmd.status IN ('ERROR','UNCERTAIN')) AS command_errors
       FROM integration_connections c JOIN stores s ON s.id=c.store_id ORDER BY s.name`)).rows,
   })));
-  app.put('/integrations/ifood/connection',{preHandler:manager},async request=>{
-    const input=configSchema.parse(request.body);
+  app.put('/integrations/ifood/connection',{preHandler:protectedManager,config:confirmationLimit},async request=>{
+    const body={...(request.body as Record<string,unknown>)};delete body['confirmationPassword'];
+    const input=configSchema.parse(body);
     return withTenantTransaction(db,request.auth,async client=>{
       const store=(await client.query<{company_id:string}>('SELECT company_id FROM stores WHERE id=$1 AND integration_in_scope(id)',[input.storeId])).rows[0];
       if(!store)throw notFound('Unidade não encontrada.');
@@ -59,7 +63,7 @@ export async function ifoodRoutes(app:FastifyInstance,db:Database,env:AppEnv):Pr
       await writeAudit(client,{tenantId:request.auth.tenantId,actorUserId:request.auth.userId,action:'integration.configured',entityType:'integration_connection',entityId:result.id,afterData:input});return result;
     });
   });
-  app.post('/integrations/ifood/:id/test',{preHandler:manager},async request=>{
+  app.post('/integrations/ifood/:id/test',{preHandler:protectedManager,config:confirmationLimit},async request=>{
     const {id}=idSchema.parse(request.params);
     const c=await withTenantTransaction(db,request.auth,async client=>(await client.query<Connection>('SELECT * FROM integration_connections WHERE id=$1',[id])).rows[0]);
     if(!c)throw notFound('Integração não encontrada.');
@@ -68,10 +72,10 @@ export async function ifoodRoutes(app:FastifyInstance,db:Database,env:AppEnv):Pr
       return {mode:c.mode,merchant,message:c.mode==='mock'?'Simulação pronta. Nenhuma conexão real realizada.':'Merchant autorizado.'};
     }catch{await withTenantTransaction(db,request.auth,client=>client.query(`UPDATE integration_connections SET status='ERROR',last_error_at=now(),last_error_message='IFOOD_CONNECTION_TEST_FAILED' WHERE id=$1`,[id]));throw new AppError(502,'IFOOD_CONNECTION_TEST_FAILED','Não foi possível validar o merchant. Confira credenciais e permissões.');}
   });
-  app.get('/integrations/ifood/:id/events',{preHandler:staff},async request=>{
+  app.get('/integrations/ifood/:id/events',{preHandler:manager},async request=>{
     const {id}=idSchema.parse(request.params);return withTenantTransaction(db,request.auth,async client=>({data:(await client.query(`SELECT id,external_event_id,external_order_id,event_code,event_full_code,status,attempts,last_error,received_at,processed_at FROM integration_events WHERE integration_id=$1 ORDER BY received_at DESC LIMIT 100`,[id])).rows}));
   });
-  app.post('/integrations/ifood/events/:id/reprocess',{preHandler:manager},async request=>{
+  app.post('/integrations/ifood/events/:id/reprocess',{preHandler:protectedManager,config:confirmationLimit},async request=>{
     const {id}=idSchema.parse(request.params);return withTenantTransaction(db,request.auth,async client=>{
       const updated=await client.query(`UPDATE integration_events SET status='RECEIVED',attempts=0,next_attempt_at=now(),last_error=NULL WHERE id=$1 AND status='ERROR' RETURNING id`,[id]);
       if(!updated.rowCount)throw notFound('Evento com erro não encontrado.');
@@ -109,8 +113,9 @@ export async function ifoodRoutes(app:FastifyInstance,db:Database,env:AppEnv):Pr
     });
     return service.requestAction(request.auth,id,input.action,input.cancellationCode);
   });
-  if(env.NODE_ENV==='development'&&env.IFOOD_MODE==='mock')app.post('/integrations/ifood/:id/simulate',{preHandler:manager,config:{rateLimit:{max:10,timeWindow:'1 minute'}}},async(request,reply)=>{
-    const {id}=idSchema.parse(request.params);const {scenario}=z.object({scenario:z.enum(['own','ifood','cash','prepaid','cancelled','duplicate'])}).strict().parse(request.body);
+  if(env.NODE_ENV==='development'&&env.IFOOD_MODE==='mock')app.post('/integrations/ifood/:id/simulate',{preHandler:protectedManager,config:confirmationLimit},async(request,reply)=>{
+    const body={...(request.body as Record<string,unknown>)};delete body['confirmationPassword'];
+    const {id}=idSchema.parse(request.params);const {scenario}=z.object({scenario:z.enum(['own','ifood','cash','prepaid','cancelled','duplicate'])}).strict().parse(body);
     const c=await withTenantTransaction(db,request.auth,async client=>(await client.query<Connection>(`SELECT * FROM integration_connections WHERE id=$1 AND mode='mock' AND enabled`,[id])).rows[0]);
     if(!c)throw notFound('Conexão de simulação ativa não encontrada.');
     const order=mockOrder(scenario,c.merchant_id);const event={id:`mock-${randomUUID()}`,orderId:order.id,merchantId:c.merchant_id,code:'PLC',fullCode:'PLACED',createdAt:new Date().toISOString(),mockOrder:order};
