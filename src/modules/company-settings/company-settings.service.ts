@@ -31,6 +31,8 @@ function environmentValues(env:AppEnv,provider:CompanyProvider):ResolvedCompanyS
 }
 
 export async function resolveCompanyService(client:Pick<PoolClient,'query'>,env:AppEnv,companyId:string,provider:CompanyProvider):Promise<ResolvedCompanyService>{
+  // One PWA origin uses one VAPID identity. Legacy company rows must not override it.
+  if(provider==='WEB_PUSH')return environmentValues(env,provider);
   const available=(await client.query<{available:boolean}>("SELECT to_regclass('rastreia.company_service_settings') IS NOT NULL AS available")).rows[0]?.available;
   if(!available)return environmentValues(env,provider);
   const row=(await client.query<{enabled:boolean;public_config:Record<string,string|boolean|number>;secret_config_encrypted:string|null}>(

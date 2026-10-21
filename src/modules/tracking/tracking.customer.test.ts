@@ -24,7 +24,7 @@ describe('customer authenticated tracking', () => {
   it('loads only the delivery linked to the authenticated customer', async () => {
     const now = new Date();
     const query = vi.fn()
-      .mockResolvedValueOnce({ rows: [{
+      .mockResolvedValueOnce({ rows: [{ snapshot: { delivery: {
         tenantId, storeName: 'Loja parceira', storeContactPhone: '34999999999', externalReference: '9489',
         courierName: 'Entregador Teste', status: 'DELIVERED', addressLine: 'Rua das Flores', addressNumber: '109',
         neighborhood: 'Centro', city: 'Uberlândia', state: 'MG', postalCode: '38400-000',
@@ -33,9 +33,7 @@ describe('customer authenticated tracking', () => {
         locationLongitude: null, locationAccuracy: null, locationHeading: null, locationCapturedAt: null,
         proofId: null, proofRecipientName: null, proofCreatedAt: null, estimatedArrivalAt: null,
         etaCalculatedAt: null, hasPreviousStops: false, expiresAt: new Date(now.getTime() + 86_400_000),
-      }] })
-      .mockResolvedValueOnce({ rows: [{ status: 'DELIVERED', occurredAt: now }] })
-      .mockResolvedValueOnce({ rows: [] });
+      }, history: [{ status: 'DELIVERED', occurredAt: now }], notices: [] } }] });
     const client = { query } as unknown as PoolClient;
     const { state, directions, calculateRoute, env } = dependencies();
 
@@ -43,7 +41,7 @@ describe('customer authenticated tracking', () => {
       client, env, state, directions, tenantId, customerId, deliveryId,
     );
 
-    expect(query).toHaveBeenNthCalledWith(1, expect.stringContaining('delivery.customer_profile_id = $2'), [
+    expect(query).toHaveBeenNthCalledWith(1, expect.stringContaining('customer_tracking_snapshot'), [
       deliveryId, customerId, tenantId, 86_400, 86_400,
     ]);
     expect(tracking).toMatchObject({ status: 'DELIVERED', reference: '9489', store: { name: 'Loja parceira' } });

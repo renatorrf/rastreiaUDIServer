@@ -488,6 +488,7 @@ async function processPush(database: Database, env: AppEnv, event: OutboxEvent):
 function customerPushCopy(eventType: string): { title: string; body: string } | null {
   const copy: Record<string, { title: string; body: string }> = {
     'delivery.assigned': { title: 'Seu pedido está sendo preparado', body: 'A loja já organizou a entrega do seu pedido.' },
+    'delivery.created': { title: 'Seu pedido foi registrado', body: 'Acompanhe as próximas etapas da entrega pelo Rastreia.' },
     'delivery.collect': { title: 'Pedido coletado', body: 'Seu pedido foi retirado na loja e seguirá para o endereço informado.' },
     'delivery.start': { title: 'Seu pedido saiu para entrega', body: 'Acompanhe o andamento pelo Rastreia.' },
     'delivery.arrived': { title: 'Seu entregador chegou', body: 'O entregador está no endereço do pedido. Prepare-se para recebê-lo.' },
@@ -506,14 +507,20 @@ export async function processCustomerPush(database: Database, env: AppEnv, event
   const push=await resolveCompanyService(database,env,companyId??'00000000-0000-0000-0000-000000000000','WEB_PUSH');
   if(!companyServiceConfigured(push))return;
   const result = await database.query<{ id: string; endpoint: string; p256dh: string; auth_secret: string }>(
-    `SELECT subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret
+    `SELECT DISTINCT ON (subscription.endpoint) subscription.id,subscription.endpoint,subscription.p256dh,subscription.auth_secret
      FROM rastreia.deliveries delivery
+     JOIN rastreia.customer_profiles recipient ON recipient.id=delivery.customer_profile_id
+       AND recipient.tenant_id=delivery.tenant_id AND recipient.status='ACTIVE'
+     JOIN rastreia.customer_profiles device_owner ON device_owner.status='ACTIVE'
+       AND ((device_owner.id=recipient.id AND device_owner.tenant_id=recipient.tenant_id)
+         OR (recipient.user_id IS NOT NULL AND device_owner.user_id=recipient.user_id))
      JOIN rastreia.customer_push_subscriptions subscription
-       ON subscription.tenant_id=delivery.tenant_id
-      AND subscription.customer_profile_id=delivery.customer_profile_id
+       ON subscription.tenant_id=device_owner.tenant_id
+      AND subscription.customer_profile_id=device_owner.id
       AND subscription.active
      WHERE delivery.id=$1 AND delivery.tenant_id=$2
-       AND (NOT $3::boolean OR delivery.status IN ('IN_ROUTE','NEXT_STOP'))`,
+       AND (NOT $3::boolean OR delivery.status IN ('IN_ROUTE','NEXT_STOP'))
+     ORDER BY subscription.endpoint,subscription.id`,
     [event.aggregate_id, event.tenant_id, ['delivery.arrived','delivery.waiting-at-gate'].includes(event.event_type)],
   );
   const notificationKey = `customer:${event.aggregate_id}:${event.event_type}`;

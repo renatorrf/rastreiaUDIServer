@@ -27,6 +27,7 @@ describe('courier arrival and private customer notifications', () => {
     await pg.exec(`CREATE SCHEMA rastreia; SET search_path=rastreia,public;
       CREATE ROLE rastreia_runtime; GRANT USAGE ON SCHEMA rastreia TO rastreia_runtime;
       CREATE TABLE courier_profiles(id uuid PRIMARY KEY,user_id uuid);
+      CREATE TABLE customer_profiles(id uuid,tenant_id uuid,user_id uuid,status text DEFAULT 'ACTIVE');
       CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,store_id uuid,courier_profile_id uuid,
         customer_profile_id uuid,route_id uuid,status text,version int DEFAULT 1,updated_at timestamptz DEFAULT now());
       CREATE TABLE routes(id uuid PRIMARY KEY);
@@ -41,16 +42,29 @@ describe('courier arrival and private customer notifications', () => {
       GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA rastreia TO rastreia_runtime;`);
     await pg.exec(await readFile(new URL('../../../migrations/0051_delivery_customer_alerts.sql', import.meta.url), 'utf8'));
     await pg.query('INSERT INTO courier_profiles VALUES($1,$2)', [courier, user]);
+    await pg.query('INSERT INTO customer_profiles(id,tenant_id,user_id) VALUES($1,$2,$3)',[customer,tenant,randomUUID()]);
     await pg.query(`INSERT INTO courier_workdays(tenant_id,store_id,courier_profile_id,status,ends_at,location_consent_at)
       VALUES($1,$2,$3,'CHECKED_IN',now()+interval '8 hours',now())`, [tenant, store, courier]);
   }, 30000);
   beforeEach(async () => {
     vi.mocked(webpush.sendNotification).mockClear(); id = randomUUID();
+    await pg.exec('DELETE FROM customer_push_subscriptions');
     await pg.query(`UPDATE courier_workdays SET status='CHECKED_IN'`);
     await pg.query(`INSERT INTO deliveries(id,tenant_id,company_id,store_id,courier_profile_id,customer_profile_id,status)
       VALUES($1,$2,$2,$3,$4,$5,'IN_ROUTE')`, [id, tenant, store, courier, customer]);
   });
   afterAll(async () => pg?.close());
+  it('uses the same authenticated identity across companies, without notifying another customer', async () => {
+    const secondTenant=randomUUID(),secondProfile=randomUUID(),unrelated=randomUUID();
+    await pg.query("INSERT INTO customer_profiles(id,tenant_id,user_id) SELECT $1,$2,user_id FROM customer_profiles WHERE id=$3",[secondProfile,secondTenant,customer]);
+    await pg.query('INSERT INTO customer_profiles(id,tenant_id,user_id) VALUES($1,$2,$3)',[unrelated,secondTenant,randomUUID()]);
+    await pg.query(`INSERT INTO customer_push_subscriptions(tenant_id,customer_profile_id,active,endpoint,p256dh,auth_secret)
+      VALUES($1,$2,true,'same-account-device','test','test'),($1,$3,true,'other-account-device','test','test')`,[secondTenant,secondProfile,unrelated]);
+    await processCustomerPush(database,env,{id:randomUUID(),tenant_id:tenant,aggregate_type:'delivery',aggregate_id:id,event_type:'delivery.created',payload:{},attempts:0,occurred_at:new Date()});
+    expect(webpush.sendNotification).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(webpush.sendNotification).mock.calls[0]![0].endpoint).toBe('same-account-device');
+    expect(String(vi.mocked(webpush.sendNotification).mock.calls[0]![1])).toContain('Seu pedido foi registrado');
+  });
   it('records arrival once, including retries with a new idempotency key', async () => {
     const key = randomUUID();
     const first = await notifyDeliveryCustomer(database, auth, id, key, 'ARRIVED');

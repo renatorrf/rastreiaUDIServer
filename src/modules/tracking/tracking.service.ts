@@ -404,71 +404,19 @@ export async function getCustomerTracking(
   customerId: string,
   deliveryId: string,
 ) {
-  const deliveryResult = await client.query<CustomerTrackingDeliveryRow>(
-    `SELECT delivery.tenant_id AS "tenantId",
-            store.name AS "storeName", store.contact_phone AS "storeContactPhone",
-            delivery.external_reference AS "externalReference",
-            courier_user.name AS "courierName", delivery.status,
-            delivery.address_line AS "addressLine", delivery.address_number AS "addressNumber",
-            delivery.neighborhood, delivery.city, delivery.state,
-            delivery.postal_code AS "postalCode",
-            delivery.latitude AS "destinationLatitude",
-            delivery.longitude AS "destinationLongitude",
-            delivery.promised_window_start AS "promisedWindowStart",
-            delivery.promised_window_end AS "promisedWindowEnd",
-            delivery.delivered_at AS "deliveredAt", delivery.updated_at AS "updatedAt",
-            last_location.latitude AS "locationLatitude",
-            last_location.longitude AS "locationLongitude",
-            last_location.accuracy AS "locationAccuracy",
-            last_location.heading AS "locationHeading",
-            last_location.captured_at AS "locationCapturedAt",
-            proof.id AS "proofId", proof.recipient_name AS "proofRecipientName",
-            proof.created_at AS "proofCreatedAt",
-            route_stop.estimated_arrival_at AS "estimatedArrivalAt",
-            route.eta_calculated_at AS "etaCalculatedAt",
-            EXISTS (SELECT 1 FROM route_stops previous_stop
-              WHERE previous_stop.route_id = delivery.route_id AND previous_stop.stop_type = 'DELIVERY'
-                AND previous_stop.status = 'PENDING' AND previous_stop.sequence < route_stop.sequence) AS "hasPreviousStops",
-            COALESCE(
-              delivery.delivered_at + ($4::text || ' seconds')::interval,
-              now() + ($5::text || ' seconds')::interval
-            ) AS "expiresAt"
-     FROM deliveries delivery
-     JOIN stores store ON store.id = delivery.store_id
-     LEFT JOIN courier_profiles courier ON courier.id = delivery.courier_profile_id
-     LEFT JOIN users courier_user ON courier_user.id = courier.user_id
-     LEFT JOIN routes route ON route.id = delivery.route_id
-     LEFT JOIN route_stops route_stop ON route_stop.route_id = delivery.route_id
-       AND route_stop.delivery_id = delivery.id AND route_stop.stop_type = 'DELIVERY'
-     LEFT JOIN courier_last_locations last_location
-       ON last_location.tenant_id = delivery.tenant_id
-      AND last_location.courier_profile_id = delivery.courier_profile_id
-      AND last_location.delivery_id = delivery.id
-     LEFT JOIN LATERAL (
-       SELECT candidate.id, candidate.recipient_name, candidate.created_at
-       FROM delivery_proofs candidate
-       WHERE candidate.delivery_id = delivery.id AND candidate.public_visible
-       ORDER BY candidate.created_at DESC LIMIT 1
-     ) proof ON true
-     WHERE delivery.id = $1 AND delivery.customer_profile_id = $2 AND delivery.tenant_id = $3`,
-    [deliveryId, customerId, tenantId, env.TRACKING_COMPLETED_GRACE_SECONDS, env.TRACKING_TOKEN_TTL_SECONDS],
-  );
-  const delivery = deliveryResult.rows[0];
-  if (!delivery) throw notFound('Pedido não encontrado para este cliente.');
-
-  const history = await client.query<{ status: DeliveryStatus; occurredAt: Date }>(
-    `SELECT to_status AS status, created_at AS "occurredAt"
-     FROM delivery_status_history
-     WHERE delivery_id = $1
-     ORDER BY delivery_version`,
-    [deliveryId],
-  );
-  const revealDestination = shouldRevealPublicDestination(delivery.status, delivery.hasPreviousStops);
-  const operationalNotices = (await client.query(
-    `SELECT status,message,occurred_at AS "occurredAt",resolved_at AS "resolvedAt",affects_eta AS "affectsEta"
-     FROM rastreia.public_driver_event_notices($1)`,
-    [deliveryId],
-  )).rows;
+  const result = await client.query<{
+    snapshot: { delivery: CustomerTrackingDeliveryRow; history: Array<{status:DeliveryStatus;occurredAt:Date}>;
+      notices: Array<{affectsEta:boolean}> } | null;
+  }>('SELECT rastreia.customer_tracking_snapshot($1,$2,$3,$4,$5) AS snapshot',
+    [deliveryId,customerId,tenantId,env.TRACKING_COMPLETED_GRACE_SECONDS,env.TRACKING_TOKEN_TTL_SECONDS]);
+  const snapshot=result.rows[0]?.snapshot;
+  if(!snapshot?.delivery)throw notFound('Pedido não encontrado para este cliente.');
+  const delivery=snapshot.delivery;
+  // JSONB timestamps arrive as strings, unlike typed PostgreSQL timestamp columns.
+  if(delivery.locationCapturedAt)delivery.locationCapturedAt=new Date(delivery.locationCapturedAt);
+  const history={rows:snapshot.history};
+  const operationalNotices=snapshot.notices;
+  const revealDestination=shouldRevealPublicDestination(delivery.status,delivery.hasPreviousStops);
   const cachedLocation = await state.getDelivery(tenantId, deliveryId);
   const databaseLocation = delivery.locationLatitude !== null
     && delivery.locationLongitude !== null

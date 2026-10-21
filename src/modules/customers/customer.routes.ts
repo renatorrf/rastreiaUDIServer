@@ -217,9 +217,7 @@ export async function customerRoutes(
   app.get('/customer/push/status', async request => withCustomerSession(database, env, request, async (client, scope) => {
     const row = (await client.query<{ count: string }>(`SELECT count(*)::text AS count
       FROM customer_push_subscriptions WHERE customer_profile_id=$1 AND active`, [scope.customerId])).rows[0];
-    const company=(await client.query<{company_id:string}>(`SELECT delivery.company_id FROM deliveries delivery
-      WHERE delivery.customer_profile_id=$1 ORDER BY delivery.created_at DESC LIMIT 1`,[scope.customerId])).rows[0];
-    const push=await resolveCompanyService(client,env,company?.company_id??'00000000-0000-0000-0000-000000000000','WEB_PUSH');
+    const push=await resolveCompanyService(client,env,'00000000-0000-0000-0000-000000000000','WEB_PUSH');
     return {
       configured: companyServiceConfigured(push),
       publicKey: companyServiceConfigured(push)?String(push.values['publicKey']??''):null,
@@ -231,6 +229,7 @@ export async function customerRoutes(
     const input = pushSubscriptionSchema.parse(request.body);
     return withCustomerSession(database, env, request, async (client, scope) => {
       const endpointHash = createHash('sha256').update(input.endpoint).digest('hex');
+      await client.query('SELECT rastreia.claim_customer_push_endpoint($1,$2)',[scope.customerId,endpointHash]);
       const row = (await client.query<{ id: string }>(`INSERT INTO customer_push_subscriptions
         (tenant_id,customer_profile_id,endpoint,endpoint_hash,p256dh,auth_secret,expiration_time,user_agent,active,failure_count)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,true,0)
@@ -238,7 +237,7 @@ export async function customerRoutes(
           p256dh=EXCLUDED.p256dh,auth_secret=EXCLUDED.auth_secret,expiration_time=EXCLUDED.expiration_time,
           user_agent=EXCLUDED.user_agent,active=true,failure_count=0,last_failure_at=NULL
         RETURNING id`, [scope.tenantId, scope.customerId, input.endpoint, endpointHash, input.keys.p256dh,
-        input.keys.auth, input.expirationTime ?? null, request.headers['user-agent'] ?? null])).rows[0]!;
+        input.keys.auth, input.expirationTime == null ? null : new Date(input.expirationTime), request.headers['user-agent'] ?? null])).rows[0]!;
       return { id: row.id, active: true };
     });
   });
