@@ -93,7 +93,9 @@ export async function applyImport(c:PoolClient,auth:AuthContext,store:string,id:
     const product=await saveProduct(c,auth,store,input,row.productId,row.version);
     if(row.stock!==undefined){const balance=(await c.query<{variant_id:string;version:number;on_hand:number}>(`SELECT b.variant_id,b.version,b.on_hand FROM commerce_inventory_balances b JOIN commerce_variants v ON v.id=b.variant_id WHERE v.product_id=$1 AND v.is_default`,[product.id])).rows[0]!;
       if(row.stockVersion!==undefined&&balance.version!==row.stockVersion)throw conflict('O estoque mudou. Gere uma nova prévia.');
-      const delta=row.stock-balance.on_hand;if(delta)await adjustInventory(c,auth,store,{variantId:balance.variant_id,expectedVersion:row.stockVersion??balance.version,delta,kind:'ADJUSTMENT',reason:`Importação ${id}: ${reason}`.slice(0,500)});
+      // Imported opening/received stock is not an inventory surplus (DRE revenue).
+      // Only an explicitly mapped cost can value the incoming units; defaults are unknown.
+      const delta=row.stock-balance.on_hand;if(delta)await adjustInventory(c,auth,store,{variantId:balance.variant_id,expectedVersion:row.stockVersion??balance.version,delta,kind:delta>0?'ENTRY':'ADJUSTMENT',reason:`Importação ${id}: ${reason}`.slice(0,500),...(delta>0&&job.options.mapping.cost!=null?{unitCostCents:input.costCents}:{})});
     }
   }
   const result=importCounts(current);await c.query("UPDATE commerce_import_jobs SET state='APPLIED',result=$2,applied_at=now() WHERE id=$1",[id,JSON.stringify(result)]);

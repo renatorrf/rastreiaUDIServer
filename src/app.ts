@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { financeRoutes } from './modules/commerce/finance.routes.js';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -171,6 +172,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await courierRoutes(app, database, env);
   await customerRoutes(app, database, objectStorage, env, locationState, options.routeDirectionsProvider ?? geoapify);
   await commerceRoutes(app, database, env);
+  await financeRoutes(app, database, env);
   await liveRoutes(app, database, env);
   await liveVideoRoutes(app, database, env);
   await inventoryRoutes(app, database, env);

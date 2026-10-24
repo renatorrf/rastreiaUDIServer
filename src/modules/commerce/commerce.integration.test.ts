@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { financeReport,seedFinanceCategories,createFinanceEntry,settleFinanceEntry,reverseFinanceSettlement,cancelFinanceEntry,initializeFinanceCost,today } from './finance.service.js';
+import { financeEntry,financePeriod,financeCategory } from './finance.schemas.js';
 import Fastify from 'fastify';
 import { ZodError } from 'zod';
 import type { Database } from '../../database/pool.js';
@@ -67,6 +69,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0060_commerce_checkout_orders.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0061_commerce_live_sessions.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0062_commerce_live_video.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0063_commerce_finance.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -76,6 +79,99 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.query('INSERT INTO store_access VALUES($1,$4),($2,$4),($3,$4)',[manager,courier,operator,store]);
   },30000);
   afterAll(()=>pg.close());
+  it('finance validates dates, integer cents and category directions',()=>{
+    expect(financePeriod.safeParse({from:'2026-02-30',to:'2026-03-01'}).success).toBe(false);
+    expect(financePeriod.safeParse({from:'2025-01-01',to:'2026-12-31'}).success).toBe(false);
+    expect(financeCategory.safeParse({name:'Aluguel',direction:'IN',dreGroup:'FIXED'}).success).toBe(false);
+    expect(financeEntry.safeParse({categoryId:randomUUID(),description:'Despesa teste',amountCents:10.1,competenceDate:today(),dueDate:today()}).success).toBe(false);
+  });
+  it('finance freezes weighted cost on confirmation and recognizes only completed sales',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();
+    await initializeFinanceCost(client,auth,store,v.id,{expectedVersion:2,unitCostCents:1000,reason:'Custo inicial conferido'});
+    await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:3,delta:10,kind:'ENTRY',reason:'Nova compra conferida',unitCostCents:2000});
+    expect(Number((await pg.query<{average_cost_cents:string}>('SELECT average_cost_cents FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]!.average_cost_cents)).toBe(1500);
+    const order=await checkout();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    expect((await financeReport(client,store,today(),today())).orders).toBe(0);
+    const balance=(await pg.query<{version:number}>('SELECT version FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]!;
+    await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:balance.version,delta:2,kind:'ENTRY',reason:'Compra posterior',unitCostCents:3000});
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    const report=await financeReport(client,store,today(),today());expect(report.orders).toBe(1);expect(report.unknownCostItems).toBe(0);expect(report.knownCostCents).toBe(3000);
+    expect(report.cash.incomingCents).toBe(0);expect(report.outstanding.receivableCents).toBe(5000);
+    expect((await pg.query('SELECT id FROM commerce_finance_entries WHERE order_id=$1',[order.id])).rows).toHaveLength(1);
+    expect(JSON.stringify((await pg.query('SELECT commerce_order_read($1) AS data',[order.id])).rows)).not.toContain('financial_unit_cost');
+  }));
+  it('finance returns cancelled stock at its frozen cost and never recognizes cancelled revenue',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();await initializeFinanceCost(client,auth,store,v.id,{expectedVersion:2,unitCostCents:1000,reason:'Custo inicial conferido'});
+    const order=await checkout();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    const b=(await pg.query<{version:number}>('SELECT version FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]!;
+    await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:b.version,delta:2,kind:'ENTRY',reason:'Compra nova conferida',unitCostCents:2000});
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'CANCELLED','Cliente desistiu')",[order.id,store]);
+    const result=(await pg.query<{average_cost_cents:string;on_hand:number}>('SELECT average_cost_cents,on_hand FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]!;
+    expect(result.on_hand).toBe(12);expect(Number(result.average_cost_cents)).toBeCloseTo(1166.666667,5);expect((await financeReport(client,store,today(),today())).orders).toBe(0);
+  }));
+  it('finance flags missing historical inventory costs instead of inventing profit',()=>context('manager',async()=>{
+    const {checkout}=await checkoutFixture();const order=await checkout();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    const report=await financeReport(client,store,today(),today());expect(report.unknownCostItems).toBe(1);expect(report.dre.find(l=>l.code==='NET_PROFIT')?.amountCents).toBeNull();expect(report.inventory.unknownVariants).toBe(1);
+  }));
+  it('finance freezes made-to-order estimated cost and excludes production from stock projections',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture(true);await pg.query("UPDATE commerce_products SET stock_mode='MADE_TO_ORDER',cost_cents=750 WHERE id=$1",[v.productId]);
+    const order=await checkout();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    await pg.query('UPDATE commerce_products SET cost_cents=900 WHERE id=$1',[v.productId]);await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    const report=await financeReport(client,store,today(),today());expect(report.knownCostCents).toBe(1500);expect(report.inventory.units).toBe(0);expect(report.inventory.potentialRevenueCents).toBe(0);
+  }));
+  it('finance charges inventory losses once and prevents current-cost overrides',()=>context('manager',async()=>{
+    const v=await stockFixture();await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:1,delta:10,kind:'ENTRY',reason:'Compra conferida',unitCostCents:1000});
+    await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:2,delta:-2,kind:'LOSS',reason:'Dano no transporte'});
+    const report=await financeReport(client,store,today(),today());expect(report.dre.find(l=>l.code==='STOCK_LOSS')?.amountCents).toBe(-2000);expect(report.inventory.knownCostCents).toBe(8000);
+    await expect(initializeFinanceCost(client,auth,store,v.id,{expectedVersion:3,unitCostCents:1,reason:'Tentativa de sobrescrita'})).rejects.toMatchObject({statusCode:409});
+  }));
+  it('finance records imported opening inventory without fictitious DRE profit',()=>context('manager',async()=>{
+    const id=await importFixture(),preview=await previewImport(client,store,id,importOptions);await applyImport(client,auth,store,id,preview.previewToken!,'Saldo de abertura');
+    const report=await financeReport(client,store,today(),today());expect(report.dre.find(l=>l.code==='STOCK_GAIN')?.amountCents).toBe(0);expect(report.inventory.unknownVariants).toBeGreaterThan(0);expect(report.orders).toBe(0);
+  }));
+  it('finance keeps a settlement reversal in its actual month and rejects stale duplicate payments',()=>context('manager',async()=>{
+    await seedFinanceCategories(client,auth,store);const category=(await pg.query<{id:string}>("SELECT id FROM commerce_finance_categories WHERE store_id=$1 AND name='Aluguel'",[store])).rows[0]!;
+    const entry=await createFinanceEntry(client,auth,store,{categoryId:category.id,description:'Aluguel de janeiro',amountCents:2000,competenceDate:'2025-01-01',dueDate:'2025-01-10',document:''});
+    const first=await settleFinanceEntry(client,auth,store,entry.id,{expectedVersion:1,amountCents:1000,paidDate:'2025-02-01',method:'PIX',note:''});
+    await expect(settleFinanceEntry(client,auth,store,entry.id,{expectedVersion:1,amountCents:1000,paidDate:'2025-02-01',method:'PIX',note:''})).rejects.toMatchObject({statusCode:409});
+    await reverseFinanceSettlement(client,auth,store,entry.id,first.id,{expectedVersion:2,reversedDate:'2025-03-01',reason:'Baixa incorreta'});
+    const jan=await financeReport(client,store,'2025-01-01','2025-01-31'),feb=await financeReport(client,store,'2025-02-01','2025-02-28'),mar=await financeReport(client,store,'2025-03-01','2025-03-31');
+    expect(jan.dre.find(l=>l.code==='FIXED')?.amountCents).toBe(-2000);expect(jan.cash.outgoingCents).toBe(0);expect(feb.cash.outgoingCents).toBe(1000);expect(mar.cash.outgoingCents).toBe(-1000);
+  }));
+  it('finance separates competence, partial settlements, reversals and inventory purchase cash',()=>context('manager',async()=>{
+    await seedFinanceCategories(client,auth,store);await seedFinanceCategories(client,auth,store);
+    const cat=(await pg.query<{id:string}>("SELECT id FROM commerce_finance_categories WHERE store_id=$1 AND name='Aluguel'",[store])).rows[0]!;
+    const entry=await createFinanceEntry(client,auth,store,{categoryId:cat.id,description:'Aluguel mensal',amountCents:10000,competenceDate:today(),dueDate:today(),document:''});
+    const first=await settleFinanceEntry(client,auth,store,entry.id,{expectedVersion:1,amountCents:4000,paidDate:today(),method:'PIX',note:''});
+    await expect(settleFinanceEntry(client,auth,store,entry.id,{expectedVersion:2,amountCents:7000,paidDate:today(),method:'PIX',note:''})).rejects.toMatchObject({statusCode:409});
+    await expect(cancelFinanceEntry(client,auth,store,entry.id,{expectedVersion:2,reason:'Teste de cancelamento'})).rejects.toMatchObject({statusCode:409});
+    let report=await financeReport(client,store,today(),today());expect(report.dre.find(l=>l.code==='FIXED')?.amountCents).toBe(-10000);expect(report.cash.outgoingCents).toBe(4000);expect(report.outstanding.payableCents).toBe(6000);
+    await reverseFinanceSettlement(client,auth,store,entry.id,first.id,{expectedVersion:2,reversedDate:today(),reason:'Baixa registrada por engano'});
+    report=await financeReport(client,store,today(),today());expect(report.cash.outgoingCents).toBe(0);expect(report.outstanding.payableCents).toBe(10000);
+    await cancelFinanceEntry(client,auth,store,entry.id,{expectedVersion:3,reason:'Documento duplicado'});
+    const purchase=(await pg.query<{id:string}>("SELECT id FROM commerce_finance_categories WHERE store_id=$1 AND name='Compra de mercadorias / insumos'",[store])).rows[0]!;
+    await createFinanceEntry(client,auth,store,{categoryId:purchase.id,description:'Compra de estoque',amountCents:30000,competenceDate:today(),dueDate:today(),document:''});
+    report=await financeReport(client,store,today(),today());expect(report.dre.find(l=>l.code==='NET_PROFIT')?.amountCents).toBe(0);expect(report.outstanding.payableCents).toBe(30000);
+  }));
+  it('finance denies courier/operator and foreign-store access',()=>context('manager',async()=>{
+    await seedFinanceCategories(client,auth,store);await expect(financeReport(client,sibling,today(),today())).rejects.toMatchObject({statusCode:404});await expect(financeReport(client,otherStore,today(),today())).rejects.toMatchObject({statusCode:404});
+    await pg.query("SELECT set_config('app.user_id',$1,true)",[courier]);expect((await pg.query('SELECT * FROM commerce_finance_categories')).rows).toHaveLength(0);
+    await expect(financeReport(client,store,today(),today())).rejects.toMatchObject({statusCode:404});
+  }));
+  it('finance prevents direct runtime overpayments at the database boundary',()=>context('manager',async()=>{
+    await seedFinanceCategories(client,auth,store);const cat=(await pg.query<{id:string}>("SELECT id FROM commerce_finance_categories WHERE store_id=$1 AND name='Aluguel'",[store])).rows[0]!;
+    const entry=await createFinanceEntry(client,auth,store,{categoryId:cat.id,description:'Teste de integridade',amountCents:100,competenceDate:today(),dueDate:today(),document:''});
+    await expect(pg.query("INSERT INTO commerce_finance_settlements(tenant_id,store_id,entry_id,amount_cents,paid_date,method,created_by) VALUES($1,$2,$3,101,current_date,'PIX',$4)",[tenant,store,entry.id,manager])).rejects.toMatchObject({code:'23514'});
+  }));
+  it('finance keeps manual external CMV non-cash and out of payables',()=>context('manager',async()=>{
+    await seedFinanceCategories(client,auth,store);const cat=(await pg.query<{id:string}>("SELECT id FROM commerce_finance_categories WHERE store_id=$1 AND dre_group='COGS'",[store])).rows[0]!;
+    const entry=await createFinanceEntry(client,auth,store,{categoryId:cat.id,description:'Custo de venda externa',amountCents:1200,competenceDate:today(),dueDate:today(),document:''});
+    const report=await financeReport(client,store,today(),today());expect(report.dre.find(l=>l.code==='COGS')?.amountCents).toBe(-1200);expect(report.outstanding.payableCents).toBe(0);
+    await expect(settleFinanceEntry(client,auth,store,entry.id,{expectedVersion:1,amountCents:1200,paidDate:today(),method:'PIX',note:''})).rejects.toMatchObject({statusCode:409});
+  }));
+  it('finance never grants item costs to the shared customer order reader',()=>context('manager',async()=>{
+    await checkoutFixture();await expect(pg.query('SELECT financial_unit_cost_cents FROM commerce_order_items')).rejects.toMatchObject({code:'42501'});
+  }));
   async function liveFixture(){
     const {id:cartId,v}=await cartFixture();
     await pg.query("SELECT set_config('app.platform_admin_id',$1,true)",[masterId]);

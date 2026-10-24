@@ -36,7 +36,7 @@ export async function saveVariant(client:PoolClient,auth:AuthContext,store:strin
 export async function adjustInventory(client:PoolClient,auth:AuthContext,store:string,input:Omit<z.infer<typeof adjustmentSchema>,'confirmationPassword'>){
   await requireCommerceStore(client,store);
   let id:string;
-  try {id=(await client.query<{id:string}>('SELECT commerce_adjust_inventory($1,$2,$3,$4,$5,$6) AS id',[input.variantId,store,input.expectedVersion,input.delta,input.kind,input.reason])).rows[0]!.id;}
+  try {id=(await client.query<{id:string}>('SELECT commerce_adjust_inventory_costed($1,$2,$3,$4,$5,$6,$7) AS id',[input.variantId,store,input.expectedVersion,input.delta,input.kind,input.reason,input.unitCostCents??null])).rows[0]!.id;}
   catch(error){const code=(error as {code?:string}).code;
     if(code==='40001')throw new AppError(409,'VERSION_CONFLICT','O estoque mudou. Atualize o saldo antes de confirmar.');
     if(code==='23514')throw conflict('O ajuste deixaria o estoque abaixo do reservado ou acima do limite.');
