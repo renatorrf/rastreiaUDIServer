@@ -59,6 +59,34 @@ const env = {
 } satisfies AppEnv;
 
 describe('app', () => {
+  it.each(['/auth/sign-in', '/auth/customer/sign-in'])(
+    'retorna 429 com prazo de espera quando o login %s excede o limite', async (url) => {
+      const app = await buildApp({ env: { ...env, APP_ORIGINS: 'https://localhost' } });
+      try {
+        const options = { method: 'POST' as const, url, payload: {},
+          headers: { origin: 'https://localhost' }, remoteAddress: '192.0.2.10' };
+        // Invalid payloads exercise the real limiter without accessing the database.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          expect((await app.inject(options)).statusCode).toBe(400);
+        }
+        const response = await app.inject(options);
+        const seconds = Number(response.headers['retry-after']);
+        expect(response.statusCode).toBe(429);
+        expect(seconds).toBeGreaterThan(0);
+        expect(seconds).toBeLessThanOrEqual(900);
+        expect(response.json()).toEqual({ error: {
+          code: 'RATE_LIMIT_EXCEEDED',
+          message: `Muitas tentativas. Aguarde ${Math.ceil(seconds / 60)} minutos e tente novamente.`,
+          correlation_id: expect.any(String), retry_after_seconds: seconds,
+        } });
+        expect(response.headers['x-correlation-id']).toBe(response.json().error.correlation_id);
+        expect(response.headers['access-control-allow-origin']).toBe('https://localhost');
+        expect(response.headers['cache-control']).toBe('no-store');
+        expect((await app.inject({ ...options, remoteAddress: '192.0.2.11' })).statusCode).toBe(400);
+      } finally { await app.close(); }
+    },
+  );
+
   it('expõe liveness sem depender do banco', async () => {
     const app = await buildApp({ env });
     const response = await app.inject({ method: 'GET', url: '/health/live' });

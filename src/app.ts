@@ -199,6 +199,20 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
   app.setErrorHandler(async (error, request, reply) => {
     reply.header('X-Correlation-Id', request.id);
+    if ((error as { statusCode?: number }).statusCode === 429) {
+      // The limiter has already set Retry-After; preserve its remaining window.
+      const retryAfter = Number(reply.getHeader('retry-after'));
+      const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : undefined;
+      const duration = seconds === undefined ? 'alguns minutos'
+        : seconds >= 60 ? `${Math.ceil(seconds / 60)} minuto${seconds > 60 ? 's' : ''}`
+          : `${seconds} segundo${seconds > 1 ? 's' : ''}`;
+      return reply.header('Cache-Control', 'no-store').status(429).send({ error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: `Muitas tentativas. Aguarde ${duration} e tente novamente.`,
+        correlation_id: request.id,
+        ...(seconds === undefined ? {} : { retry_after_seconds: seconds }),
+      } });
+    }
     if (error instanceof Error && error.message === 'MASTER_REQUIRED') {
       return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.', correlation_id: request.id } });
     }
