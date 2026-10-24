@@ -12,9 +12,9 @@ Os requisitos de publicação, categoria, variante, unidade e empresa ativas con
 
 ## Implantação
 
-Migração nova: `0057_commerce_production_products.sql`, posterior à 0056. Foi preparada e validada em PostgreSQL isolado (PGlite); **não aplicada na base compartilhada nesta alteração**.
+Migração `0057_commerce_production_products.sql` **aplicada na base configurada em 23/10/2026 às 22:36 (Brasília)**, junto da dependência pendente `0056_commerce_guest_carts.sql`. Nova conexão confirmou 57 migrações e nenhuma pendência. A coluna `stock_mode` está NOT NULL com padrão `STOCKED`; produto, variante e saldos existentes foram preservados. RLS, privilégios e consultas públicas/carrinho foram conferidos com o papel runtime, sem criar dados fictícios.
 
-Aplicar a migração antes de publicar o backend, pois a listagem administrativa passa a consultar `stock_mode`. Depois publicar o frontend/Firebase e sincronizar o Android quando for distribuído um novo APK. Não alterar as migrações anteriores. Nenhum ajuste de `.env` é necessário.
+A etapa de banco está concluída. Publicação do backend, frontend/Firebase e sincronização do Android permanecem etapas separadas, mediante autorização. Não alterar as migrações anteriores. Nenhum ajuste de `.env` é necessário.
 
 ## Arquivos e design
 

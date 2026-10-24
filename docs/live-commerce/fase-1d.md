@@ -1,6 +1,6 @@
 # Fase 1D — carrinho persistente do catálogo público
 
-Implementação local em 21/10/2026. **Migração 0056 preparada, ainda não aplicada ao banco configurado. Sem deploy.**
+Implementação local em 21/10/2026. **Migração 0056 aplicada ao banco configurado em 23/10/2026, como dependência da 0057 autorizada. Sem deploy nesta execução.**
 
 ## Comportamento entregue
 
@@ -45,8 +45,8 @@ Nenhuma tabela de live é referenciada: carrinho e futuras lives têm ciclos ind
 
 ## Ativação e próxima etapa
 
-1. Conferir backup, destino e pendências antes de executar `npm run db:migrate`, que aplica todas as pendentes. **0056 ainda não aplicada nesta entrega.** As migrações 0053–0055 já foram aplicadas anteriormente mediante autorização.
-2. Aplicar `0056_commerce_guest_carts.sql` antes de publicar o backend com as novas rotas. Validar as três tabelas/RLS, privilégios e funções no PostgreSQL 9.6 do provedor. O SQL evita recursos posteriores ao 9.6.
+1. **0056 e 0057 aplicadas em ordem em 23/10/2026 às 22:36 (Brasília)** após conferência do destino e das pendências. Nova conexão confirmou 57 migrações e nenhuma pendência.
+2. Validadas as três tabelas com RLS forçada e sem privilégios diretos para o runtime, além dos privilégios das funções no PostgreSQL 9.6.24 configurado. Nenhum carrinho fictício foi criado; produto, variante e saldos existentes foram preservados.
 3. Publicar backend e frontend; conferir preflight CORS para `X-Commerce-Cart-Token`, `Idempotency-Key` e PUT na origem Firebase/APK já autorizada. Não há nova variável de ambiente.
 4. Homologar com produtos autorizados: visitante sem login, duas abas, refresh, reconexão, erro de versão, estoque alterado e catálogo oculto. Não usar este carrinho como comprovação de reserva ou pedido.
 5. A Fase 2 adiciona identificação/merge transacional com a conta existente, checkout, retirada/entrega, reservas com expiração, pedidos e notificações. Não há botão de checkout funcional nesta entrega.
