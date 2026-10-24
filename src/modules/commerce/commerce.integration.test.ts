@@ -58,6 +58,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0054_commerce_inventory_storefront.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0055_commerce_media_imports.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0056_commerce_guest_carts.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0057_commerce_production_products.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -67,7 +68,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.query('INSERT INTO store_access VALUES($1,$4),($2,$4),($3,$4)',[manager,courier,operator,store]);
   },30000);
   afterAll(()=>pg.close());
-  type TestCart={id:string;version:number;totalQuantity:number;subtotalCents:number;expired:boolean;storeAvailable:boolean;items:{variantId:string;quantity:number;status:string;unitPriceCents:number;priceChanged:boolean;productName:string}[]};
+  type TestCart={id:string;version:number;totalQuantity:number;subtotalCents:number;expired:boolean;storeAvailable:boolean;items:{variantId:string;quantity:number;maxQuantity:number;status:string;unitPriceCents:number;priceChanged:boolean;productName:string}[]};
   const ownerHash=cartTokenHash('a'.repeat(43)),otherHash=cartTokenHash('b'.repeat(43));
   const readCart=async(id:string,hash=ownerHash)=>(await pg.query<{data:TestCart|null}>('SELECT commerce_cart_read($1,$2) AS data',[id,hash])).rows[0]!.data;
   async function cartFixture(){
@@ -86,6 +87,42 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     const opened=(await pg.query<{id:string}>("SELECT commerce_cart_open('loja-carrinho',$1) AS id",[ownerHash])).rows[0]!.id;expect(opened).toBe(id);
     expect((await pg.query<{reserved:number;on_hand:number}>('SELECT reserved,on_hand FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:0,on_hand:10});
     const publicData=JSON.stringify(first);for(const field of ['costCents','cost_cents','tenant_id','token_hash','sku'])expect(publicData).not.toContain(field);
+  }));
+  const publicProducts=async()=> (await pg.query<{data:{total:number;data:{stockMode:string;variants:{available:boolean}[]}[]}}>(
+    "SELECT commerce_public_products('loja-carrinho','',NULL,20,0) AS data")).rows[0]!.data;
+  it('keeps zero-stock products visible but allows production items in the cart without physical balance',()=>context('manager',async()=>{
+    const {id,v}=await cartFixture();
+    await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:2,delta:-10,kind:'EXIT',reason:'Esvaziar saldo de teste'});
+    const stocked=await publicProducts();expect(stocked.total).toBe(1);expect(stocked.data[0]!.variants[0]!.available).toBe(false);
+    const changed=await saveProduct(client,auth,store,{...product,stockMode:'MADE_TO_ORDER'},v.productId,1);
+    expect(changed?.stockMode).toBe('MADE_TO_ORDER');
+    const made=await publicProducts();expect(made.data[0]!.stockMode).toBe('MADE_TO_ORDER');expect(made.data[0]!.variants[0]!.available).toBe(true);
+    const cart=await setCart(id,v.id,99,1);expect(cart.items[0]).toMatchObject({status:'AVAILABLE',maxQuantity:99});
+    expect(cart.subtotalCents).toBe(v.priceCents*99);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:0,reserved:0});
+    // A legacy client or an import omitting stockMode must preserve the manager choice.
+    const preserved=await saveProduct(client,auth,store,product,v.productId,2);expect(preserved?.stockMode).toBe('MADE_TO_ORDER');
+    await saveProduct(client,auth,store,{...product,stockMode:'STOCKED'},v.productId,3);
+    expect((await readCart(id))!.items[0]).toMatchObject({status:'INSUFFICIENT_STOCK',maxQuantity:0});
+    await expect(setCart(id,v.id,1,2)).rejects.toMatchObject({code:'23514'});
+  }));
+  it.each(['product','variant','category','store'])('still hides production items when %s is disabled',kind=>context('manager',async()=>{
+    const {id,v}=await cartFixture();
+    await saveProduct(client,auth,store,{...product,stockMode:'MADE_TO_ORDER'},v.productId,1);
+    await setCart(id,v.id,1,1);
+    if(kind==='product')await pg.query('UPDATE commerce_products SET published=false WHERE id=$1',[v.productId]);
+    if(kind==='variant')await pg.query('UPDATE commerce_variants SET active=false WHERE id=$1',[v.id]);
+    if(kind==='store')await pg.query('UPDATE commerce_storefronts SET published=false WHERE store_id=$1',[store]);
+    if(kind==='category'){
+      const category=await saveCategory(client,auth,store,{name:'Categoria arquivada',active:false});
+      await pg.query('UPDATE commerce_products SET category_id=$2 WHERE id=$1',[v.productId,category.id]);
+    }
+    expect((await publicProducts()).total).toBe(0);expect((await readCart(id))!.items[0]!.status).toBe('UNAVAILABLE');
+    await expect(setCart(id,v.id,2,2)).rejects.toMatchObject({code:'P0001'});
+  }));
+  it('accepts only known availability modes and defaults old product creations to stock',()=>context('manager',async()=>{
+    expect(productSchema.safeParse({...product,stockMode:'UNLIMITED'}).success).toBe(false);
+    expect((await saveProduct(client,auth,store,product))?.stockMode).toBe('STOCKED');
   }));
   it('does not reveal carts by guessed ID or allow a token from another guest',()=>context('manager',async()=>{
     const {id,v}=await cartFixture();await setCart(id,v.id,1,1);expect(await readCart(id,otherHash)).toBeNull();
