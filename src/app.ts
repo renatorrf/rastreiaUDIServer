@@ -26,10 +26,13 @@ import { organizationOperationsRoutes } from './modules/organization/operations.
 import { courierRoutes } from './modules/couriers/courier.routes.js';
 import { customerRoutes } from './modules/customers/customer.routes.js';
 import { commerceRoutes } from './modules/commerce/commerce.routes.js';
+import { liveRoutes } from './modules/commerce/live.routes.js';
+import { liveVideoRoutes } from './modules/commerce/live-video.routes.js';
 import { inventoryRoutes } from './modules/commerce/inventory.routes.js';
 import { mediaRoutes } from './modules/commerce/media.routes.js';
 import { catalogImportRoutes } from './modules/commerce/catalog-import.routes.js';
 import { cartRoutes } from './modules/commerce/cart.routes.js';
+import { orderRoutes } from './modules/commerce/order.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
 import { companySettingsRoutes } from './modules/company-settings/company-settings.routes.js';
@@ -72,7 +75,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     logger: {
       level: env.LOG_LEVEL,
       redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-master-login-grant"]',
-        'req.headers.x-customer-token', 'req.headers["x-commerce-cart-token"]', 'res.headers.set-cookie', '*.password', '*.confirmationPassword', 'req.body.confirmationPassword', '*.token', '*.grant', '*.apiKey'],
+        'req.headers.x-customer-token', 'req.headers["x-commerce-cart-token"]', 'res.headers.set-cookie', '*.password', '*.confirmationPassword', 'req.body.confirmationPassword', 'req.body.leaseToken', '*.leaseToken', '*.streamKey', '*.playbackUrl', '*.token', '*.grant', '*.apiKey'],
       serializers: {
         req(request) {
           const url = typeof request.url === 'string' && request.url.startsWith('/public/tracking/')
@@ -168,10 +171,13 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await courierRoutes(app, database, env);
   await customerRoutes(app, database, objectStorage, env, locationState, options.routeDirectionsProvider ?? geoapify);
   await commerceRoutes(app, database, env);
+  await liveRoutes(app, database, env);
+  await liveVideoRoutes(app, database, env);
   await inventoryRoutes(app, database, env);
   await mediaRoutes(app, database, env, objectStorage);
   await catalogImportRoutes(app, database, env);
   await cartRoutes(app, database);
+  await orderRoutes(app, database, env);
   await companySettingsRoutes(app, database, env);
   await communicationRoutes(app, database, env);
   await communicationWebhookRoutes(app, database, env);

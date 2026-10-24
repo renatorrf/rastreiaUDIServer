@@ -3,6 +3,12 @@ import { accessScopeSchema, companySchema } from './organization.schemas.js';
 import { operationsFilterSchema } from './operations.service.js';
 const tenantId='00000000-0000-4000-8000-000000000001',companyId='00000000-0000-4000-8000-000000000002',storeId='00000000-0000-4000-8000-000000000003';
 describe('organization contract validation',()=>{
+  it('accepts supported business activities and keeps omission compatible with old clients',()=>{
+    const base={name:'Empresa',legalName:'Empresa jurídica',taxId:'11.222.333/0001-81'};
+    for(const businessActivity of ['GENERAL','FASHION','FOOTWEAR','FOOD'])expect(companySchema.parse({...base,businessActivity}).businessActivity).toBe(businessActivity);
+    expect(companySchema.parse(base).businessActivity).toBeUndefined();
+    expect(companySchema.safeParse({...base,businessActivity:'UNKNOWN'}).success).toBe(false);
+  });
   it('requires the exact identifiers for each access scope',()=>{
     for(const scope of [{level:'TENANT',tenantId},{level:'COMPANY',tenantId,companyId},{level:'STORE',tenantId,companyId,storeId}])expect(accessScopeSchema.safeParse(scope).success).toBe(true);
     for(const scope of [{level:'TENANT',tenantId,companyId},{level:'COMPANY',tenantId},{level:'STORE',tenantId,storeId}])expect(accessScopeSchema.safeParse(scope).success).toBe(false);

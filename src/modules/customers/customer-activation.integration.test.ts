@@ -70,8 +70,21 @@ describe('customer pre-registration and WhatsApp activation', () => {
       CREATE TABLE idempotency_keys(tenant_id uuid,idempotency_key text,operation text,actor_user_id uuid,request_hash text,response_status int,response_body jsonb,UNIQUE(tenant_id,idempotency_key,operation));
       GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA rastreia TO rastreia_runtime;`);
     await pg.exec(await readFile(new URL('../../../migrations/0051_delivery_customer_alerts.sql',import.meta.url),'utf8'));
+    // Load the real storefront/publication and enrichment functions, not a fake
+    // publication flag: customers must not gain direct access to commercial RLS.
+    await pg.exec(`ALTER TABLE tenants ADD COLUMN status text DEFAULT 'ACTIVE';
+      ALTER TABLE tenant_users ADD COLUMN role text, ADD COLUMN status text DEFAULT 'ACTIVE';
+      CREATE TABLE platform_admins(id uuid PRIMARY KEY);
+      CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
+      ALTER TABLE stores ADD COLUMN tenant_id uuid,ADD COLUMN company_id uuid,ADD COLUMN status text DEFAULT 'ACTIVE',ADD UNIQUE(id,tenant_id);
+      CREATE FUNCTION has_store_access(uuid,uuid) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$;
+      CREATE FUNCTION is_master() RETURNS boolean LANGUAGE sql STABLE AS $$SELECT false$$;`);
+    for(const migration of ['0053_commerce_catalog_live_plans','0054_commerce_inventory_storefront','0058_customer_order_catalog']){
+      await pg.exec('BEGIN;'+await readFile(new URL(`../../../migrations/${migration}.sql`,import.meta.url),'utf8')+'COMMIT;');
+    }
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
-    await pg.query("INSERT INTO stores VALUES($1,'Loja teste','34988887777')",[store]);
+    await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[store,tenant]);
+    await pg.query("INSERT INTO stores(id,name,contact_phone,tenant_id,company_id) VALUES($1,'Loja teste','34988887777',$2,$1)",[store,tenant]);
     await pg.query(`INSERT INTO deliveries(id,tenant_id,store_id,recipient_name,recipient_phone,address_line,address_number,neighborhood,city,state,postal_code,latitude,longitude)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,[delivery,tenant,store,order.recipientName,order.recipientPhone,order.addressLine,order.addressNumber,order.neighborhood,order.city,order.state,order.postalCode,order.latitude,order.longitude]);
     await pg.query("INSERT INTO tracking_tokens(id,tenant_id,delivery_id,token_hash,expires_at) VALUES($1,$2,$3,$4,now()+interval '1 day')",[tracking,tenant,delivery,trackingTokenHash(token,env.TRACKING_TOKEN_PEPPER)]);
@@ -201,6 +214,39 @@ describe('customer pre-registration and WhatsApp activation', () => {
       expect((await client.query('SELECT * FROM rastreia.customer_identity_order_scope($1)',[randomUUID()])).rows).toEqual([]);
       await client.query("SELECT set_config('app.user_id',$1,true)",[randomUUID()]);
       expect((await client.query('SELECT * FROM rastreia.customer_identity_orders()')).rows).toEqual([]);
+      expect((await client.query('SELECT * FROM rastreia.customer_orders_with_catalog(NULL)')).rows).toEqual([]);
     });
+  });
+  it('includes only the exact order store published catalog, with private storefronts still protected',async()=>{
+    const session=await signInCustomer(database,env,'34999991234','Ab3Def7H');
+    const history=async()=>{
+      const response=await app.inject({method:'GET',url:'/customer/orders',headers:{authorization:`Bearer ${session.accessToken}`}});
+      expect(response.statusCode).toBe(200);
+      return response.json<{data:Array<{id:string;storeCatalogSlug:string|null}>}>().data;
+    };
+    expect((await history()).find(item=>item.id===delivery)?.storeCatalogSlug).toBeNull();
+    await pg.query("INSERT INTO commerce_storefronts(store_id,tenant_id,slug,title,published) VALUES($1,$2,'loja-teste','Loja teste',false)",[store,tenant]);
+    expect((await history()).find(item=>item.id===delivery)?.storeCatalogSlug).toBeNull();
+    await pg.query('UPDATE commerce_storefronts SET published=true WHERE store_id=$1',[store]);
+    const visible=await history();
+    expect(visible.find(item=>item.id===delivery)?.storeCatalogSlug).toBe('loja-teste');
+    // An old inconsistent fixture order has the same store id but another tenant.
+    expect(visible.filter(item=>item.id!==delivery).every(item=>item.storeCatalogSlug===null)).toBe(true);
+    for(const table of ['stores','companies','tenants']){
+      await pg.query(`UPDATE ${table} SET status='INACTIVE' WHERE id=$1`,[table==='tenants'?tenant:store]);
+      expect((await history()).find(item=>item.id===delivery)?.storeCatalogSlug).toBeNull();
+      await pg.query(`UPDATE ${table} SET status='ACTIVE' WHERE id=$1`,[table==='tenants'?tenant:store]);
+    }
+    await withRuntimeTransaction(database,async client=>{
+      await client.query("SELECT set_config('app.user_id',$1,true)",[accountId]);
+      await setTenantContext(client,{tenantId:tenant,userId:accountId,role:'STORE_OPERATOR',storeIds:[],sessionId:randomUUID()});
+      expect((await client.query('SELECT * FROM commerce_storefronts')).rows).toEqual([]);
+      expect((await client.query<{data:{storeCatalogSlug:string}}>('SELECT * FROM customer_orders_with_catalog($1)',[profileId])).rows[0]?.data.storeCatalogSlug).toBe('loja-teste');
+      expect((await client.query('SELECT * FROM customer_orders_with_catalog($1)',[randomUUID()])).rows).toEqual([]);
+      await client.query("SELECT set_config('app.user_id',$1,true)",[randomUUID()]);
+      expect((await client.query('SELECT * FROM customer_orders_with_catalog($1)',[profileId])).rows).toEqual([]);
+    });
+    await pg.query('UPDATE commerce_storefronts SET published=false WHERE store_id=$1',[store]);
+    expect((await history()).find(item=>item.id===delivery)?.storeCatalogSlug).toBeNull();
   });
 });

@@ -10,10 +10,10 @@ import { accessScopeSchema, companySchema, provisionOrganizationSchema } from '.
 
 export async function createCompany(client:PoolClient,env:AppEnv,auth:PlatformAuthContext,tenantId:string,input:z.infer<typeof companySchema>) {
   if(!(await client.query("SELECT id FROM tenants WHERE id=$1 AND status='ACTIVE' FOR SHARE",[tenantId])).rowCount)throw conflict('Grupo inativo ou inexistente.');
-  const row=(await client.query<{id:string}>(`INSERT INTO companies(tenant_id,name,legal_name,tax_id_encrypted) VALUES($1,$2,$3,$4) RETURNING id`,
-    [tenantId,input.name,input.legalName,encryptPayload({taxId:input.taxId},env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER)])).rows[0]!;
+  const row=(await client.query<{id:string}>(`INSERT INTO companies(tenant_id,name,legal_name,tax_id_encrypted,business_activity) VALUES($1,$2,$3,$4,$5) RETURNING id`,
+    [tenantId,input.name,input.legalName,encryptPayload({taxId:input.taxId},env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER),input.businessActivity??'GENERAL'])).rows[0]!;
   await masterAudit(client,auth,{action:'company.created',entityType:'company',entityId:row.id,tenantId,
-    after:{name:input.name,legalName:input.legalName,taxIdMasked:`***${input.taxId.slice(-4)}`},reason:'Empresa jurídica cadastrada pelo Master.'});
+    after:{name:input.name,legalName:input.legalName,businessActivity:input.businessActivity??'GENERAL',taxIdMasked:`***${input.taxId.slice(-4)}`},reason:'Empresa jurídica cadastrada pelo Master.'});
   return row;
 }
 

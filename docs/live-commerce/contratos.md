@@ -1,5 +1,7 @@
 # Contratos propostos para vendas por live
 
+Atualização de 24/10/2026: o contrato implementado para vídeo, estúdio e credenciais está em [Amazon IVS](amazon-ivs.md). Essas operações usam leases e respostas `no-store`, não o cache genérico de idempotência descrito para escritas comerciais abaixo. A ativação AWS e a migração 0062 permanecem pendentes.
+
 Contratos de planejamento, ainda não publicados. Manter o padrão Fastify/Zod e erros `{ error: { code, message, correlation_id } }`. Rotas de tela estão no [plano de implementação](fase-0.md); estes caminhos são de API.
 
 ## Regras comuns
@@ -98,16 +100,36 @@ Ausência de contrato ativo retorna `403 LIVE_ADDON_REQUIRED`; cota esgotada ret
 | Método e rota | Responsabilidade |
 | --- | --- |
 | GET/POST `/commerce/stores/:storeId/lives` | Listar/agendar sessão com título, horário e playlist |
-| PATCH `/commerce/lives/:id` | Editar dados e ordem com versão, sem afetar pedidos |
-| POST `/commerce/lives/:id/start` | Validar contrato/cota, reservar consumo e iniciar provisionamento idempotente |
+| GET/PATCH `/commerce/stores/:storeId/lives/:id` | Consultar/editar dados e ordem com versão, antes do início |
+| POST `/commerce/stores/:storeId/lives/:id/start` | Validar contrato/cota e iniciar sessão comercial idempotente; ainda sem vídeo |
 | POST `/commerce/lives/:id/broadcaster-session` | Operador autorizado recebe credencial transitória, somente após autorização de início |
-| POST `/commerce/lives/:id/current-product` | `action: NEXT/PREVIOUS/SELECT/HIDE`, `itemId?`, `expectedVersion` |
-| POST `/commerce/lives/:id/end` | Confirmação explícita, versão e idempotência; interromper vídeo sem invalidar compras |
+| POST `/commerce/stores/:storeId/lives/:id/current-product` | `action: NEXT/PREVIOUS/SELECT/HIDE`, `productId?`, `expectedVersion` |
+| POST `/commerce/stores/:storeId/lives/:id/end` | Confirmação explícita, versão e idempotência; encerrar sessão comercial sem invalidar compras |
 | GET `/public/lives/:publicToken` | Snapshot comercial, produto atual, sequência e estado; sem credenciais do apresentador |
 | POST `/public/lives/:publicToken/viewer-sessions` | Admissão anônima limitada, lease e playback autorizado |
 | POST `/public/live-viewer-sessions/:id/renew` | Prova de posse da sessão; renovar sem consumir nova vaga |
 
 Respostas de credenciais/tokens não são cacheáveis. Visão pública de sessão encerrada oferece catálogo/carrinho. Novos inícios passam pelo relógio e locks do servidor; retomada após falha não ganha mais 120 minutos nem consome outra cota da mesma live.
+
+**Implementado em 24/10/2026:** persistência comercial, playlist, destaque, início/encerramento, cota mensal e snapshot público, mediante a migração **0061**. Rotas de apresentador e espectadores acima continuam propostas, não implementadas. Detalhes operacionais e limitações em [sessoes-comerciais.md](sessoes-comerciais.md). Não há provisionamento, player, cobrança, eventos Socket.IO ou limite de audiência implementados nesta etapa.
+
+### Compra do produto em exibição — requisito refinado em 24/10/2026
+
+**Estado: modal compartilhado implementado no catálogo e na interface pública da live em 24/10/2026 (`ProductOptionsComponent` + `ProductPurchaseController`).** Rota frontend `/loja/:slug/live/:publicToken`, destaque e estados comerciais validados com prévia isolada. O endpoint `GET /public/lives/:publicToken` foi implementado com `{id, sequence, store:{slug,title}, title, status:WAITING|LIVE|ENDED, featuredProduct:PublicProduct|null}`. **Estúdio, admissão e integração com o player continuam pendentes; a área de vídeo informa indisponibilidade, não simula transmissão.** Detalhes em `rastreia-front/rastreiaApp/docs/live-tela-publica.md`. O foco comercial da live é o varejo de roupas, calçados, utensílios e produtos semelhantes. Isso não cria um catálogo paralelo nem restringe automaticamente outros segmentos: a atividade da unidade e a configuração do produto continuam determinando os campos exibidos.
+
+Fluxo: produto em exibição → **Comprar este** → modal de opções → **Adicionar ao carrinho** → continuar assistindo. Finalizar o pedido continua no checkout existente, com autenticação, entrega ou retirada e confirmação pela loja, sem presumir pagamento online.
+
+- Reutilizar o mesmo produto, variantes, preços, disponibilidade e carrinho da loja. A playlist referencia o produto, não impõe ao comprador uma variante usada pelo apresentador. O backend valida a relação entre live, loja, produto e variante; nenhum identificador enviado pelo navegador concede acesso a outra unidade.
+- Modal compartilhado com o catálogo: foto real cadastrada, nome, preço da combinação selecionada, cor, tamanho e quantidade, nessa ordem. Exibir somente atributos existentes. Variantes diferenciadas apenas pelo nome precisam de seletor de modelo/opção; não presumir que toda variante possui cor e tamanho. Produto sem variações não exige seletores vazios.
+- Exigir escolha explícita quando houver mais de uma opção. Mostrar combinações indisponíveis com texto e estado desabilitado, sem depender apenas de cor. Uma mudança de cor não pode selecionar silenciosamente outro tamanho. A ação principal só é habilitada para uma variante válida e quantidade aceita pelo carrinho.
+- Observações de preparo aparecem somente quando permitidas no produto; não são um campo obrigatório de roupas ou utensílios. Produtos sob encomenda mantêm a regra existente, sem exigir saldo físico para disponibilidade.
+- Direção visual: preservar o tema escuro/verde e usar o Design System, com hierarquia focada no produto, opções legíveis e uma ação principal. No celular, sheet/modal acessível, sem modais encadeados; no desktop, modal compacto. Abertura/fechamento e estados de seleção/processamento usam transições discretas, respeitando movimento reduzido.
+- Abrir/fechar o modal não deve recriar o player nem interromper intencionalmente a transmissão. Foco fica contido no modal e retorna ao botão de origem ao fechar. Rótulos, seleção por teclado, fechamento e áreas de toque devem funcionar também em telas estreitas.
+- Fixar a identidade do produto no instante em que o cliente toca em **Comprar este**. Se o apresentador mudar o destaque, manter produto e escolhas do modal aberto, com aviso discreto de que outro produto está em exibição. Nunca substituir o item da compra silenciosamente.
+- Preço e disponibilidade continuam sujeitos à revalidação no servidor. Abrir o modal ou adicionar ao carrinho não reserva estoque; a reserva ocorre no checkout. Em falta de estoque, mudança de preço ou falha de rede, preservar a seleção e informar como revisar/tentar novamente, sem sucesso fictício nem adição duplicada.
+- Após adição confirmada, mostrar feedback e atualizar o contador do carrinho; permitir continuar assistindo. Se a live terminar durante a escolha, preservar o carrinho e oferecer o catálogo, revalidando a disponibilidade conforme as regras existentes.
+
+Critérios de aceite: roupas com cor/tamanho, calçados com numeração, utensílio sem variantes, modelos com nomes distintos, combinação esgotada, quantidade inválida, produto sob encomenda, troca do destaque com modal aberto, encerramento da live, atualização de preço/estoque, retry após timeout e isolamento entre lojas. Validar player contínuo, foco, leitores de tela e layout em 320, 375, 390, 430, 768, 1024 e 1200+ px na implementação.
 
 ## Eventos e notificações
 

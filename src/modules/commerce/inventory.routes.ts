@@ -37,7 +37,7 @@ export async function inventoryRoutes(app:FastifyInstance,database:Database,env:
     const {storeId}=storeParams.parse(req.params);await requireCommerceStore(c,storeId);
     const f=listSchema.extend({stock:z.enum(['all','low','empty']).default('all'),productId:z.uuid().optional()}).parse(req.query);
     const where=`v.store_id=$1 AND ($2='' OR position(lower($2) in lower(p.name||' '||v.name||' '||v.sku))>0)
-      AND ($3='all' OR v.active=($3='active')) AND ($4='all' OR ($4='low' AND b.on_hand-b.reserved<=v.minimum_stock) OR ($4='empty' AND b.on_hand=b.reserved)) AND ($5::uuid IS NULL OR v.product_id=$5)`;
+      AND ($3='all' OR v.active=($3='active')) AND ($4='all' OR (p.stock_mode='STOCKED' AND (($4='low' AND b.on_hand-b.reserved<=v.minimum_stock) OR ($4='empty' AND b.on_hand=b.reserved)))) AND ($5::uuid IS NULL OR v.product_id=$5)`;
     const values=[storeId,f.search,f.status,f.stock,f.productId??null];
     const data=(await c.query(`${variantSelect} WHERE ${where} ORDER BY p.name,v.name,v.id LIMIT $6 OFFSET $7`,[...values,f.limit,f.offset])).rows;
     const total=(await c.query(`SELECT count(*)::int AS total FROM commerce_variants v JOIN commerce_products p ON p.id=v.product_id JOIN commerce_inventory_balances b ON b.variant_id=v.id WHERE ${where}`,values)).rows[0]!.total;

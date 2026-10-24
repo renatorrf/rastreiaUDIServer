@@ -10,6 +10,7 @@ import { conflict, notFound } from '../../shared/errors.js';
 import { masterAudit } from '../billing/billing.service.js';
 import { cancellationSchema, categorySchema, listSchema, planSchema, productSchema, subscriptionSchema } from './commerce.schemas.js';
 import { cancelSubscription, createPlanVersion, planSelect, productSelect, requireCommerceStore, saveCategory, saveProduct, subscribeStore, subscriptionSelect } from './commerce.service.js';
+import { liveEntitlement } from './live.service.js';
 
 const storeParams = z.object({storeId:z.string().uuid()});
 const itemParams = storeParams.extend({id:z.string().uuid()});
@@ -28,7 +29,7 @@ export async function commerceRoutes(app: FastifyInstance, database: Database, e
   for (const platform of [false,true]) {
     app.get(platform?'/platform/live-stores':'/commerce/stores',{preHandler:platform?master:manager},request=>{
       const f=listSchema.parse(request.query);
-      const run=async(client:PoolClient)=>({data:(await client.query(`SELECT s.id,s.name,c.name AS "companyName"
+      const run=async(client:PoolClient)=>({data:(await client.query(`SELECT s.id,s.name,c.name AS "companyName",c.business_activity AS "businessActivity"
         FROM stores s JOIN companies c ON c.id=s.company_id
         WHERE ${platform?'true':'commerce_manage_store(s.id)'} AND ($1='' OR position(lower($1) in lower(s.name||' '||c.name))>0)
         ORDER BY s.name,s.id LIMIT $2 OFFSET $3`,[f.search,f.limit,f.offset])).rows});
@@ -108,6 +109,6 @@ export async function commerceRoutes(app: FastifyInstance, database: Database, e
   app.get('/commerce/stores/:storeId/live-entitlement',{preHandler:manager},request=>withTenantTransaction(database,request.auth,async client=>{
     const {storeId}=storeParams.parse(request.params);await requireCommerceStore(client,storeId);
     const data=(await client.query(`${subscriptionSelect} WHERE s.store_id=$1 ORDER BY s.starts_at DESC,s.id LIMIT 100`,[storeId])).rows;
-    return {data,streamingAvailable:false,usage:null};
+    return {data,...await liveEntitlement(client,storeId)};
   }));
 }

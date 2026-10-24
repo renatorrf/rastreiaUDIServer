@@ -14,6 +14,7 @@ export const productSchema = z.object({
   description: z.string().trim().max(2000).default(''), categoryId: z.string().uuid().nullable(),
   priceCents: cents, costCents: cents, active: z.boolean(),
   stockMode: z.enum(['STOCKED', 'MADE_TO_ORDER']).optional(),
+  acceptsNotes: z.boolean().optional(),
 }).strict();
 export const planSchema = z.object({
   code: z.string().trim().toUpperCase().regex(/^[A-Z0-9_-]{2,40}$/),

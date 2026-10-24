@@ -41,9 +41,9 @@ export async function cartRoutes(app:FastifyInstance,db:Database){
   for(const refresh of [false,true])app.route({method:refresh?'POST':'PUT',url:`/public/commerce/carts/:id/${refresh?'refresh':'items/:variantId'}`,config,handler:async(req,reply)=>{
     const {id,variantId}=params.extend({variantId:z.uuid().optional()}).parse(req.params);
     const hash=cartTokenHash(req.headers['x-commerce-cart-token']),key=parseIdempotencyKey(req.headers['idempotency-key']);
-    const input=(refresh?z.object({expectedVersion:z.number().int().positive()}).strict():z.object({expectedVersion:z.number().int().positive(),quantity:z.number().int().min(0).max(99)}).strict()).parse(req.body);
+    const input=(refresh?z.object({expectedVersion:z.number().int().positive()}).strict():z.object({expectedVersion:z.number().int().positive(),quantity:z.number().int().min(0).max(99),preparationNotes:z.string().trim().max(500).optional()}).strict()).parse(req.body);
     const quantity='quantity' in input?input.quantity:null;reply.header('Cache-Control','no-store');
-    try{return await withRuntimeTransaction(db,async c=>(await c.query('SELECT commerce_cart_change($1,$2,$3,$4,$5,$6,$7,$8) AS data',[id,hash,variantId??null,quantity,input.expectedVersion,key,requestHash({refresh,variantId:variantId??null,...input}),refresh])).rows[0]!.data);
+    try{return await withRuntimeTransaction(db,async c=>(await c.query('SELECT commerce_cart_change_with_notes($1,$2,$3,$4,$5,$6,$7,$8,$9) AS data',[id,hash,variantId??null,quantity,input.expectedVersion,key,requestHash({refresh,variantId:variantId??null,...input}),refresh,'preparationNotes' in input?input.preparationNotes??null:null])).rows[0]!.data);
     }catch(error){return cartError(error);}
   }});
 }

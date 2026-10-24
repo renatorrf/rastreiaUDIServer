@@ -55,7 +55,7 @@ export async function organizationRoutes(app:FastifyInstance,database:Database,e
   });
   app.get('/platform/companies',{preHandler:auth},request=>withPlatformTransaction(database,request.platformAuth,async client=>{
     const f=contextFilterSchema.parse(request.query);
-    const result=await client.query(`SELECT company.id,company.tenant_id,company.name,company.legal_name,company.status,company.version,
+    const result=await client.query(`SELECT company.id,company.tenant_id,company.name,company.legal_name,company.business_activity,company.status,company.version,
       tenant.name AS tenant_name,(company.tax_id_encrypted IS NOT NULL) AS fiscal_configured,count(*) OVER()::int AS total_count
       FROM companies company JOIN tenants tenant ON tenant.id=company.tenant_id
       WHERE ($1::uuid IS NULL OR company.tenant_id=$1) AND ($2::uuid IS NULL OR company.id=$2)
@@ -78,12 +78,12 @@ export async function organizationRoutes(app:FastifyInstance,database:Database,e
   app.patch('/platform/companies/:id',{preHandler:auth},(request,reply)=>{
     const id=idOf(request);const input=companySchema.extend({status:z.enum(['ACTIVE','INACTIVE']),version:z.number().int().positive(),reason}).parse(request.body);
     return mutate(request,reply,'company.update',{id,...input},async client=>{
-      const before=(await client.query('SELECT id,tenant_id,name,legal_name,status,version FROM companies WHERE id=$1 FOR UPDATE',[id])).rows[0];if(!before)throw notFound();
+      const before=(await client.query('SELECT id,tenant_id,name,legal_name,business_activity,status,version FROM companies WHERE id=$1 FOR UPDATE',[id])).rows[0];if(!before)throw notFound();
       if(before.version!==input.version)throw conflict('Empresa alterada em outra sessão. Recarregue.');
-      await client.query('UPDATE companies SET name=$2,legal_name=$3,tax_id_encrypted=$4,status=$5,version=version+1 WHERE id=$1',
-        [id,input.name,input.legalName,encryptPayload({taxId:input.taxId},env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER),input.status]);
+      await client.query('UPDATE companies SET name=$2,legal_name=$3,tax_id_encrypted=$4,status=$5,business_activity=$6,version=version+1 WHERE id=$1',
+        [id,input.name,input.legalName,encryptPayload({taxId:input.taxId},env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER),input.status,input.businessActivity??before.business_activity]);
       await masterAudit(client,request.platformAuth,{action:'company.updated',entityType:'company',entityId:id,tenantId:before.tenant_id,
-        before,after:{name:input.name,legalName:input.legalName,status:input.status,taxIdMasked:`***${input.taxId.slice(-4)}`},reason:input.reason});return {id};
+        before,after:{name:input.name,legalName:input.legalName,businessActivity:input.businessActivity??before.business_activity,status:input.status,taxIdMasked:`***${input.taxId.slice(-4)}`},reason:input.reason});return {id};
     });
   });
   app.post('/platform/organizations/provision',{preHandler:auth},(request,reply)=>{

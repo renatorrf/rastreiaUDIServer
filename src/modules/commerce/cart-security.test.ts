@@ -29,4 +29,15 @@ describe('guest cart HTTP boundary',()=>{
   it('returns no data for a cart owned by someone else',async()=>{
     query.mockResolvedValue({rows:[{data:null}],rowCount:1});expect((await app.inject({url:`/public/commerce/carts/${id}`,headers})).statusCode).toBe(404);
   });
+  it('validates preparation notes and includes them in the idempotency payload',async()=>{
+    const req={method:'PUT' as const,url:`/public/commerce/carts/${id}/items/${variant}`,headers};
+    for(const preparationNotes of [123,'x'.repeat(501)])expect((await app.inject({...req,payload:{quantity:1,expectedVersion:1,preparationNotes}})).statusCode).toBe(422);
+    const hashes=[];
+    for(const preparationNotes of ['Sem alface','Sem cebola']){
+      query.mockClear();expect((await app.inject({...req,payload:{quantity:1,expectedVersion:1,preparationNotes}})).statusCode).toBe(200);
+      const call=query.mock.calls.find(([sql])=>String(sql).includes('commerce_cart_change_with_notes'))!;
+      expect(call[1][8]).toBe(preparationNotes);hashes.push(call[1][6]);
+    }
+    expect(hashes[0]).not.toBe(hashes[1]);
+  });
 });

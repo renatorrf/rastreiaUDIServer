@@ -5,7 +5,9 @@ import type { Database } from '../../database/pool.js';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import type { PoolClient } from 'pg';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { AppEnv } from '../../config/env.js';
+import { createLiveVideoService,maintainLiveVideo } from './live-video.service.js';
 import type { AuthContext, PlatformAuthContext } from '../auth/auth.types.js';
 import { withIdempotency } from '../../shared/idempotency.js';
 import { cancelSubscription, createPlanVersion, saveCategory, saveProduct, subscribeStore, subscriptionSelect } from './commerce.service.js';
@@ -15,6 +17,7 @@ import { adjustmentSchema } from './inventory.schemas.js';
 import { cartRoutes,cartTokenHash } from './cart.routes.js';
 import { requestHash } from '../../shared/idempotency.js';
 import { applyImport,previewImport,loadImport,importOptionsSchema,type ImportOptions } from './catalog-import.service.js';
+import { saveLive,startLive,highlightLive,endLive,liveEntitlement,expireLiveStore,liveDetail } from './live.service.js';
 
 describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
   const pg=new PGlite();
@@ -45,8 +48,9 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
       CREATE FUNCTION is_master() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER AS $$SELECT EXISTS(SELECT 1 FROM platform_admins WHERE id=nullif(current_setting('app.platform_admin_id',true),'')::uuid)$$;
       CREATE TABLE tenants(id uuid PRIMARY KEY,status text DEFAULT 'ACTIVE');
       CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
-      CREATE TABLE stores(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,status text DEFAULT 'ACTIVE',UNIQUE(id,tenant_id));
-      CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE');
+      CREATE TABLE stores(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,name text DEFAULT 'Loja teste',status text DEFAULT 'ACTIVE',UNIQUE(id,tenant_id));
+      CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE',must_change_password boolean DEFAULT false);
+      CREATE TABLE customer_profiles(id uuid PRIMARY KEY,user_id uuid,tenant_id uuid,first_name text,last_name text,whatsapp_normalized text,status text DEFAULT 'ACTIVE',updated_at timestamptz DEFAULT now(),address_line text,address_number text,complement text,neighborhood text,city text,state text,postal_code text,latitude float8,longitude float8);
       CREATE TABLE tenant_users(tenant_id uuid,user_id uuid,role text,status text DEFAULT 'ACTIVE');
       CREATE TABLE store_access(user_id uuid,store_id uuid);
       CREATE FUNCTION has_store_access(uuid,uuid) RETURNS boolean LANGUAGE sql STABLE AS $$SELECT EXISTS(SELECT 1 FROM store_access WHERE user_id=$1 AND store_id=$2)$$;
@@ -59,6 +63,10 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0055_commerce_media_imports.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0056_commerce_guest_carts.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0057_commerce_production_products.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0059_business_activity_preparation_notes.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0060_commerce_checkout_orders.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0061_commerce_live_sessions.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0062_commerce_live_video.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -68,9 +76,320 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.query('INSERT INTO store_access VALUES($1,$4),($2,$4),($3,$4)',[manager,courier,operator,store]);
   },30000);
   afterAll(()=>pg.close());
+  async function liveFixture(){
+    const {id:cartId,v}=await cartFixture();
+    await pg.query("SELECT set_config('app.platform_admin_id',$1,true)",[masterId]);
+    const p=await createPlanVersion(client,master,plan);
+    const sub=await subscribeStore(client,master,store,{planVersionId:p!.id as string,startsAt:'2026-01-01T00:00:00Z',endsAt:'2099-01-01T00:00:00Z',reason:'Sessões de teste isolado'});
+    await pg.query("SELECT set_config('app.platform_admin_id','',true)");
+    const input={title:'Coleção da semana',scheduledAt:null,productIds:[v.productId]};
+    const session=await saveLive(client,auth,store,input);
+    return {session,input,v,cartId,subscriptionId:sub!.id as string};
+  }
+  const publicLive=async(token:unknown)=>(await pg.query<{data:{id:string;sequence:number;status:string;featuredProduct:{id:string;variants:unknown[]}|null}|null}>('SELECT commerce_public_live($1) AS data',[token])).rows[0]!.data;
+  async function videoFixture(){
+    const fixture=await liveFixture();await startLive(client,auth,store,String(fixture.session.id),1);
+    await pg.query(`INSERT INTO commerce_live_video(live_id,tenant_id,store_id,channel_arn,owner_id,lease_hash,lease_until,state,provider_online,checked_at,playback_url)
+      VALUES($1,$2,$3,'arn:aws:ivs:us-east-1:123456789012:channel/demo',$4,$5,now()+interval '90 seconds','READY',true,now(),'https://example.playback.live-video.net/video.m3u8')`,[fixture.session.id,tenant,store,manager,'a'.repeat(64)]);
+    await pg.exec('RESET ROLE;INSERT INTO commerce_live_video_worker VALUES(true,now()) ON CONFLICT(id) DO UPDATE SET seen_at=now();SET LOCAL ROLE rastreia_runtime;');
+    return fixture;
+  }
+  const viewer=async(token:unknown,hash:string,renew=false)=>(await pg.query<{data:Record<string,string>|null}>('SELECT commerce_live_viewer($1,$2,$3) AS data',[token,hash,renew])).rows[0]!.data;
+  it('admits and renews an opaque viewer without exposing any studio credential',()=>context('manager',async()=>{
+    const {session}=await videoFixture();const result=await viewer(session.publicToken,'b'.repeat(64));
+    expect(result?.id).toBeTruthy();expect(JSON.stringify(result)).not.toMatch(/lease_hash|streamKey|owner_id|tenant_id/);
+    expect((await viewer(session.publicToken,'b'.repeat(64),true))?.id).toBe(result?.id);
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toMatchObject({error:'VIEWER_ALREADY_ISSUED'});
+    expect(await viewer('0'.repeat(64),'b'.repeat(64))).toBeNull();
+    expect(await viewer(session.publicToken,'invalid')).toBeNull();
+  }));
+  it('blocks admission without provider confirmation, active worker, public catalog or live contract',()=>context('manager',async()=>{
+    const {session}=await videoFixture();
+    await pg.query('UPDATE commerce_live_video SET provider_online=false WHERE live_id=$1',[session.id]);
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toBeNull();
+    await pg.query('UPDATE commerce_live_video SET provider_online=true WHERE live_id=$1',[session.id]);
+    await pg.exec("RESET ROLE;UPDATE commerce_live_video_worker SET seen_at=now()-interval '2 minutes';SET LOCAL ROLE rastreia_runtime;");
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toBeNull();
+    await pg.exec('RESET ROLE;UPDATE commerce_live_video_worker SET seen_at=now();SET LOCAL ROLE rastreia_runtime;');
+    await pg.query('UPDATE commerce_storefronts SET published=false WHERE store_id=$1',[store]);
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toBeNull();
+    await pg.query('UPDATE commerce_storefronts SET published=true WHERE store_id=$1',[store]);
+    await endLive(client,auth,store,String(session.id),2);
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toBeNull();
+  }));
+  it('holds audience slots until revocation propagates and never revives an expired lease',()=>context('manager',async()=>{
+    const {session}=await videoFixture();
+    await pg.exec('RESET ROLE;');
+    await pg.query(`INSERT INTO commerce_live_viewers(live_id,lease_hash,lease_until)
+      SELECT $1,lpad(n::text,64,'0'),now()-interval '1 minute' FROM generate_series(1,200) AS n`,[session.id]);
+    await pg.exec('SET LOCAL ROLE rastreia_runtime;');
+    expect(await viewer(session.publicToken,'b'.repeat(64))).toMatchObject({error:'LIVE_AUDIENCE_FULL'});
+    expect(await viewer(session.publicToken,'1'.padStart(64,'0'),true)).toMatchObject({error:'VIEWER_EXPIRED'});
+    await pg.exec('RESET ROLE;');
+    await pg.query("UPDATE commerce_live_viewers SET revoked_at=now(),release_after=now()-interval '1 second' WHERE live_id=$1",[session.id]);
+    await pg.exec('SET LOCAL ROLE rastreia_runtime;');
+    expect((await viewer(session.publicToken,'b'.repeat(64)))?.id).toBeTruthy();
+  }));
+  it('isolates video management with FORCE RLS and denies direct viewer reads',()=>context('manager',async()=>{
+    await videoFixture();
+    await pg.query("SELECT set_config('app.user_id',$1,true)",[courier]);
+    expect((await pg.query('SELECT * FROM commerce_live_video')).rows).toHaveLength(0);
+    await pg.exec('SAVEPOINT denied_viewers');
+    await expect(pg.query('SELECT * FROM commerce_live_viewers')).rejects.toThrow();
+    await pg.exec('ROLLBACK TO SAVEPOINT denied_viewers');
+  }));
+  function videoServiceFixture(){
+    // Nested service transactions use savepoints so every test still rolls back its complete fixture.
+    const query=async(sql:string,values?:unknown[])=>{
+      const mapped=sql==='BEGIN'?'SAVEPOINT video_service':sql==='COMMIT'?'RELEASE SAVEPOINT video_service':sql==='ROLLBACK'?'ROLLBACK TO SAVEPOINT video_service':sql;
+      return client.query(mapped,values);
+    };
+    const db={query,connect:async()=>({query,release:()=>{}})} as unknown as Database;
+    const arn='arn:aws:ivs:us-east-1:123456789012:channel/demo';
+    const env={IVS_ENABLED:true,IVS_REGION:'us-east-1',IVS_CHANNELS_JSON:JSON.stringify({[store]:arn}),IVS_PLAYBACK_PRIVATE_KEY:'test-only',APP_ORIGINS:'https://example.test'} as AppEnv;
+    const provider={channel:vi.fn().mockResolvedValue({arn,ingestEndpoint:'ingest',playbackUrl:'https://test.playback.live-video.net/stream.m3u8'}),key:vi.fn().mockResolvedValue('TEST_KEY_NOT_PERSISTED'),online:vi.fn().mockResolvedValue(true),stop:vi.fn().mockResolvedValue(undefined),revoke:vi.fn().mockResolvedValue(undefined),playback:vi.fn().mockResolvedValue('signed')};
+    return {db,env,provider,service:createLiveVideoService(db,env,provider)};
+  }
+  it('serializes the studio lease and reconnects without consuming another commercial session',()=>context('manager',async()=>{
+    const {session}=await videoFixture();await pg.query("UPDATE commerce_live_video SET state='STOPPED' WHERE live_id=$1",[session.id]);
+    const {service,provider}=videoServiceFixture();const id=String(session.id),lease='c'.repeat(64);
+    expect(await service.connect(auth,store,id,lease)).toMatchObject({streamKey:'TEST_KEY_NOT_PERSISTED'});
+    await service.connect(auth,store,id,lease);expect((await liveEntitlement(client,store)).usage.used).toBe(1);
+    await expect(service.connect(auth,store,id,'d'.repeat(64))).rejects.toMatchObject({statusCode:409});
+    expect(provider.key).toHaveBeenCalledTimes(2);
+    await service.heartbeat(auth,store,id,lease);expect((await service.status(auth,store,id)).video).toMatchObject({providerOnline:true});
+    const stored=(await pg.query('SELECT row_to_json(v) AS data FROM commerce_live_video v WHERE live_id=$1',[id])).rows[0];
+    expect(JSON.stringify(stored)).not.toContain('TEST_KEY_NOT_PERSISTED');expect(JSON.stringify(stored)).not.toContain(lease);
+    await expect(service.connect({...auth,storeIds:[]},otherStore,id,lease)).rejects.toMatchObject({statusCode:404});
+  }));
+  it('keeps durable cleanup intent when AWS fails and retries stopping without losing the session',()=>context('manager',async()=>{
+    const {session}=await videoFixture();await pg.query("UPDATE commerce_live_video SET state='STOPPED' WHERE live_id=$1",[session.id]);
+    const {service,provider,env,db}=videoServiceFixture();const id=String(session.id),lease='c'.repeat(64);
+    provider.key.mockRejectedValueOnce(new Error('Fake AWS timeout'));
+    await expect(service.connect(auth,store,id,lease)).rejects.toThrow('Fake AWS timeout');
+    expect((await pg.query<{state:string}>('SELECT state FROM commerce_live_video WHERE live_id=$1',[id])).rows[0]?.state).toBe('PREPARING');
+    await service.disconnect(auth,store,id);await pg.exec('RESET ROLE');
+    provider.stop.mockRejectedValueOnce(new Error('Fake stop failure'));
+    await expect(maintainLiveVideo(db,env,provider)).rejects.toThrow();
+    expect((await pg.query<{state:string}>('SELECT state FROM commerce_live_video WHERE live_id=$1',[id])).rows[0]?.state).toBe('PREPARING');
+    await maintainLiveVideo(db,env,provider);expect(provider.stop).toHaveBeenCalledTimes(2);
+    expect((await pg.query<{state:string}>('SELECT state FROM commerce_live_video WHERE live_id=$1',[id])).rows[0]?.state).toBe('STOPPED');
+  }));
+  it('stops the provider after commercial closure and revokes viewers without erasing their history',()=>context('manager',async()=>{
+    const {session}=await videoFixture();const id=String(session.id);await viewer(session.publicToken,'e'.repeat(64));
+    await endLive(client,auth,store,id,2);const {provider,env,db}=videoServiceFixture();await pg.exec('RESET ROLE');
+    await maintainLiveVideo(db,env,provider);expect(provider.stop).toHaveBeenCalledWith('arn:aws:ivs:us-east-1:123456789012:channel/demo',id);
+    expect(provider.revoke).toHaveBeenCalledTimes(1);
+    const rows=await pg.query<{revoked_at:string}>('SELECT revoked_at FROM commerce_live_viewers WHERE live_id=$1',[id]);expect(rows.rows).toHaveLength(1);expect(rows.rows[0]?.revoked_at).toBeTruthy();
+  }));
+  it('persists a live and exposes only published public data through its opaque token',()=>context('manager',async()=>{
+    const {session,v}=await liveFixture();expect(session.status).toBe('WAITING');expect(String(session.publicToken)).toMatch(/^[a-f0-9]{64}$/);
+    expect((await publicLive(session.publicToken))?.featuredProduct).toBeNull();
+    await startLive(client,auth,store,String(session.id),1);const snapshot=await publicLive(session.publicToken);
+    expect(snapshot).toMatchObject({status:'LIVE',sequence:2,featuredProduct:{id:v.productId}});
+    expect(JSON.stringify(snapshot)).not.toMatch(/costCents|tenantId|publicToken|subscriptionId|createdBy/);
+    expect(await publicLive('f'.repeat(64))).toBeNull();
+    await pg.query('UPDATE commerce_products SET published=false WHERE id=$1',[v.productId]);
+    expect((await publicLive(session.publicToken))?.featuredProduct).toBeNull();
+  }));
+  it('counts exactly four starts per store/month and does not refund a finished session',()=>context('manager',async()=>{
+    const {session,input}=await liveFixture();
+    for(let n=0;n<4;n++){
+      const item=n===0?session:await saveLive(client,auth,store,input);
+      await startLive(client,auth,store,String(item.id),1);await endLive(client,auth,store,String(item.id),2);
+    }
+    expect((await liveEntitlement(client,store)).usage).toMatchObject({used:4,remaining:0,limit:4});
+    const fifth=await saveLive(client,auth,store,input);
+    await expect(startLive(client,auth,store,String(fifth.id),1)).rejects.toMatchObject({code:'LIVE_QUOTA_EXHAUSTED'});
+  }));
+  it('replays start without duplicating usage and rejects a competing start',()=>context('manager',async()=>{
+    const {session,input}=await liveFixture(),id=String(session.id),run=async()=>({statusCode:200,body:await startLive(client,auth,store,id,1)});
+    const first=await withIdempotency(client,auth,'start-live-once','live.start',{id},run);
+    expect((await withIdempotency(client,auth,'start-live-once','live.start',{id},run)).body).toEqual(JSON.parse(JSON.stringify(first.body)));
+    expect((await liveEntitlement(client,store)).usage.used).toBe(1);
+    const other=await saveLive(client,auth,store,input);await expect(startLive(client,auth,store,String(other.id),1)).rejects.toMatchObject({statusCode:409});
+    await expect(saveLive(client,auth,store,input,id,2)).rejects.toMatchObject({statusCode:409});
+  }));
+  it('manages the playlist highlight with version checks and preserves the cart on end',()=>context('manager',async()=>{
+    const {session,v,cartId}=await liveFixture();const id=String(session.id);
+    await setCart(cartId,v.id,2,1);await startLive(client,auth,store,id,1);
+    await expect(highlightLive(client,auth,store,id,{expectedVersion:1,action:'HIDE'})).rejects.toMatchObject({code:'VERSION_CONFLICT'});
+    await highlightLive(client,auth,store,id,{expectedVersion:2,action:'HIDE'});expect((await publicLive(session.publicToken))?.featuredProduct).toBeNull();
+    await highlightLive(client,auth,store,id,{expectedVersion:3,action:'NEXT'});expect((await publicLive(session.publicToken))?.featuredProduct?.id).toBe(v.productId);
+    await expect(highlightLive(client,auth,store,id,{expectedVersion:4,action:'SELECT',productId:randomUUID()})).rejects.toMatchObject({statusCode:404});
+    await endLive(client,auth,store,id,4);expect((await publicLive(session.publicToken))?.status).toBe('ENDED');expect((await readCart(cartId))?.totalQuantity).toBe(2);
+    await expect(startLive(client,auth,store,id,5)).rejects.toMatchObject({statusCode:409});
+  }));
+  it('enforces duration even without a worker, then materializes expiration once',()=>context('manager',async()=>{
+    const {session}=await liveFixture(),id=String(session.id);await startLive(client,auth,store,id,1);
+    await pg.query("UPDATE commerce_live_sessions SET started_at=now()-interval '3 hours',deadline_at=now()-interval '1 hour' WHERE id=$1",[id]);
+    expect(await publicLive(session.publicToken)).toMatchObject({status:'ENDED',sequence:3,featuredProduct:null});
+    await expireLiveStore(client,store);await expireLiveStore(client,store);expect(await liveDetail(client,store,id)).toMatchObject({status:'ENDED',version:3});
+  }));
+  it('stops public commercial activity when the package is cancelled',()=>context('manager',async()=>{
+    const {session,subscriptionId}=await liveFixture();await startLive(client,auth,store,String(session.id),1);
+    await pg.query("SELECT set_config('app.platform_admin_id',$1,true)",[masterId]);await cancelSubscription(client,master,subscriptionId,1,'Cancelamento de teste');await pg.query("SELECT set_config('app.platform_admin_id','',true)");
+    expect((await publicLive(session.publicToken))?.status).toBe('ENDED');
+    await expect(saveLive(client,auth,store,{title:'Outra sessão',scheduledAt:null,productIds:[]})).rejects.toMatchObject({code:'LIVE_ADDON_REQUIRED'});
+  }));
+  it('cannot access sibling/foreign sessions or unpublished products',()=>context('manager',async()=>{
+    const {session,input,v}=await liveFixture();
+    for(const unit of [sibling,otherStore])await expect(saveLive(client,auth,unit,input)).rejects.toMatchObject({statusCode:404});
+    await expect(liveDetail(client,sibling,String(session.id))).rejects.toMatchObject({statusCode:404});
+    await pg.query('UPDATE commerce_products SET published=false WHERE id=$1',[v.productId]);
+    await expect(startLive(client,auth,store,String(session.id),1)).rejects.toMatchObject({statusCode:409});
+    await pg.query("SELECT set_config('app.user_id',$1,true)",[courier]);expect((await pg.query('SELECT id FROM commerce_live_sessions')).rows).toHaveLength(0);
+  }));
+  it('replays creation once, and excludes previous-month starts from the current quota',()=>context('manager',async()=>{
+    const {session,input}=await liveFixture();
+    const run=async()=>({statusCode:200,body:await saveLive(client,auth,store,input)});
+    const first=await withIdempotency(client,auth,'create-once','live.create',input,run);
+    const retry=await withIdempotency(client,auth,'create-once','live.create',input,run);
+    expect(retry.replayed).toBe(true);expect(retry.body).toEqual(JSON.parse(JSON.stringify(first.body)));
+    expect((await pg.query('SELECT id FROM commerce_live_sessions')).rows).toHaveLength(2);
+    await startLive(client,auth,store,String(session.id),1);await endLive(client,auth,store,String(session.id),2);
+    await pg.query("UPDATE commerce_live_sessions SET started_at=(date_trunc('month',now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo')-interval '2 hours' WHERE id=$1",[session.id]);
+    expect((await liveEntitlement(client,store)).usage).toMatchObject({used:0,remaining:4});
+  }));
+  it('uses ordered products, skips unpublished ones, and validates previous/next bounds',()=>context('manager',async()=>{
+    const {session,input,v}=await liveFixture();
+    const second=await saveProduct(client,auth,store,{...product,name:'Bolsa',sku:'BOLSA'}),third=await saveProduct(client,auth,store,{...product,name:'Calçado',sku:'CALCADO'});
+    await pg.query('UPDATE commerce_products SET published=true WHERE id=ANY($1::uuid[])',[[second!.id,third!.id]]);
+    await saveLive(client,auth,store,{...input,productIds:[v.productId,String(second!.id),String(third!.id)]},String(session.id),1);
+    await startLive(client,auth,store,String(session.id),2);
+    await pg.query('UPDATE commerce_products SET published=false WHERE id=$1',[second!.id]);
+    expect(await highlightLive(client,auth,store,String(session.id),{action:'NEXT',expectedVersion:3})).toMatchObject({currentProductId:third!.id,version:4});
+    await expect(highlightLive(client,auth,store,String(session.id),{action:'NEXT',expectedVersion:4})).rejects.toMatchObject({statusCode:409});
+    expect(await highlightLive(client,auth,store,String(session.id),{action:'PREVIOUS',expectedVersion:4})).toMatchObject({currentProductId:v.productId,version:5});
+  }));
+  it('limits duration to the earliest of package duration and subscription expiry',()=>context('manager',async()=>{
+    const {session,subscriptionId}=await liveFixture();
+    // Fixture owner changes expiry; runtime managers cannot alter contract terms.
+    await pg.exec('SET LOCAL ROLE NONE');await pg.query("UPDATE store_live_subscriptions SET ends_at=now()+interval '20 minutes' WHERE id=$1",[subscriptionId]);await pg.exec('SET LOCAL ROLE rastreia_runtime');
+    await startLive(client,auth,store,String(session.id),1);
+    const limit=(await pg.query<{minutes:number}>('SELECT extract(epoch FROM deadline_at-started_at)/60 AS minutes FROM commerce_live_sessions WHERE id=$1',[session.id])).rows[0]!;
+    expect(Number(limit.minutes)).toBe(20);
+  }));
   type TestCart={id:string;version:number;totalQuantity:number;subtotalCents:number;expired:boolean;storeAvailable:boolean;items:{variantId:string;quantity:number;maxQuantity:number;status:string;unitPriceCents:number;priceChanged:boolean;productName:string}[]};
   const ownerHash=cartTokenHash('a'.repeat(43)),otherHash=cartTokenHash('b'.repeat(43));
   const readCart=async(id:string,hash=ownerHash)=>(await pg.query<{data:TestCart|null}>('SELECT commerce_cart_read($1,$2) AS data',[id,hash])).rows[0]!.data;
+  type TestOrder={id:string;status:string;version:number;subtotalCents:number;items:Array<{sku:string;productName:string;preparationNotes:string;attributes:{size:string;color:string}}>};
+  async function checkoutFixture(food=false){
+    if(food)await pg.query("UPDATE companies SET business_activity='FOOD'");
+    const {id,v}=await cartFixture();
+    const profile=randomUUID();await pg.query("INSERT INTO customer_profiles(id,user_id,tenant_id,first_name,last_name,whatsapp_normalized,address_line,address_number,city,latitude,longitude) VALUES($1,$2,$3,'Cliente','Teste','34999999999','Rua Teste','10','Cidade',-18,-48)",[profile,manager,tenant]);
+    const version=(await pg.query<{stamp:string}>('SELECT updated_at::text AS stamp FROM customer_profiles WHERE id=$1',[profile])).rows[0]!.stamp;
+    await setCart(id,v.id,2,1);
+    const checkout=async(hash=ownerHash,cartVersion=2)=>(await pg.query<{data:TestOrder}>('SELECT commerce_checkout($1,$2,$3,$4,$5,$6,$7) AS data',[id,hash,cartVersion,requestHash({id,profile}),'DELIVERY',profile,version])).rows[0]!.data;
+    return {id,v,profile,checkout,profileVersion:version};
+  }
+  it('does not oversell the same stock across different customer carts',()=>context('manager',async()=>{
+    const {v,profile,profileVersion,checkout}=await checkoutFixture();
+    const second=(await pg.query<{id:string}>("SELECT commerce_cart_open('loja-carrinho',$1) AS id",[otherHash])).rows[0]!.id;
+    await pg.query('SELECT commerce_cart_change($1,$2,$3,9,1,$4,$5,false)',[second,otherHash,v.id,randomUUID(),requestHash({second})]);
+    await checkout();await pg.exec('SAVEPOINT competing_cart');
+    await expect(pg.query('SELECT commerce_checkout($1,$2,2,$3,\'DELIVERY\',$4,$5)',[second,otherHash,requestHash({second}),profile,profileVersion])).rejects.toMatchObject({code:'23514'});
+    await pg.exec('ROLLBACK TO SAVEPOINT competing_cart');
+    expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:2});expect((await pg.query('SELECT id FROM commerce_orders')).rows).toHaveLength(1);
+  }));
+  it('cancels a pending order without a stock debit and completes confirmed orders without another debit',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();const order=await checkout();
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CANCELLED','Cliente desistiu')",[order.id,store]);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:10,reserved:0});
+    expect((await pg.query("SELECT id FROM commerce_inventory_movements WHERE reason LIKE 'Pedido catálogo%'")).rows).toHaveLength(0);
+  }));
+  it('completes a confirmed order without a second inventory movement',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();const order=await checkout();
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:8,reserved:0});
+    expect((await pg.query("SELECT id FROM commerce_inventory_movements WHERE reason LIKE 'Pedido catálogo%'")).rows).toHaveLength(1);
+  }));
+  it('converts one cart exactly once, reserves stock and freezes the order snapshot',()=>context('manager',async()=>{
+    const {id,v,checkout}=await checkoutFixture();const order=await checkout();expect(await checkout()).toEqual(order);
+    expect(order).toMatchObject({status:'RECEIVED',subtotalCents:v.priceCents*2});
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:10,reserved:2});
+    await pg.query("UPDATE commerce_products SET name='Novo nome',price_cents=999 WHERE id=$1",[v.productId]);
+    expect((await pg.query<{data:TestOrder}>('SELECT commerce_order_read($1) AS data',[order.id])).rows[0]!.data).toEqual(order);
+    expect((await readCart(id)) as unknown).toMatchObject({checkoutOrderId:order.id});
+    await expect(setCart(id,v.id,3,2)).rejects.toMatchObject({code:'55000'});
+  }));
+  it('snapshots variants and preparation notes without reserving made-to-order stock',()=>context('manager',async()=>{
+    const {id,v,profile}=await checkoutFixture(true);
+    await pg.query("UPDATE commerce_variants SET attributes='{"+ '"size":"Grande","color":""' +"}' WHERE id=$1",[v.id]);
+    await pg.query('SELECT commerce_cart_change_with_notes($1,$2,$3,2,2,$4,$5,false,$6)',[id,ownerHash,v.id,randomUUID(),requestHash({notes:'sem alface'}),'Sem alface']);
+    const stamp=(await pg.query<{stamp:string}>('SELECT updated_at::text AS stamp FROM customer_profiles WHERE id=$1',[profile])).rows[0]!.stamp;
+    const order=(await pg.query<{data:TestOrder}>('SELECT commerce_checkout($1,$2,3,$3,\'PICKUP\',$4,$5) AS data',[id,ownerHash,requestHash({id}),profile,stamp])).rows[0]!.data;
+    expect(order.items[0]).toMatchObject({preparationNotes:'Sem alface',attributes:{size:'Grande',color:''}});
+    expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:0});
+    expect(JSON.stringify(order)).not.toMatch(/unit_cost|costCents|latitude|longitude|token_hash/);
+  }));
+  for(const failure of ['owner','version','price','stock','inactive','profile','password'] as const)it(`rejects checkout ${failure} without creating an order`,()=>context('manager',async()=>{
+    const {v,profile,checkout}=await checkoutFixture();
+    if(failure==='price')await pg.query('UPDATE commerce_variants SET price_cents=1 WHERE id=$1',[v.id]);
+    if(failure==='stock')await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:2,delta:-10,kind:'EXIT',reason:'Saldo consumido'});
+    if(failure==='inactive')await pg.query('UPDATE commerce_products SET active=false WHERE id=$1',[v.productId]);
+    if(failure==='profile')await pg.query("UPDATE customer_profiles SET updated_at=updated_at+interval '1 second' WHERE id=$1",[profile]);
+    if(failure==='password')await pg.query('UPDATE users SET must_change_password=true WHERE id=$1',[manager]);
+    await expect(checkout(failure==='owner'?otherHash:ownerHash,failure==='version'?99:2)).rejects.toMatchObject({code:failure==='owner'?'P0002':failure==='stock'?'23514':failure==='inactive'?'P0001':failure==='password'?'42501':'40001'});
+  }));
+  it('confirms stock once and restores it on cancellation with an audit trail',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();const order=await checkout();
+    const change=async(status:string,version:number)=>(await pg.query<{data:TestOrder}>('SELECT commerce_order_transition($1,$2,$3,$4,$5) AS data',[order.id,store,version,status,'Solicitação do cliente'])).rows[0]!.data;
+    expect((await change('CONFIRMED',1)).status).toBe('CONFIRMED');
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:8,reserved:0});
+    expect((await change('CANCELLED',2)).status).toBe('CANCELLED');
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:10,reserved:0});
+    await expect(change('CONFIRMED',3)).rejects.toMatchObject({code:'22023'});
+  }));
+  it('expires reservations and prevents late confirmation',()=>context('manager',async()=>{
+    const {v,checkout}=await checkoutFixture();const order=await checkout();
+    await pg.exec('RESET ROLE');await pg.query("UPDATE commerce_orders SET reservation_expires_at=now()-interval '1 second' WHERE id=$1",[order.id]);await pg.exec('SET LOCAL ROLE rastreia_runtime');
+    const result=(await pg.query<{data:TestOrder}>('SELECT commerce_order_transition($1,$2,1,\'CONFIRMED\',\'\') AS data',[order.id,store])).rows[0]!.data;
+    expect(result.status).toBe('EXPIRED');expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:0});
+  }));
+  it('hides customer orders from unrelated identities and store scopes',()=>context('manager',async()=>{
+    const {checkout}=await checkoutFixture();const order=await checkout();
+    await pg.query("SELECT set_config('app.user_id',$1,true),set_config('app.tenant_id',$2,true)",[courier,otherTenant]);
+    expect((await pg.query('SELECT * FROM commerce_orders')).rows).toHaveLength(0);
+    expect((await pg.query<{data:unknown}>('SELECT commerce_order_read($1) AS data',[order.id])).rows[0]!.data).toBeNull();
+    await expect(pg.query('SELECT commerce_order_transition($1,$2,1,\'CONFIRMED\',\'\')',[order.id,store])).rejects.toMatchObject({code:'42501'});
+  }));
+  it('uses company activity for new products without rewriting existing stock settings',()=>context('manager',async()=>{
+    const existing=await saveProduct(client,auth,store,product);
+    await pg.query("UPDATE companies SET business_activity='FOOD'");
+    const food=await saveProduct(client,auth,store,{...product,sku:'LANCHE'});
+    expect(food).toMatchObject({stockMode:'MADE_TO_ORDER',acceptsNotes:true});
+    const beverage=await saveProduct(client,auth,store,{...product,sku:'BEBIDA',stockMode:'STOCKED',acceptsNotes:false});
+    expect(beverage).toMatchObject({stockMode:'STOCKED',acceptsNotes:false});
+    expect(await saveProduct(client,auth,store,product,existing!.id as string,1)).toMatchObject({stockMode:'STOCKED',acceptsNotes:false});
+  }));
+  it('does not enable preparation fields for a non-food business',()=>context('manager',async()=>{
+    await expect(saveProduct(client,auth,store,{...product,acceptsNotes:true})).rejects.toMatchObject({statusCode:409});
+  }));
+  it('persists preparation notes with cart ownership, optimistic locking and idempotent retries',()=>context('manager',async()=>{
+    await pg.query("UPDATE companies SET business_activity='FOOD'");
+    const {id,v}=await cartFixture();
+    const write=async(notes:string|null,version:number,key=randomUUID(),hash=ownerHash)=>(await pg.query<{data:TestCart&{items:Array<{preparationNotes:string;acceptsNotes:boolean}>}}>(
+      'SELECT commerce_cart_change_with_notes($1,$2,$3,2,$4,$5,$6,false,$7) AS data',[id,hash,v.id,version,key,requestHash({notes,version}),notes])).rows[0]!.data;
+    const key=randomUUID();const saved=await write('Sem alface',1,key);
+    expect(saved.items[0]).toMatchObject({preparationNotes:'Sem alface',acceptsNotes:true});
+    expect(await write('Sem alface',1,key)).toEqual(saved);
+    const changed=await write('Molho à parte',2);expect(changed.version).toBe(3);
+    expect((await write('Sem alface',1,key)).items[0]?.preparationNotes).toBe('Molho à parte');
+    // Quantity-only clients and explicit refresh must preserve the saved notes.
+    expect((await write(null,3)).items[0]?.preparationNotes).toBe('Molho à parte');
+    const read=await setCart(id,null,null,4,randomUUID(),true);
+    expect(read.items[0]).toMatchObject({preparationNotes:'Molho à parte'});
+    expect(read.subtotalCents).toBe(v.priceCents*2);
+  }));
+  for(const kind of ['owner','disabled','length','version'] as const)it(`rejects invalid preparation notes: ${kind}`,()=>context('manager',async()=>{
+    if(kind!=='disabled')await pg.query("UPDATE companies SET business_activity='FOOD'");
+    const {id,v}=await cartFixture();
+    await expect(pg.query('SELECT commerce_cart_change_with_notes($1,$2,$3,1,$4,$5,$6,false,$7)',
+      [id,kind==='owner'?otherHash:ownerHash,v.id,kind==='version'?99:1,randomUUID(),requestHash({kind}),kind==='length'?'a'.repeat(501):'Sem alface']))
+      .rejects.toMatchObject({code:kind==='owner'?'P0002':kind==='version'?'40001':'22023'});
+  }));
   async function cartFixture(){
     const v=await stockFixture();await adjustInventory(client,auth,store,{variantId:v.id,expectedVersion:1,delta:10,kind:'ENTRY',reason:'Saldo do catálogo'});
     await saveStorefront(client,auth,store,{slug:'loja-carrinho',title:'Loja carrinho',description:'',published:true,expectedVersion:0});

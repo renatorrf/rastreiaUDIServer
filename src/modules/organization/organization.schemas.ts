@@ -4,6 +4,7 @@ import { storeSchema } from '../stores/store.routes.js';
 
 export const groupSchema=z.object({name:z.string().trim().min(2).max(160),slug:z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/),timezone:timezoneSchema.default('America/Sao_Paulo')});
 export const companySchema=z.object({name:z.string().trim().min(2).max(160),legalName:z.string().trim().min(2).max(200),
+  businessActivity:z.enum(['GENERAL','FASHION','FOOTWEAR','FOOD']).optional(),
   taxId:z.string().trim().refine(value=>value.replace(/[.\-/\s]/g,'').length===14&&validTaxId(value),'CNPJ inválido.')
     .transform(value=>value.toUpperCase().replace(/[.\-/\s]/g,''))});
 export const managerSchema=z.object({name:z.string().trim().min(2).max(160),email:z.string().trim().email().toLowerCase()});

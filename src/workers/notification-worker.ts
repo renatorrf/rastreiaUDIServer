@@ -13,6 +13,10 @@ import { processBillingBatch } from '../modules/billing/billing-worker.service.j
 import { processEmailBatch } from '../integrations/email/email.service.js';
 import { createIfoodWorker } from '../integrations/ifood/ifood.worker.js';
 import { maintainWorkdays } from '../modules/workdays/workday.service.js';
+import { expireCommerceOrders } from '../modules/commerce/order-maintenance.js';
+import { expireCommerceLives } from '../modules/commerce/live-maintenance.js';
+import { maintainLiveVideo } from '../modules/commerce/live-video.service.js';
+import { createIvsProvider } from '../integrations/ivs/ivs.provider.js';
 
 loadLocalEnv();
 const env = getEnv();
@@ -24,6 +28,7 @@ const redis = await createRedisRuntime(env, (level, message, details) => {
 });
 const workerId = `${process.pid}:${crypto.randomUUID()}`;
 const processIfood = createIfoodWorker(database,env);
+const ivsProvider = env.IVS_ENABLED ? createIvsProvider(env) : undefined;
 let running = false;
 
 async function tick(): Promise<void> {
@@ -32,6 +37,9 @@ async function tick(): Promise<void> {
   try {
     // Integration processing must not depend on SMTP or notification maintenance succeeding.
     try { await processIfood(); } catch { process.stderr.write('ifood worker: batch failed; inspect integration health\n'); }
+    try { await expireCommerceOrders(database); } catch { process.stderr.write('commerce worker: reservation expiry failed\n'); }
+    try { await expireCommerceLives(database); } catch { process.stderr.write('commerce worker: live expiry failed\n'); }
+    try { await maintainLiveVideo(database,env,ivsProvider); } catch { process.stderr.write('ivs worker: cleanup failed; retrying next tick\n'); }
     const releaseLease = await redis.acquireLease(
       'notification-worker:maintenance', Math.max(30_000, env.NOTIFICATION_WORKER_INTERVAL_MS * 3),
     );

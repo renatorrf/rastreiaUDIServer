@@ -155,7 +155,7 @@ export async function customerRoutes(
   }));
 
   app.get('/customer/orders', async request => withCustomerSession(database, env, request, async (client, scope) => ({
-    data: (await client.query(scope.identityUserId?'SELECT * FROM rastreia.customer_identity_orders()':'SELECT * FROM rastreia.customer_order_history($1)', scope.identityUserId?[]:[scope.customerId])).rows,
+    data: (await client.query<{data:unknown}>('SELECT data FROM rastreia.customer_orders_with_catalog($1)', [scope.identityUserId ? null : scope.customerId])).rows.map(row=>row.data),
   })));
 
   app.get('/customer/orders/:id/tracking', async (request, reply) => {
