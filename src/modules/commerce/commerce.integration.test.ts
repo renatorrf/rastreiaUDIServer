@@ -70,6 +70,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0061_commerce_live_sessions.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0062_commerce_live_video.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0063_commerce_finance.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0064_commerce_store_identity.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -785,6 +786,18 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
   }));
   it('denies adjustment by courier even through the database function',()=>context('courier',async()=>{
     await expect(pg.query("SELECT commerce_adjust_inventory($1,$2,1,1,'ENTRY','Tentativa inválida')",[randomUUID(),store])).rejects.toMatchObject({code:'42501'});
+  }));
+  it('scopes logo edits and only serves identity for an active published storefront',()=>context('manager',async()=>{
+    await saveStorefront(client,auth,store,{slug:'loja-identidade',title:'Loja identidade',description:'',published:true,expectedVersion:0});
+    await pg.query("UPDATE commerce_storefronts SET logo_key='private/store-logo.webp',logo_version=1 WHERE store_id=$1",[store]);
+    expect((await pg.query<{key:string}>("SELECT commerce_public_logo('loja-identidade') AS key")).rows[0]!.key).toBe('private/store-logo.webp');
+    const projection=(await pg.query<{data:Record<string,unknown>}>("SELECT commerce_public_store('loja-identidade') AS data")).rows[0]!.data;
+    expect(projection.logoVersion).toBe(1);expect(JSON.stringify(projection)).not.toContain('private/');
+    await pg.query("SELECT set_config('app.tenant_id',$1,true)",[otherTenant]);
+    expect((await pg.query("UPDATE commerce_storefronts SET logo_key='malicious' WHERE store_id=$1 RETURNING store_id",[store])).rows).toHaveLength(0);
+    await pg.query("SELECT set_config('app.tenant_id',$1,true)",[tenant]);
+    await pg.query('UPDATE commerce_storefronts SET published=false WHERE store_id=$1',[store]);
+    expect((await pg.query<{key:string|null}>("SELECT commerce_public_logo('loja-identidade') AS key")).rows[0]!.key).toBeNull();
   }));
   it('publishes only explicit active items and removes them immediately on unpublish',()=>context('manager',async()=>{
     const v=await stockFixture();const settings={slug:'loja-de-teste',title:'Catálogo teste',description:'Descrição pública',published:false,expectedVersion:0};

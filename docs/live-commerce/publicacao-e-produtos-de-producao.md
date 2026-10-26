@@ -30,3 +30,13 @@ A etapa de banco está concluída. Publicação do backend, frontend/Firebase e 
 - Evidência visual local: `rastreia-front/rastreiaApp/.data/commerce-evidence/publicacao-dois-passos.png`.
 
 Checkout e geração de pedidos permanecem fora desta etapa. Esta validação local não representa implantação nem teste do APK instalado.
+
+## Identidade por unidade — 26/10/2026
+
+- Migração **0064_commerce_store_identity.sql preparada, não aplicada ao banco compartilhado**. Executar pelo processo normal de migrations antes de implantar este backend; não altera os registros existentes nem exige cadastrar logos para lojas antigas.
+- Publicação recebe `hasLogo`/`logoVersion`; a chave privada do objeto não é devolvida no JSON. Catálogo e snapshot da live recebem somente a versão pública (zero quando não há logo).
+- Gestor autorizado à unidade envia JPEG/PNG/WebP de até 5 MB em `POST /commerce/stores/:storeId/storefront/logo?expectedVersion=N`, com `Idempotency-Key`; consulta autenticada por GET e remoção lógica por PATCH `{remove:true,expectedVersion:N}`. Reutiliza RLS, validação real/otimização de imagem, auditoria, storage e controle de versão do catálogo.
+- Endpoint público `/public/commerce/stores/:slug/logo` só serve imagem de catálogo publicado com unidade/empresa/tenant ativos. A remoção e a despublicação impedem novas consultas públicas; cache HTTP `no-store`.
+- A imagem é convertida para WebP de até 400 px sem recorte, preservando proporção. Não há configuração de logo no `.env`. Reutiliza o object storage já configurado para imagens de produtos; em hospedagem com disco efêmero, manter storage persistente configurado.
+- Remover/substituir a logo desvincula a imagem antiga, sem exclusão física automática. Objetos anteriores ficam para uma futura política de limpeza segura; não são acessíveis pelo endpoint de logo.
+- Validação isolada: 128 testes comerciais/segurança/SQL aprovados, build e lint dos arquivos alterados aprovados. Nenhuma escrita na base real, publicação ou configuração de AWS realizada.

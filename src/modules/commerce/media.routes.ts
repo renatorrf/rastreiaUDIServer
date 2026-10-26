@@ -41,6 +41,65 @@ async function parent(c:PoolClient,store:string,product:string,lock=false){
 }
 export async function mediaRoutes(app:FastifyInstance,db:Database,env:AppEnv,storage:ObjectStorage){
   const manager=[authenticate(env,db),requireRoles('TENANT_MANAGER')];
+  const logoPath='/commerce/stores/:storeId/storefront/logo';
+  const logoStore=z.object({storeId:z.uuid()});
+  const logoVersion=z.object({expectedVersion:z.coerce.number().int().positive()});
+  const logoParent=async(c:PoolClient,store:string,lock=false)=>{
+    await requireCommerceStore(c,store);
+    const row=(await c.query<{version:number;logo_key:string|null;logo_version:number}>(`SELECT version,logo_key,logo_version FROM commerce_storefronts WHERE store_id=$1${lock?' FOR UPDATE':''}`,[store])).rows[0];
+    if(!row)throw notFound('Salve a publicação do catálogo antes de enviar a logo.');return row;
+  };
+  app.get(logoPath,{preHandler:manager},async(req,reply)=>{
+    const {storeId}=logoStore.parse(req.params);
+    const row=await withTenantTransaction(db,req.auth,c=>logoParent(c,storeId));
+    if(!row.logo_key)throw notFound();
+    return reply.type('image/webp').header('Cache-Control','no-store').send(await storage.open(row.logo_key));
+  });
+  app.post(logoPath,{preHandler:manager,config:{rateLimit:{max:12,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {storeId}=logoStore.parse(req.params),input=logoVersion.parse(req.query);
+    const key=parseIdempotencyKey(req.headers['idempotency-key']);
+    await withTenantTransaction(db,req.auth,c=>logoParent(c,storeId));
+    const file=await req.file({limits:{files:1,fileSize:MAX_UPLOAD,fields:0,parts:1}});
+    if(!file)throw new AppError(422,'FILE_REQUIRED','Selecione a logo da loja.');
+    const optimized=await optimizeProductImage(await file.toBuffer());
+    const objectKey=`${req.auth.tenantId}/storefront/${storeId}/${randomUUID()}.webp`;
+    let wrote=false;
+    try {
+      const result=await withTenantTransaction(db,req.auth,c=>withIdempotency(c,req.auth,key,'commerce.storefront.logo.upload',{storeId,...input,checksum:optimized.checksum},async()=>{
+        const before=await logoParent(c,storeId,true);assertVersion(before.version,input.expectedVersion);
+        wrote=true;await storage.put(objectKey,optimized.thumbnail);
+        await c.query('UPDATE commerce_storefronts SET logo_key=$2,logo_version=logo_version+1,version=version+1,updated_at=now() WHERE store_id=$1',[storeId,objectKey]);
+        await writeAudit(c,{tenantId:req.auth.tenantId,actorUserId:req.auth.userId,action:'commerce.storefront.logo.uploaded',entityType:'store',entityId:storeId,afterData:{bytes:optimized.thumbnail.length}});
+        return {statusCode:200,body:{hasLogo:true,version:before.version+1,logoVersion:before.logo_version+1}};
+      }));
+      return reply.header('Idempotency-Replayed',String(result.replayed)).send(result.body);
+    } catch(error) {
+      // Do not remove a possibly committed object on a lost COMMIT response.
+      if(wrote)try {
+        const current=await withTenantTransaction(db,req.auth,c=>logoParent(c,storeId));
+        if(current.logo_key!==objectKey)await storage.remove(objectKey);
+      }catch{app.log.warn({storeId},'Store logo cleanup deferred');}
+      throw error;
+    }
+  });
+  app.patch(logoPath,{preHandler:manager},async(req,reply)=>{
+    const {storeId}=logoStore.parse(req.params),input=z.object({expectedVersion:z.number().int().positive(),remove:z.literal(true)}).strict().parse(req.body);
+    const result=await withTenantTransaction(db,req.auth,async c=>{
+      await requireCommerceStore(c,storeId);
+      return withIdempotency(c,req.auth,parseIdempotencyKey(req.headers['idempotency-key']),'commerce.storefront.logo.remove',{storeId,...input},async()=>{
+        const before=await logoParent(c,storeId,true);assertVersion(before.version,input.expectedVersion);
+        await c.query('UPDATE commerce_storefronts SET logo_key=NULL,logo_version=logo_version+1,version=version+1,updated_at=now() WHERE store_id=$1',[storeId]);
+        await writeAudit(c,{tenantId:req.auth.tenantId,actorUserId:req.auth.userId,action:'commerce.storefront.logo.removed',entityType:'store',entityId:storeId});
+        return {statusCode:200,body:{hasLogo:false,version:before.version+1,logoVersion:before.logo_version+1}};
+      });
+    });return reply.send(result.body);
+  });
+  app.get('/public/commerce/stores/:slug/logo',{config:{rateLimit:{max:180,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {slug}=z.object({slug:z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/)}).parse(req.params);
+    const key=await withRuntimeTransaction(db,async c=>(await c.query<{key:string|null}>('SELECT commerce_public_logo($1) AS key',[slug])).rows[0]?.key);
+    if(!key)throw notFound();
+    return reply.type('image/webp').header('Cache-Control','no-store').header('Cross-Origin-Resource-Policy','cross-origin').send(await storage.open(key));
+  });
   const path='/commerce/stores/:storeId/products/:productId/images';
   app.get(path,{preHandler:manager},req=>withTenantTransaction(db,req.auth,async c=>{
     const {storeId,productId}=ids.parse(req.params),p=await parent(c,storeId,productId);

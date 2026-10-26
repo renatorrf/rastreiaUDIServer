@@ -10,9 +10,9 @@ export const variantSelect=`SELECT v.id,v.product_id AS "productId",p.name AS "p
  v.price_cents AS "priceCents",v.cost_cents AS "costCents",v.minimum_stock AS "minimumStock",v.is_default AS "isDefault",v.active,v.version,
  b.on_hand AS "onHand",b.reserved,b.on_hand-b.reserved AS available,b.version AS "stockVersion"
  FROM commerce_variants v JOIN commerce_products p ON p.id=v.product_id JOIN commerce_inventory_balances b ON b.variant_id=v.id`;
-export const storefrontSelect=`SELECT slug,title,description,published,version FROM commerce_storefronts`;
+export const storefrontSelect=`SELECT slug,title,description,published,version,logo_key IS NOT NULL AS "hasLogo",logo_version AS "logoVersion" FROM commerce_storefronts`;
 export interface VariantRow {id:string;productId:string;productName:string;stockMode?:'STOCKED'|'MADE_TO_ORDER';name:string;sku:string;attributes:Record<string,string>;priceCents:number;costCents:number;minimumStock:number;isDefault:boolean;active:boolean;version:number;onHand:number;reserved:number;available:number;stockVersion:number}
-export interface StorefrontRow {slug:string;title:string;description:string;published:boolean;version:number}
+export interface StorefrontRow {slug:string;title:string;description:string;published:boolean;version:number;hasLogo:boolean;logoVersion:number}
 export function storefrontPublicUrl(base:string|undefined,slug:string):string|null {
   try { const url=new URL(`/loja/${encodeURIComponent(slug)}`,base);return ['https:','http:'].includes(url.protocol)?url.href:null; }catch{return null;}
 }

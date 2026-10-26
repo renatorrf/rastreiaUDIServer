@@ -27,12 +27,13 @@ describe('catalog import and media route boundaries',()=>{
   });
   afterEach(()=>app.close());
   it('requires authentication for imports and images',async()=>{
-    for(const url of [`${base}/imports`,imagePath,`${imagePath}/${id}/file`])expect((await app.inject({url})).statusCode).toBe(401);
+    for(const url of [`${base}/imports`,imagePath,`${imagePath}/${id}/file`,`${base}/storefront/logo`])expect((await app.inject({url})).statusCode).toBe(401);
   });
   it.each(['COURIER','STORE_OPERATOR'] as const)('denies %s before reading files or data',async role=>{
-    const h=await headers(role);for(const url of [`${base}/imports`,imagePath]){expect((await app.inject({url,headers:h})).statusCode).toBe(403);expect((await app.inject({method:'POST',url,headers:h})).statusCode).toBe(403);}expect(storage.put).not.toHaveBeenCalled();
+    const h=await headers(role);for(const url of [`${base}/imports`,imagePath,`${base}/storefront/logo`]){expect((await app.inject({url,headers:h})).statusCode).toBe(403);expect((await app.inject({method:'POST',url,headers:h})).statusCode).toBe(403);}expect(storage.put).not.toHaveBeenCalled();
   });
   it('checks store access before file processing and idempotent replay',async()=>{
+    expect((await app.inject({method:'POST',url:`${base}/storefront/logo?expectedVersion=1`,headers:await headers()})).statusCode).toBe(404);
     const h=await headers();expect((await app.inject({method:'POST',url:`${imagePath}?expectedVersion=1`,headers:h})).statusCode).toBe(404);
     expect((await app.inject({method:'POST',url:`${base}/imports`,headers:h})).statusCode).toBe(404);
     expect((await app.inject({method:'PATCH',url:imagePath,headers:h,payload:{expectedVersion:1,images:[]}})).statusCode).toBe(404);
@@ -60,5 +61,29 @@ describe('catalog import and media route boundaries',()=>{
     query.mockImplementation(async(sql:string)=>({rows:sql.includes('commerce_public_image')?[{key:'private/photo.webp'}]:[],rowCount:0}));storage.open.mockResolvedValue(Readable.from(Buffer.from('image')));
     const response=await app.inject({url:`/public/commerce/stores/loja-teste/images/${id}`});expect(response.statusCode).toBe(200);expect(response.headers['content-type']).toContain('image/webp');expect(response.headers['cache-control']).toBe('no-store');expect(response.headers['cross-origin-resource-policy']).toBe('cross-origin');expect(storage.open).toHaveBeenCalledWith('private/photo.webp');
     query.mockResolvedValue({rows:[{key:null}],rowCount:1});storage.open.mockClear();expect((await app.inject({url:`/public/commerce/stores/loja-teste/images/${id}`})).statusCode).toBe(404);expect(storage.open).not.toHaveBeenCalled();
+  });
+  it('uploads a normalized logo once and rejects stale versions and unknown remove fields',async()=>{
+    let requestHash='',responseBody:unknown=null;
+    query.mockImplementation(async(sql:string,values:unknown[]=[])=>{
+      if(sql.includes('INSERT INTO idempotency_keys'))requestHash=String(values[4]);
+      if(sql.includes('UPDATE idempotency_keys'))responseBody=JSON.parse(String(values[4]));
+      return {rows:sql.includes('tenant_session_is_current')?[{current:true}]:sql.includes('commerce_manage_store')?[{allowed:true}]:sql.includes('SELECT version,logo_key')?[{version:1,logo_key:null,logo_version:0}]:sql.includes('SELECT actor_user_id, request_hash')?[{actor_user_id:userId,request_hash:requestHash,response_status:responseBody?200:null,response_body:responseBody}]:[],rowCount:0};
+    });
+    storage.put.mockResolvedValue({objectUrl:'test'});
+    const bytes=await sharp({create:{width:600,height:300,channels:4,background:'#339966'}}).png().toBuffer();
+    const payload=Buffer.concat([Buffer.from('--logo\r\nContent-Disposition: form-data; name="file"; filename="logo.png"\r\nContent-Type: image/png\r\n\r\n'),bytes,Buffer.from('\r\n--logo--\r\n')]);
+    const request={method:'POST' as const,url:`${base}/storefront/logo?expectedVersion=1`,headers:{...await headers(),'content-type':'multipart/form-data; boundary=logo'},payload};
+    const first=await app.inject(request);expect(first.statusCode).toBe(200);expect(first.json()).toEqual({hasLogo:true,version:2,logoVersion:1});
+    expect((await app.inject(request)).json()).toEqual(first.json());expect(storage.put).toHaveBeenCalledTimes(1);
+    const meta=await sharp(storage.put.mock.calls[0]![1] as Buffer).metadata();expect(meta.format).toBe('webp');expect(meta.width).toBeLessThanOrEqual(400);
+    responseBody=null;expect((await app.inject({...request,url:`${base}/storefront/logo?expectedVersion=9`})).statusCode).toBe(409);
+    expect((await app.inject({method:'PATCH',url:`${base}/storefront/logo`,headers:await headers(),payload:{expectedVersion:1,remove:true,tenantId:'other'}})).statusCode).toBe(422);
+  });
+  it('serves the public logo through its scoped database projection only',async()=>{
+    query.mockResolvedValue({rows:[{key:null}],rowCount:1});
+    expect((await app.inject({url:'/public/commerce/stores/loja-teste/logo'})).statusCode).toBe(404);expect(storage.open).not.toHaveBeenCalled();
+    query.mockResolvedValue({rows:[{key:'private/logo.webp'}],rowCount:1});storage.open.mockResolvedValue(Readable.from(Buffer.from('image')));
+    const response=await app.inject({url:'/public/commerce/stores/loja-teste/logo'});expect(response.statusCode).toBe(200);expect(response.headers['cache-control']).toBe('no-store');
+    expect(query.mock.calls.some(([sql])=>String(sql).includes('commerce_public_logo'))).toBe(true);
   });
 });
