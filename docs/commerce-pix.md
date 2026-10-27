@@ -2,16 +2,21 @@
 
 ## Entrega desta etapa
 
-- Migração **0067_commerce_pix_checkout.sql**, preparada e testada em PostgreSQL isolado. Não aplicada ao banco compartilhado nesta etapa.
+- Migração **0067_commerce_pix_checkout.sql** aplicada em etapa anterior. A nova **0068_commerce_store_approval.sql** está preparada/testada isoladamente, ainda não aplicada ao banco compartilhado.
 - Taxa de entrega em centavos por unidade. Retirada custa zero. A taxa é congelada no pedido; mudanças posteriores não alteram um Pix emitido.
 - Pix desativado por padrão em todas as unidades. Pedidos legados continuam no fluxo a combinar.
-- Pix ativo: carrinho → reserva de estoque por 15 minutos → WAITING_PAYMENT → QR/Copia e Cola → confirmação bancária → RECEIVED na fila operacional → confirmação/conclusão da loja.
-- A loja não consegue aceitar um pedido Pix sem pagamento. Cliente não informa valor confiável nem consegue marcar o pagamento como recebido.
+- Novos pedidos (`flow_version=2`): cliente escolhe **Pix** (quando habilitado) ou **cartão na maquininha**, entrega/retirada → reserva por 10 minutos → RECEIVED aguardando aprovação da loja.
+- Aprovação com Pix: WAITING_PAYMENT → reserva renovada por 15 minutos → QR/Copia e Cola → confirmação bancária → CONFIRMED. Não há cobrança antes da aprovação nem despacho antes do pagamento.
+- Aprovação com cartão: CONFIRMED diretamente, com valor **a cobrar presencialmente**. Não coleta dados do cartão, não integra adquirente e não registra pagamento automaticamente.
+- Taxa fixa aplica-se também ao cartão, mesmo com Pix desabilitado; retirada não cobra taxa. Valor/método são congelados no checkout.
+- CONFIRMED + DELIVERY: worker cria uma entrega AWAITING_COURIER, vinculada por ID único, usando o serviço operacional existente. Loja pode atribuir individualmente ou inserir em rota. Cliente/WhatsApp/endereço e resumo dos itens/preparo são copiados; cobrança na maquininha ou Pix já pago aparecem nas instruções. Resumo operacional limitado a 1.000 caracteres; itens completos permanecem nos pedidos do catálogo.
+- CONFIRMED + PICKUP: loja marca READY_PICKUP e depois COMPLETED; nunca cria entrega/rota. Entregas vinculadas são concluídas pela operação, não por um atalho no pedido comercial.
+- Cliente não informa valor confiável nem consegue marcar pagamento como recebido. Estoque baixa uma vez na liberação operacional; confirmação e cancelamento congelam/restituem custos sem duplicação.
 - Caixa reconhece o recebimento confirmado; DRE gerencial reconhece produtos + taxa na conclusão, sem segunda baixa de caixa.
 
 ## Configuração e ordem de implantação
 
-1. Aplicar 0067 com a credencial de migração, antes de publicar API e worker. Não executar rollback removendo tabelas com cobranças reais.
+1. Aplicar 0068 com a credencial de migração (0067 já aplicada), antes de publicar API e worker. Não executar rollback removendo tabelas com cobranças reais.
 2. Publicar backend e worker da mesma versão, depois frontend. O frontend novo requer as rotas de cotação/pagamento. Worker deve ficar ativo, com execução contínua, inclusive quando não há navegador aberto.
 3. Conferir CNPJ no cadastro da **empresa**. Em **Integrações → BTG**, preencher Client ID, Client Secret e chave Pix da conta da empresa; salvar com senha do gestor e autorizar novamente. A alteração da configuração invalida a versão da autorização anterior.
 4. `BTG_ENABLED=true`, `BTG_REDIRECT_URI` e `BTG_ENCRYPTION_SECRET` estável na infraestrutura. Credenciais bancárias são por empresa; não há fallback do Client ID/Secret do `.env`.
@@ -20,6 +25,16 @@
 7. Fazer homologação controlada com o responsável: entrega e retirada, confirmação, expiração, interrupção de rede, reinício do worker e cancelamento de pedido pago. Testes locais não substituem essa validação. Nenhuma cobrança/autorização real foi feita nesta entrega.
 
 O callback OAuth ainda depende de cookies entre frontend e backend: Safari/bloqueio de cookies de terceiros pode exigir domínios same-site. Não retirar a validação de cookie para contornar esse requisito. Consulte `btg-authorization.md`.
+
+## Operação e recuperação da entrega automática (0068)
+
+- Worker de fulfillment independente do Pix/notificações: tick de 5 segundos, até 30 pedidos por lote, nova consulta da entrega a cada 15 segundos e retry em 30 segundos após falha. São intervalos de consulta, não garantia de latência. Requer worker publicado/ativo.
+- Ordem de locks: loja → pedido → leitura da entrega. Criação, histórico operacional, outbox e vínculo comercial são transacionais; crash antes do commit não deixa entrega órfã. Retentativa consulta o vínculo existente, sem criar outra entrega.
+- DELIVERED sincroniza COMPLETED e reconhecimento na DRE; CANCELLED sincroniza cancelamento e devolução de estoque uma vez. Falha/retorno da entrega não é tratado como venda concluída. Devoluções que exigem inspeção continuam no fluxo operacional de ocorrências.
+- Depois de vinculada, cancelar pela operação de Entregas/Rotas; antes do vínculo ou durante aprovação/Pix, cancelar em Pedidos do catálogo. O pedido comercial bloqueia cancelamento direto de uma entrega vinculada para não deixar rota ativa atendendo pedido cancelado.
+- Cartão concluído gera **conta a receber**, não caixa. O gestor deve conferir o comprovante e registrar a baixa no Financeiro. Pix bancário mantém recebimento único; concluir não baixa caixa outra vez.
+- Pedidos antigos (`flow_version=1`) preservam o contrato anterior. Nova API exige método explícito e versão da cotação; publicar frontend compatível junto com API/worker e orientar atualização de PWA antigo.
+- Validação local em PostgreSQL isolado e mocks do banco/serviço de entrega. Sem migração compartilhada, deploy ou transação BTG real nesta alteração. Homologar com loja e aparelho físico antes de liberar clientes.
 
 ## Confirmação, falhas e operação
 
@@ -50,6 +65,8 @@ Valores da API BTG são reais decimais; armazenamento/cálculo da aplicação us
 
 ## Verificações locais e pendências gerais
 
-169 testes selecionados de backend aprovados, incluindo integração SQL/RLS PGlite, orquestração de cobrança com persistência/banco simulados, isolamento de empresas e regressão BTG. Build e lint aprovados. Frontend: 34 testes direcionados e build/PWA; lint dos arquivos alterados aprovado. Lint global do frontend tem erro preexistente em `catalog-import.page.html:21` e build mantém avisos CommonJS IVS.
+Na revisão 0068: **202 testes selecionados de backend** aprovados (9 arquivos), incluindo integração SQL/RLS PGlite, aprovação, recusa, expiração, entrega idempotente, retirada, custo/estoque e caixa sem duplicação, isolamento e regressão BTG/entregas. Build e lint aprovados. Frontend: **31 testes direcionados**, build e integridade de 184 arquivos PWA aprovados; lint dos arquivos alterados aprovado. Lint global do frontend tem erro preexistente em `catalog-import.page.html:21` e build mantém avisos CommonJS IVS.
+
+Prévia local com componentes reais e API simulada: seleção de cartão/Pix, envio fictício e espera de aprovação verificados no navegador; larguras 320, 375, 390, 430, 768, 1024 e 1280 sem overflow horizontal. Console observado sem erros. Não substitui teste com BTG/aparelho físico e banco contratado.
 
 `npm audit --omit=dev` sinalizou 8 dependências de produção (6 high, 2 moderate) já presentes na cadeia do backend, incluindo Zod, Nodemailer, Engine.IO e gRPC. Nenhum alerta apontou o novo gerador QR. A atualização dessas dependências precisa de revisão/regressão antes da ativação produtiva; não foi executado `audit fix --force` nem alteradas versões fora deste escopo.

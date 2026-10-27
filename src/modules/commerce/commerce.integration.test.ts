@@ -20,6 +20,8 @@ import { cartRoutes,cartTokenHash } from './cart.routes.js';
 import { requestHash } from '../../shared/idempotency.js';
 import { applyImport,previewImport,loadImport,importOptionsSchema,type ImportOptions } from './catalog-import.service.js';
 import { saveLive,startLive,highlightLive,endLive,liveEntitlement,expireLiveStore,liveDetail } from './live.service.js';
+import { fulfillCommerceOrder } from './order-fulfillment.service.js';
+import type { createDeliveryInTransaction } from '../deliveries/delivery.service.js';
 
 describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
   const pg=new PGlite();
@@ -51,6 +53,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
       CREATE TABLE tenants(id uuid PRIMARY KEY,status text DEFAULT 'ACTIVE');
       CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
       CREATE TABLE stores(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,name text DEFAULT 'Loja teste',status text DEFAULT 'ACTIVE',UNIQUE(id,tenant_id));
+      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,status text);
       CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE',must_change_password boolean DEFAULT false);
       CREATE TABLE customer_profiles(id uuid PRIMARY KEY,user_id uuid,tenant_id uuid,first_name text,last_name text,whatsapp_normalized text,status text DEFAULT 'ACTIVE',updated_at timestamptz DEFAULT now(),address_line text,address_number text,complement text,neighborhood text,city text,state text,postal_code text,latitude float8,longitude float8);
       CREATE TABLE tenant_users(tenant_id uuid,user_id uuid,role text,status text DEFAULT 'ACTIVE');
@@ -72,6 +75,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0063_commerce_finance.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0064_commerce_store_identity.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0067_commerce_pix_checkout.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0068_commerce_store_approval.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -389,6 +393,96 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     return {...fixture,submit};
   }
   async function privileged(sql:string,values:unknown[]=[]){await pg.exec('RESET ROLE');const result=await pg.query(sql,values);await pg.exec('SET LOCAL ROLE rastreia_runtime');return result;}
+  async function approvalFixture(method='PIX',mode='DELIVERY',enabled=true){
+    const f=await checkoutFixture();await pg.query("UPDATE customer_profiles SET state='MG' WHERE id=$1",[f.profile]);
+    await pg.query('INSERT INTO commerce_payment_settings(store_id,tenant_id,enabled,delivery_fee_cents) VALUES($1,$2,$3,750)',[store,tenant,enabled]);
+    const submit=async()=> (await pg.query<{data:TestOrder&{deliveryId:string|null;paymentMethod:string;totalCents:number;payment:{status:string}|null}}>(
+      'SELECT commerce_checkout_for_approval($1,$2,2,$3,$4,$5,$6,1,$7) AS data',[f.id,ownerHash,requestHash({approval:f.id,method}),mode,f.profile,f.profileVersion,method])).rows[0]!.data;
+    return {...f,submit};
+  }
+  async function bridge(id:string){
+    const create=vi.fn<typeof createDeliveryInTransaction>().mockImplementation(async(c,a,input)=>{
+      const deliveryId=randomUUID();await c.query("INSERT INTO deliveries(id,tenant_id,store_id,status) VALUES($1,$2,$3,'AWAITING_COURIER')",[deliveryId,a.tenantId,input.storeId]);
+      return {id:deliveryId} as Awaited<ReturnType<typeof createDeliveryInTransaction>>;
+    });
+    await pg.exec('RESET ROLE');await fulfillCommerceOrder(client,id,create);await pg.exec('SET LOCAL ROLE rastreia_runtime');return create;
+  }
+  it('approval: checkout reserves inventory but creates no Pix before approval; replay is idempotent',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();expect(o).toMatchObject({status:'RECEIVED',flowVersion:2,paymentMethod:'PIX',payment:null,totalCents:5750});
+    expect(await f.submit()).toEqual(o);expect((await privileged('SELECT * FROM commerce_pix_payments WHERE order_id=$1',[o.id])).rows).toHaveLength(0);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({on_hand:10,reserved:2});
+    expect(await bridge(o.id)).not.toHaveBeenCalled();
+  }));
+  it('approval: Pix is generated only on approval and releases fulfillment only after a bank payment',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();
+    const approved=(await pg.query<{data:TestOrder}>("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','') AS data",[o.id,store])).rows[0]!.data;
+    expect(approved.status).toBe('WAITING_PAYMENT');expect(await bridge(o.id)).not.toHaveBeenCalled();
+    expect((await privileged('SELECT round(extract(epoch FROM expires_at-now())) AS seconds FROM commerce_pix_payments WHERE order_id=$1',[o.id])).rows[0]).toEqual({seconds:'900'});
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-approved-'+o.id]);
+    const create=await bridge(o.id);expect(create).toHaveBeenCalledOnce();expect(create.mock.calls[0]![2].deliveryInstructions).toContain('PIX PAGO');
+    expect(await bridge(o.id)).not.toHaveBeenCalled();await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-approved-'+o.id]);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({on_hand:8,reserved:0});
+  }));
+  it('approval: card includes fixed fee even with Pix disabled, creates one delivery and no payment settlement',()=>context('manager',async()=>{
+    const f=await approvalFixture('CARD_PRESENT','DELIVERY',false);const o=await f.submit();expect(o.totalCents).toBe(5750);
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);
+    const create=await bridge(o.id);expect(create).toHaveBeenCalledOnce();expect(create.mock.calls[0]![2]).toMatchObject({storeId:store,recipientWhatsapp:'34999999999',addressNumber:'10'});
+    expect(create.mock.calls[0]![2].deliveryInstructions).toContain('COBRAR NA MAQUININHA: R$ 57,50');expect(await bridge(o.id)).not.toHaveBeenCalled();
+    expect((await privileged('SELECT * FROM commerce_pix_payments WHERE order_id=$1',[o.id])).rows).toHaveLength(0);
+    expect((await financeReport(client,store,today(),today())).cash.incomingCents).toBe(0);
+  }));
+  it('approval: delivery completion syncs history and revenue once, leaving card as a receivable',()=>context('manager',async()=>{
+    const f=await approvalFixture('CARD_PRESENT');const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);await bridge(o.id);
+    await privileged("UPDATE deliveries SET status='DELIVERED' WHERE id=(SELECT delivery_id FROM commerce_orders WHERE id=$1)",[o.id]);await bridge(o.id);await bridge(o.id);
+    expect((await pg.query<{data:TestOrder}>('SELECT commerce_order_read($1) AS data',[o.id])).rows[0]!.data.status).toBe('COMPLETED');
+    const report=await financeReport(client,store,today(),today());expect(report.orders).toBe(1);expect(report.cash.incomingCents).toBe(0);expect(report.outstanding.receivableCents).toBe(5750);
+    expect((await pg.query('SELECT on_hand FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({on_hand:8});
+  }));
+  it('approval: pickup has no fee/delivery and requires ready before completion',()=>context('manager',async()=>{
+    const f=await approvalFixture('CARD_PRESENT','PICKUP');const o=await f.submit();expect(o.totalCents).toBe(5000);
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);expect(await bridge(o.id)).not.toHaveBeenCalled();
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'READY_PICKUP','')",[o.id,store]);
+    expect((await pg.query<{data:TestOrder}>("SELECT commerce_order_transition($1,$2,3,'COMPLETED','') AS data",[o.id,store])).rows[0]!.data.status).toBe('COMPLETED');
+  }));
+  it('approval: rejection releases stock without a charge',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CANCELLED','Sem disponibilidade')",[o.id,store]);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({on_hand:10,reserved:0});expect(await bridge(o.id)).not.toHaveBeenCalled();
+  }));
+  it('approval: timeout before approval creates no charge and releases stock',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();await privileged("UPDATE commerce_orders SET reservation_expires_at=now()-interval '1 minute' WHERE id=$1",[o.id]);await privileged('SELECT commerce_expire_store_orders($1)',[store]);
+    expect((await pg.query<{data:TestOrder}>('SELECT commerce_order_read($1) AS data',[o.id])).rows[0]!.data.status).toBe('EXPIRED');
+    expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({reserved:0});
+  }));
+  it('approval: cancellation while awaiting Pix never dispatches even if money arrives later',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);await pg.query("SELECT commerce_order_transition($1,$2,2,'CANCELLED','Cliente desistiu')",[o.id,store]);
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-rejected-'+o.id]);expect(await bridge(o.id)).not.toHaveBeenCalled();
+    expect((await privileged('SELECT status,refund_required FROM commerce_pix_payments WHERE order_id=$1',[o.id])).rows[0]).toMatchObject({status:'REVIEW_REQUIRED',refund_required:true});
+  }));
+  it('approval: cancelled delivery synchronizes cancellation and returns stock once',()=>context('manager',async()=>{
+    const f=await approvalFixture('CARD_PRESENT');const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);await bridge(o.id);
+    await privileged("UPDATE deliveries SET status='CANCELLED' WHERE id=(SELECT delivery_id FROM commerce_orders WHERE id=$1)",[o.id]);await bridge(o.id);await bridge(o.id);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[f.v.id])).rows[0]).toEqual({on_hand:10,reserved:0});
+  }));
+  it('approval: blocks completing delivery orders directly from commerce',()=>context('manager',async()=>{
+    const f=await approvalFixture('CARD_PRESENT');const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);
+    await expect(pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[o.id,store])).rejects.toMatchObject({code:'22023'});
+  }));
+  it('approval: another unit cannot approve',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();await expect(pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,sibling])).rejects.toMatchObject({code:'42501'});
+  }));
+  it('approval: cannot choose unavailable Pix',()=>context('manager',async()=>{
+    const f=await approvalFixture('PIX','DELIVERY',false);await expect(f.submit()).rejects.toMatchObject({code:'22023'});
+  }));
+  it('approval: private worker writers are never executable by runtime clients',()=>context('manager',async()=>{
+    expect((await pg.query("SELECT has_function_privilege('rastreia_runtime','commerce_apply_approved_state(uuid,text,text,uuid)','EXECUTE') AS allowed")).rows[0]).toEqual({allowed:false});
+    expect((await pg.query("SELECT has_function_privilege('rastreia_runtime','commerce_pix_settle(uuid,bigint,text,timestamptz)','EXECUTE') AS allowed")).rows[0]).toEqual({allowed:false});
+  }));
+  it('approval: completing a paid Pix delivery recognizes revenue without a second cash entry',()=>context('manager',async()=>{
+    const f=await approvalFixture();const o=await f.submit();await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store]);
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-completed-'+o.id]);await bridge(o.id);
+    await privileged("UPDATE deliveries SET status='DELIVERED' WHERE id=(SELECT delivery_id FROM commerce_orders WHERE id=$1)",[o.id]);await bridge(o.id);await bridge(o.id);
+    const report=await financeReport(client,store,today(),today());expect(report.orders).toBe(1);expect(report.cash.incomingCents).toBe(5750);expect(report.outstanding.receivableCents).toBe(0);
+  }));
   it('Pix snapshots fixed delivery fee, reserves 15 minutes and replays one order',()=>context('manager',async()=>{
     const {submit,v}=await pixFixture();const order=await submit();expect(order).toMatchObject({status:'WAITING_PAYMENT',subtotalCents:5000,deliveryFeeCents:750,totalCents:5750,payment:{status:'CREATED'}});
     expect(await submit()).toEqual(order);

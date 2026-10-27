@@ -15,6 +15,7 @@ import { createIfoodWorker } from '../integrations/ifood/ifood.worker.js';
 import { maintainWorkdays } from '../modules/workdays/workday.service.js';
 import { expireCommerceOrders } from '../modules/commerce/order-maintenance.js';
 import { maintainCommercePix } from '../modules/commerce/pix.service.js';
+import { maintainCommerceFulfillment } from '../modules/commerce/order-fulfillment.service.js';
 import { expireCommerceLives } from '../modules/commerce/live-maintenance.js';
 import { maintainLiveVideo } from '../modules/commerce/live-video.service.js';
 import { createIvsProvider } from '../integrations/ivs/ivs.provider.js';
@@ -96,11 +97,19 @@ function tickPix(){
 }
 const pixInterval=setInterval(tickPix,10000);
 tickPix();
+let fulfillmentWork:Promise<void>|undefined;
+function tickFulfillment(){
+  if(fulfillmentWork)return;
+  fulfillmentWork=maintainCommerceFulfillment(database).catch(()=>{process.stderr.write('commerce worker: fulfillment sync failed; retry scheduled\n');}).finally(()=>{fulfillmentWork=undefined;});
+}
+const fulfillmentInterval=setInterval(tickFulfillment,5000);
+tickFulfillment();
 
 async function close(): Promise<void> {
   clearInterval(interval);
   clearInterval(pixInterval);
-  await pixWork;
+  clearInterval(fulfillmentInterval);
+  await Promise.all([pixWork,fulfillmentWork]);
   await redis.close();
   await database.end();
   process.exit(0);

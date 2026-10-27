@@ -14,9 +14,9 @@ import { pixConnection,storePaymentSettings } from './pix.service.js';
 import QRCode from 'qrcode';
 import { writeAudit } from '../../shared/audit.js';
 
-export const checkoutSchema=z.object({expectedVersion:z.number().int().positive(),paymentVersion:z.number().int().nonnegative().optional(),fulfillment:z.enum(['DELIVERY','PICKUP']),
+export const checkoutSchema=z.object({expectedVersion:z.number().int().positive(),paymentVersion:z.number().int().nonnegative(),paymentMethod:z.enum(['PIX','CARD_PRESENT']),fulfillment:z.enum(['DELIVERY','PICKUP']),
   profileId:z.uuid(),profileVersion:z.string().min(10).max(80).refine(value=>!Number.isNaN(Date.parse(value)), 'Confira a versão do cadastro.'),consent:z.literal(true)}).strict();
-export const orderTransitionSchema=z.object({expectedVersion:z.number().int().positive(),status:z.enum(['CONFIRMED','CANCELLED','COMPLETED']),reason:z.string().trim().max(500).default('')}).strict()
+export const orderTransitionSchema=z.object({expectedVersion:z.number().int().positive(),status:z.enum(['CONFIRMED','CANCELLED','READY_PICKUP','COMPLETED']),reason:z.string().trim().max(500).default('')}).strict()
   .refine(v=>v.status!=='CANCELLED'||v.reason.length>=5,{message:'Informe o motivo do cancelamento.',path:['reason']});
 const pageSchema=z.object({limit:z.coerce.number().int().min(1).max(50).default(20),offset:z.coerce.number().int().min(0).max(10000).default(0)});
 function orderError(error:unknown):never {
@@ -45,8 +45,8 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     const {id}=z.object({id:z.uuid()}).parse(req.params),input=checkoutSchema.parse(req.body);
     parseIdempotencyKey(req.headers['idempotency-key']);const owner=cartTokenHash(req.headers['x-commerce-cart-token']);
     reply.header('Cache-Control','no-store');
-    try{return await identity(req,async c=>(await c.query('SELECT commerce_checkout_with_payment($1,$2,$3,$4,$5,$6,$7,$8) AS data',
-      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion,input.paymentVersion??null])).rows[0]!.data);}catch(e){return orderError(e);}
+    try{return await identity(req,async c=>(await c.query('SELECT commerce_checkout_for_approval($1,$2,$3,$4,$5,$6,$7,$8,$9) AS data',
+      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion,input.paymentVersion,input.paymentMethod])).rows[0]!.data);}catch(e){return orderError(e);}
   });
   app.get('/customer/commerce/carts/:id/payment-quote',async(req,reply)=>{
     const {id}=z.object({id:z.uuid()}).parse(req.params),owner=cartTokenHash(req.headers['x-commerce-cart-token']);reply.header('Cache-Control','no-store');
@@ -70,6 +70,13 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     });
   });
   const manager=[authenticate(env,db),requireRoles('TENANT_MANAGER')];
+  app.get('/commerce/stores/:storeId/orders/:id',{preHandler:manager},async(req,reply)=>{
+    const {storeId,id}=z.object({storeId:z.uuid(),id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
+    return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
+      const order=(await c.query('SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE store_id=$1 AND id=$2',[storeId,id])).rows[0]?.data;
+      if(!order)throw notFound('Pedido não encontrado.');return order;
+    });
+  });
   app.get('/commerce/stores/:storeId/payment-settings',{preHandler:manager},async(req,reply)=>{
     const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
     return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);return storePaymentSettings(c,storeId);});
@@ -93,7 +100,7 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);const f=pageSchema.extend({status:z.enum(['ACTIVE','ALL','PAYMENT_REVIEW']).default('ACTIVE')}).parse(req.query);
     reply.header('Cache-Control','no-store');return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
       return {data:(await c.query(`SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE store_id=$1 AND ($2='ALL'
-        OR ($2='ACTIVE' AND status IN ('RECEIVED','CONFIRMED'))
+        OR ($2='ACTIVE' AND status IN ('RECEIVED','WAITING_PAYMENT','CONFIRMED','READY_PICKUP'))
         OR ($2='PAYMENT_REVIEW' AND (commerce_order_read(id)#>>'{payment,status}'='REVIEW_REQUIRED' OR commerce_order_read(id)#>>'{payment,refundRequired}'='true')))
         ORDER BY created_at DESC,id LIMIT $3 OFFSET $4`,[storeId,f.status,f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)};
     });
