@@ -45,6 +45,12 @@ const envSchema = z.object({
   REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(43_200),
   COOKIE_SECURE: z.string().default('true').transform((value) => value === 'true'),
   GEOAPIFY_API_KEY: optionalSecret,
+  BTG_ENABLED: z.enum(['true', 'false']).default('false').transform(value => value === 'true'),
+  BTG_MODE: z.enum(['sandbox', 'production']).default('sandbox'),
+  BTG_CLIENT_ID: optionalSecret,
+  BTG_CLIENT_SECRET: optionalSecret,
+  BTG_REDIRECT_URI: optionalSecret,
+  BTG_ENCRYPTION_SECRET: optionalSecret,
   IVS_ENABLED: z.enum(['true','false']).default('false').transform(value => value === 'true'),
   IVS_REGION: z.string().trim().default('us-east-1'),
   IVS_CHANNELS_JSON: z.string().default('{}'),
@@ -114,6 +120,17 @@ const envSchema = z.object({
   BOOTSTRAP_PLATFORM_ADMIN_EMAIL: z.string().email().optional(),
   BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: z.string().min(12).optional(),
 }).superRefine((env, context) => {
+  if (env.BTG_ENABLED) {
+    if (env.BTG_ENCRYPTION_SECRET.length < 32) {
+      context.addIssue({ code: 'custom', path: ['BTG_ENCRYPTION_SECRET'], message: 'Configure a chave interna de criptografia BTG de pelo menos 32 caracteres. Credenciais são cadastradas por empresa.' });
+    }
+    try {
+      const url = new URL(env.BTG_REDIRECT_URI);
+      if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/integrations/btg/callback') throw new Error();
+    } catch {
+      context.addIssue({ code: 'custom', path: ['BTG_REDIRECT_URI'], message: 'Informe a URI HTTPS exata /integrations/btg/callback, sem query ou fragmento.' });
+    }
+  }
   if (env.IFOOD_ENABLED && env.IFOOD_MODE !== 'mock' && (!env.IFOOD_CLIENT_ID || !env.IFOOD_CLIENT_SECRET)) {
     context.addIssue({ code: 'custom', path: ['IFOOD_CLIENT_ID'], message: 'Configure as credenciais iFood no backend.' });
   }

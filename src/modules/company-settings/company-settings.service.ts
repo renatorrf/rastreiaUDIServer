@@ -1,16 +1,18 @@
 import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
 import { decryptPayload, encryptPayload } from '../../shared/encrypted-payload.js';
+import { AppError } from '../../shared/errors.js';
 
-export const companyProviders=['WEB_PUSH','WHATSAPP','SMS','IFOOD'] as const;
+export const companyProviders=['WEB_PUSH','WHATSAPP','SMS','IFOOD','BTG'] as const;
 export type CompanyProvider=(typeof companyProviders)[number];
 export interface ResolvedCompanyService {
-  provider:CompanyProvider;enabled:boolean;source:'company'|'environment';values:Record<string,string|boolean|number>;
+  provider:CompanyProvider;enabled:boolean;source:'company'|'environment';values:Record<string,string|boolean|number>;version?:number;
 }
 
 const encryptionKey=(env:AppEnv)=>env.MESSAGE_PAYLOAD_SECRET||env.TRACKING_TOKEN_PEPPER;
 
 function environmentValues(env:AppEnv,provider:CompanyProvider):ResolvedCompanyService {
+  if(provider==='BTG')return {provider,enabled:false,source:'company',version:0,values:{mode:'sandbox',clientId:''}};
   const values:Record<string,string|boolean|number>=provider==='WEB_PUSH'?{
     subject:env.PUSH_VAPID_SUBJECT,publicKey:env.PUSH_VAPID_PUBLIC_KEY,privateKey:env.PUSH_VAPID_PRIVATE_KEY,
     appUrl:env.PUSH_APP_URL||env.PUSH_DEFAULT_OPEN_URL,iconUrl:env.PUSH_NOTIFICATION_ICON_URL,badgeUrl:env.PUSH_NOTIFICATION_BADGE_URL,
@@ -35,12 +37,17 @@ export async function resolveCompanyService(client:Pick<PoolClient,'query'>,env:
   if(provider==='WEB_PUSH')return environmentValues(env,provider);
   const available=(await client.query<{available:boolean}>("SELECT to_regclass('rastreia.company_service_settings') IS NOT NULL AS available")).rows[0]?.available;
   if(!available)return environmentValues(env,provider);
-  const row=(await client.query<{enabled:boolean;public_config:Record<string,string|boolean|number>;secret_config_encrypted:string|null}>(
-    `SELECT enabled,public_config,secret_config_encrypted FROM rastreia.company_service_settings WHERE company_id=$1 AND provider=$2`,[companyId,provider])).rows[0];
+  const row=(await client.query<{enabled:boolean;public_config:Record<string,string|boolean|number>;secret_config_encrypted:string|null;version:number}>(
+    `SELECT enabled,public_config,secret_config_encrypted,version FROM rastreia.company_service_settings WHERE company_id=$1 AND provider=$2`,[companyId,provider])).rows[0];
   if(!row)return environmentValues(env,provider);
   let secrets:Record<string,string>={};
-  if(row.secret_config_encrypted)secrets=decryptPayload<Record<string,string>>(row.secret_config_encrypted,encryptionKey(env));
-  return {provider,enabled:row.enabled,source:'company',values:{...row.public_config,...secrets}};
+  if(row.secret_config_encrypted)secrets=decryptPayload<Record<string,string>>(row.secret_config_encrypted,provider==='BTG'?btgEncryptionKey(env):encryptionKey(env));
+  return {provider,enabled:row.enabled,source:'company',version:row.version,values:{...row.public_config,...secrets}};
+}
+
+function btgEncryptionKey(env:AppEnv){
+  if(!env.BTG_ENCRYPTION_SECRET || env.BTG_ENCRYPTION_SECRET.length<32)throw new AppError(503,'BTG_NOT_CONFIGURED','A chave interna BTG ainda não foi configurada no servidor.');
+  return env.BTG_ENCRYPTION_SECRET;
 }
 
 export function companyServiceConfigured(service:ResolvedCompanyService):boolean{
@@ -49,29 +56,33 @@ export function companyServiceConfigured(service:ResolvedCompanyService):boolean
   if(service.provider==='WEB_PUSH')return Boolean(value('subject')&&value('publicKey')&&value('privateKey'));
   if(service.provider==='WHATSAPP')return Boolean(value('phoneNumberId')&&value('accessToken')&&value('trackingTemplate'));
   if(service.provider==='SMS')return value('provider')==='webhook'&&Boolean(value('apiUrl')&&value('apiKey'));
+  if(service.provider==='BTG')return ['sandbox','production'].includes(value('mode'))&&Boolean(value('clientId')&&value('clientSecret'));
   return value('mode')==='mock'||Boolean(value('clientId')&&value('clientSecret'));
 }
 
 export async function saveCompanyService(client:PoolClient,env:AppEnv,input:{tenantId:string;companyId:string;provider:CompanyProvider;
   enabled:boolean;publicConfig:Record<string,string|boolean|number>;secrets:Record<string,string>;updatedBy:string}){
-  const existing=(await client.query<{secret_config_encrypted:string|null}>(`SELECT secret_config_encrypted FROM company_service_settings
+  const existing=(await client.query<{secret_config_encrypted:string|null;public_config:Record<string,unknown>}>(`SELECT secret_config_encrypted,public_config FROM company_service_settings
     WHERE company_id=$1 AND provider=$2 FOR UPDATE`,[input.companyId,input.provider])).rows[0];
   let retained:Record<string,string>={};
-  if(existing?.secret_config_encrypted)retained=decryptPayload<Record<string,string>>(existing.secret_config_encrypted,encryptionKey(env));
+  const key=input.provider==='BTG'?btgEncryptionKey(env):encryptionKey(env);
+  if(existing?.secret_config_encrypted)retained=decryptPayload<Record<string,string>>(existing.secret_config_encrypted,key);
+  if(input.provider==='BTG'&&existing&&(existing.public_config['mode']!==input.publicConfig['mode']||existing.public_config['clientId']!==input.publicConfig['clientId']))retained={};
   const merged={...retained,...Object.fromEntries(Object.entries(input.secrets).filter(([,value])=>value.trim().length>0))};
+  if(input.provider==='BTG'&&input.enabled&&(!input.publicConfig['clientId']||!merged['clientSecret']))throw new AppError(422,'BTG_CREDENTIALS_REQUIRED','Informe Client ID e Client Secret desta empresa. Ao trocar o ambiente ou Client ID, informe novamente o Client Secret.');
   const row=(await client.query<{id:string;updated_at:Date}>(`INSERT INTO company_service_settings
     (tenant_id,company_id,provider,enabled,public_config,secret_config_encrypted,updated_by)
     VALUES($1,$2,$3,$4,$5::jsonb,$6,$7)
     ON CONFLICT(company_id,provider) DO UPDATE SET enabled=EXCLUDED.enabled,public_config=EXCLUDED.public_config,
-      secret_config_encrypted=EXCLUDED.secret_config_encrypted,updated_by=EXCLUDED.updated_by,updated_at=now()
+      secret_config_encrypted=EXCLUDED.secret_config_encrypted,updated_by=EXCLUDED.updated_by,updated_at=now(),version=company_service_settings.version+1
     RETURNING id,updated_at`,[input.tenantId,input.companyId,input.provider,input.enabled,JSON.stringify(input.publicConfig),
-      Object.keys(merged).length?encryptPayload(merged,encryptionKey(env)):null,input.updatedBy])).rows[0]!;
+      Object.keys(merged).length?encryptPayload(merged,key):null,input.updatedBy])).rows[0]!;
   return {...row,provider:input.provider,enabled:input.enabled,configuredSecrets:Object.keys(merged)};
 }
 
 export function safeCompanyService(service:ResolvedCompanyService){
   const secretKeys:Record<CompanyProvider,string[]>={WEB_PUSH:['privateKey'],WHATSAPP:['accessToken','webhookVerifyToken','appSecret'],
-    SMS:['apiKey'],IFOOD:['clientSecret','webhookSecret']};
+    SMS:['apiKey'],IFOOD:['clientSecret','webhookSecret'],BTG:['clientSecret']};
   const publicConfig=Object.fromEntries(Object.entries(service.values).filter(([key])=>!secretKeys[service.provider].includes(key)));
   return {provider:service.provider,enabled:service.enabled,source:service.source,configured:companyServiceConfigured(service),publicConfig,
     configuredSecrets:secretKeys[service.provider].filter(key=>Boolean(String(service.values[key]??'').trim()))};

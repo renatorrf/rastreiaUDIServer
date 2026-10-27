@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { btgRoutes } from './integrations/btg/btg.routes.js';
 import { financeRoutes } from './modules/commerce/finance.routes.js';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
@@ -81,7 +82,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
         req(request) {
           const url = typeof request.url === 'string' && request.url.startsWith('/public/tracking/')
             ? '/public/tracking/[redacted]'
-            : request.url;
+            : typeof request.url === 'string' && request.url.startsWith('/integrations/btg/')
+              ? request.url.split('?')[0]! : request.url;
           return { method: request.method, url, host: request.host };
         },
       },
@@ -200,6 +202,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await shiftRoutes(app, database, env);
   await geoRoutes(app, env, database, geoapify, geoapify);
   await ifoodRoutes(app, database, env);
+  await btgRoutes(app, database, env);
 
   app.setNotFoundHandler(async (request, reply) => reply.header('X-Correlation-Id', request.id).status(404).send({
     error: { code: 'NOT_FOUND', message: 'Rota não encontrada.', correlation_id: request.id },

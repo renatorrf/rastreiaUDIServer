@@ -12,6 +12,8 @@ const id=z.object({id:z.uuid()});
 const provider=z.enum(companyProviders);
 const common=z.object({enabled:z.boolean(),provider});
 const schemas={
+  BTG:common.extend({provider:z.literal('BTG'),publicConfig:z.object({mode:z.enum(['sandbox','production']),clientId:z.string().trim().max(200)}),
+    secrets:z.object({clientSecret:z.string().trim().max(2048).default('')})}),
   WEB_PUSH:common.extend({provider:z.literal('WEB_PUSH'),publicConfig:z.object({subject:z.string().trim().max(240),publicKey:z.string().trim().max(512),
     appUrl:z.union([z.literal(''),z.url()]),iconUrl:z.union([z.literal(''),z.url()]),badgeUrl:z.union([z.literal(''),z.url()])}),secrets:z.object({privateKey:z.string().trim().max(512).default('')})}),
   WHATSAPP:common.extend({provider:z.literal('WHATSAPP'),publicConfig:z.object({phoneNumberId:z.string().trim().max(100),businessAccountId:z.string().trim().max(100),
@@ -23,15 +25,20 @@ const schemas={
     webhookEnabled:z.boolean(),requestTimeoutMs:z.number().int().min(1000).max(30000),clientId:z.string().trim().max(200)}),
     secrets:z.object({clientSecret:z.string().trim().max(2048).default(''),webhookSecret:z.string().trim().max(2048).default('')})}),
 };
-const input=z.discriminatedUnion('provider',[schemas.WHATSAPP.extend({confirmationPassword:confirmationPasswordSchema}),schemas.IFOOD.extend({confirmationPassword:confirmationPasswordSchema})]);
+const input=z.discriminatedUnion('provider',[schemas.WHATSAPP.extend({confirmationPassword:confirmationPasswordSchema}),schemas.IFOOD.extend({confirmationPassword:confirmationPasswordSchema}),schemas.BTG.extend({confirmationPassword:confirmationPasswordSchema})]);
 
 export async function companySettingsRoutes(app:FastifyInstance,database:Database,env:AppEnv){
+  const expose=(service:Parameters<typeof safeCompanyService>[0])=>{
+    const safe=safeCompanyService(service);
+    return service.provider==='BTG'?{...safe,publicConfig:{...safe.publicConfig,redirectUri:env.BTG_REDIRECT_URI,
+      serverReady:Boolean(env.BTG_ENABLED&&(env.BTG_ENCRYPTION_SECRET?.length??0)>=32&&env.BTG_REDIRECT_URI)}}:safe;
+  };
   const auth=authenticate(env,database);const manager=[auth,requireRoles('TENANT_MANAGER')];
   app.get('/company-service-settings',{preHandler:manager},request=>withTenantTransaction(database,request.auth,async client=>{
     const companies=(await client.query<{id:string;name:string}>(`SELECT DISTINCT company.id,company.name FROM companies company JOIN stores store ON store.company_id=company.id
       WHERE company.tenant_id=$1 AND store_in_scope(store.id) ORDER BY company.name`,[request.auth.tenantId])).rows;
-    return {data:await Promise.all(companies.map(async company=>({company,services:await Promise.all(companyProviders.filter(item=>item==='WHATSAPP'||item==='IFOOD').map(async item=>
-      safeCompanyService(await resolveCompanyService(client,env,company.id,item))))})))};
+    return {data:await Promise.all(companies.map(async company=>({company,services:await Promise.all(companyProviders.filter(item=>item==='WHATSAPP'||item==='IFOOD'||item==='BTG').map(async item=>
+      expose(await resolveCompanyService(client,env,company.id,item))))})))};
   }));
   app.put('/companies/:id/service-settings',{preHandler:[...manager,confirmManagerPassword(database)],config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async request=>{
     const companyId=id.parse(request.params).id;const value=input.parse(request.body);
@@ -51,7 +58,7 @@ export async function companySettingsRoutes(app:FastifyInstance,database:Databas
       }
       await writeAudit(client,{tenantId:request.auth.tenantId,actorUserId:request.auth.userId,action:'company.service-settings.updated',entityType:'company',entityId:companyId,
         beforeData:before,afterData:{provider:value.provider,enabled:value.enabled,publicConfig:value.publicConfig,configuredSecrets:saved.configuredSecrets}});
-      return safeCompanyService(await resolveCompanyService(client,env,companyId,value.provider));
+      return expose(await resolveCompanyService(client,env,companyId,value.provider));
     });
   });
 }
