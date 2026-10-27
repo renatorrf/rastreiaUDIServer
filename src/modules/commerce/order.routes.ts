@@ -9,8 +9,12 @@ import { AppError,conflict,notFound } from '../../shared/errors.js';
 import { parseIdempotencyKey,requestHash,withIdempotency } from '../../shared/idempotency.js';
 import { cartTokenHash,cartError } from './cart.routes.js';
 import { requireCommerceStore } from './commerce.service.js';
+import { confirmationPasswordSchema,confirmManagerPassword } from '../auth/confirm-manager-password.js';
+import { pixConnection,storePaymentSettings } from './pix.service.js';
+import QRCode from 'qrcode';
+import { writeAudit } from '../../shared/audit.js';
 
-export const checkoutSchema=z.object({expectedVersion:z.number().int().positive(),fulfillment:z.enum(['DELIVERY','PICKUP']),
+export const checkoutSchema=z.object({expectedVersion:z.number().int().positive(),paymentVersion:z.number().int().nonnegative().optional(),fulfillment:z.enum(['DELIVERY','PICKUP']),
   profileId:z.uuid(),profileVersion:z.string().min(10).max(80).refine(value=>!Number.isNaN(Date.parse(value)), 'Confira a versão do cadastro.'),consent:z.literal(true)}).strict();
 export const orderTransitionSchema=z.object({expectedVersion:z.number().int().positive(),status:z.enum(['CONFIRMED','CANCELLED','COMPLETED']),reason:z.string().trim().max(500).default('')}).strict()
   .refine(v=>v.status!=='CANCELLED'||v.reason.length>=5,{message:'Informe o motivo do cancelamento.',path:['reason']});
@@ -41,8 +45,19 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     const {id}=z.object({id:z.uuid()}).parse(req.params),input=checkoutSchema.parse(req.body);
     parseIdempotencyKey(req.headers['idempotency-key']);const owner=cartTokenHash(req.headers['x-commerce-cart-token']);
     reply.header('Cache-Control','no-store');
-    try{return await identity(req,async c=>(await c.query('SELECT commerce_checkout($1,$2,$3,$4,$5,$6,$7) AS data',
-      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion])).rows[0]!.data);}catch(e){return orderError(e);}
+    try{return await identity(req,async c=>(await c.query('SELECT commerce_checkout_with_payment($1,$2,$3,$4,$5,$6,$7,$8) AS data',
+      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion,input.paymentVersion??null])).rows[0]!.data);}catch(e){return orderError(e);}
+  });
+  app.get('/customer/commerce/carts/:id/payment-quote',async(req,reply)=>{
+    const {id}=z.object({id:z.uuid()}).parse(req.params),owner=cartTokenHash(req.headers['x-commerce-cart-token']);reply.header('Cache-Control','no-store');
+    return identity(req,async c=>{const data=(await c.query('SELECT commerce_payment_quote($1,$2) AS data',[id,owner])).rows[0]?.data;if(!data)throw notFound();return data;});
+  });
+  // Read-only polling. Only the worker can create/reconcile charges; browsers cannot assert payment.
+  app.get('/customer/commerce/orders/:id/payment',{config:{rateLimit:{max:30,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
+    const order=await identity(req,async c=>(await c.query('SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE id=$1 AND customer_user_id=current_user_id()',[id])).rows[0]?.data as {payment?:{copyPaste?:string};status:string}|undefined);
+    if(!order)throw notFound();
+    return {...order,qrDataUrl:order.payment?.copyPaste?await QRCode.toDataURL(order.payment.copyPaste,{width:320,margin:2,errorCorrectionLevel:'M'}):null};
   });
   app.get('/customer/commerce/orders',async(req,reply)=>{
     const f=pageSchema.parse(req.query);reply.header('Cache-Control','no-store');return identity(req,async c=>({data:(await c.query(
@@ -55,10 +70,32 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     });
   });
   const manager=[authenticate(env,db),requireRoles('TENANT_MANAGER')];
+  app.get('/commerce/stores/:storeId/payment-settings',{preHandler:manager},async(req,reply)=>{
+    const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
+    return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);return storePaymentSettings(c,storeId);});
+  });
+  app.post('/commerce/stores/:storeId/payment-settings',{preHandler:[...manager,confirmManagerPassword(db)],config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);
+    const input=z.object({enabled:z.boolean(),deliveryFeeCents:z.number().int().min(0).max(1000000),expectedVersion:z.number().int().nonnegative(),confirmationPassword:confirmationPasswordSchema}).strict().parse(req.body);
+    const companyId=await withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);return (await c.query<{company_id:string}>('SELECT company_id FROM stores WHERE id=$1',[storeId])).rows[0]!.company_id;});
+    if(input.enabled){const connection=await pixConnection(db,env,companyId);await connection.api.validateAccount();}
+    reply.header('Cache-Control','no-store');
+    return withTenantTransaction(db,req.auth,async c=>{
+      await requireCommerceStore(c,storeId);await c.query("SELECT pg_advisory_xact_lock(hashtext('commerce-orders:'||$1))",[storeId]);
+      const current=await storePaymentSettings(c,storeId);if(current.version!==input.expectedVersion)throw conflict('A taxa foi alterada. Recarregue e confira antes de salvar.');
+      await c.query(`INSERT INTO commerce_payment_settings(store_id,tenant_id,enabled,delivery_fee_cents) VALUES($1,$2,$3,$4)
+        ON CONFLICT(store_id) DO UPDATE SET enabled=EXCLUDED.enabled,delivery_fee_cents=EXCLUDED.delivery_fee_cents,version=commerce_payment_settings.version+1,updated_at=now()`,[storeId,req.auth.tenantId,input.enabled,input.deliveryFeeCents]);
+      await writeAudit(c,{tenantId:req.auth.tenantId,actorUserId:req.auth.userId,action:'commerce.payment-settings.updated',entityType:'store',entityId:storeId,beforeData:current,afterData:{enabled:input.enabled,deliveryFeeCents:input.deliveryFeeCents}});
+      return storePaymentSettings(c,storeId);
+    });
+  });
   app.get('/commerce/stores/:storeId/orders',{preHandler:manager},async(req,reply)=>{
-    const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);const f=pageSchema.extend({status:z.enum(['ACTIVE','ALL']).default('ACTIVE')}).parse(req.query);
+    const {storeId}=z.object({storeId:z.uuid()}).parse(req.params);const f=pageSchema.extend({status:z.enum(['ACTIVE','ALL','PAYMENT_REVIEW']).default('ACTIVE')}).parse(req.query);
     reply.header('Cache-Control','no-store');return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
-      return {data:(await c.query(`SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE store_id=$1 AND ($2='ALL' OR status IN ('RECEIVED','CONFIRMED')) ORDER BY created_at DESC,id LIMIT $3 OFFSET $4`,[storeId,f.status,f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)};
+      return {data:(await c.query(`SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE store_id=$1 AND ($2='ALL'
+        OR ($2='ACTIVE' AND status IN ('RECEIVED','CONFIRMED'))
+        OR ($2='PAYMENT_REVIEW' AND (commerce_order_read(id)#>>'{payment,status}'='REVIEW_REQUIRED' OR commerce_order_read(id)#>>'{payment,refundRequired}'='true')))
+        ORDER BY created_at DESC,id LIMIT $3 OFFSET $4`,[storeId,f.status,f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)};
     });
   });
   app.patch('/commerce/stores/:storeId/orders/:id',{preHandler:manager},async(req,reply)=>{

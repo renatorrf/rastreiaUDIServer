@@ -9,7 +9,7 @@ O código local não torna a URI operacional até publicar o backend no Cloud Ru
 
 ## Configuração e ativação
 
-1. Aplicar as migrações `0065_btg_authorization.sql` e `0066_btg_company_settings.sql` com a credencial de migração. A 0065 já foi aplicada ao banco configurado em etapa anterior; a 0066 está preparada, mas ainda não foi aplicada nesse banco.
+1. As migrações `0065_btg_authorization.sql` e `0066_btg_company_settings.sql` foram aplicadas em etapas anteriores. Para o novo checkout Pix, aplicar também `0067_commerce_pix_checkout.sql`, ainda pendente; consulte [Checkout Pix](commerce-pix.md).
 2. Cadastrar uma aplicação **confidencial** no ambiente BTG desejado; para operar empresas distintas, conferir o modelo Third-party e a homologação no BTG.
 3. No servidor, configurar apenas `BTG_REDIRECT_URI`, `BTG_ENCRYPTION_SECRET` (chave exclusiva e estável de pelo menos 32 caracteres) e a chave geral de habilitação. Guardar a chave criptográfica no Secret Manager, não no frontend, Git, chat ou links. Não rotacionar sem recriptografar credenciais e tokens existentes.
 4. Publicar o backend e habilitar `BTG_ENABLED=true` apenas após configurar. O padrão é desativado. O ambiente BTG é independente de `NODE_ENV`.
@@ -34,7 +34,9 @@ Troca: POST form-urlencoded ao `/oauth2/token`, autenticação Basic confidencia
 
 Tokens recebidos ficam criptografados (AES-GCM) em `btg_authorizations`, separados por tenant/empresa/ambiente, com RLS de gestor. Não são retornados ao frontend. Auditoria registra apenas empresa, ambiente e status. Resposta HTML estática com CSP, no-store, no-referrer e sem recursos externos; erros do provedor não são refletidos na página.
 
-## Limites desta etapa
+## Limites da etapa original de autorização
+
+Nota de evolução: a integração de emissão/consulta, renovação de tokens e conciliação foi adicionada posteriormente em [Checkout Pix](commerce-pix.md). Os itens abaixo descrevem a entrega original de autorização, não o novo fluxo. O status histórico PENDING_ACCOUNT_VALIDATION é preservado; a nova rotina valida acesso autenticado ao CNPJ antes de habilitar/emitir cobranças e confere os dados da resposta bancária.
 
 - O status é **PENDING_ACCOUNT_VALIDATION**: a autorização recebida não comprova que o CNPJ/conta escolhido no BTG corresponde à empresa local. Antes de movimentar cobranças, implementar e homologar essa verificação contra dados autenticados do provedor. Não decodificar um JWT sem verificar sua autenticidade para ativar uma conta.
 - Tela de configuração e botão de autorização disponíveis em Integrações → BTG. Não foram implementados emissão de cobranças, webhook Pix, renovação/revogação de tokens ou conciliação de pedidos. Não há chamada financeira nesta etapa.

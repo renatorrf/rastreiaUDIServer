@@ -12,7 +12,7 @@ const id=z.object({id:z.uuid()});
 const provider=z.enum(companyProviders);
 const common=z.object({enabled:z.boolean(),provider});
 const schemas={
-  BTG:common.extend({provider:z.literal('BTG'),publicConfig:z.object({mode:z.enum(['sandbox','production']),clientId:z.string().trim().max(200)}),
+  BTG:common.extend({provider:z.literal('BTG'),publicConfig:z.object({mode:z.enum(['sandbox','production']),clientId:z.string().trim().max(200),pixKey:z.string().trim().max(140).default('')}),
     secrets:z.object({clientSecret:z.string().trim().max(2048).default('')})}),
   WEB_PUSH:common.extend({provider:z.literal('WEB_PUSH'),publicConfig:z.object({subject:z.string().trim().max(240),publicKey:z.string().trim().max(512),
     appUrl:z.union([z.literal(''),z.url()]),iconUrl:z.union([z.literal(''),z.url()]),badgeUrl:z.union([z.literal(''),z.url()])}),secrets:z.object({privateKey:z.string().trim().max(512).default('')})}),

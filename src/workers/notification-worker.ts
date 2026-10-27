@@ -14,6 +14,7 @@ import { processEmailBatch } from '../integrations/email/email.service.js';
 import { createIfoodWorker } from '../integrations/ifood/ifood.worker.js';
 import { maintainWorkdays } from '../modules/workdays/workday.service.js';
 import { expireCommerceOrders } from '../modules/commerce/order-maintenance.js';
+import { maintainCommercePix } from '../modules/commerce/pix.service.js';
 import { expireCommerceLives } from '../modules/commerce/live-maintenance.js';
 import { maintainLiveVideo } from '../modules/commerce/live-video.service.js';
 import { createIvsProvider } from '../integrations/ivs/ivs.provider.js';
@@ -87,9 +88,19 @@ async function tick(): Promise<void> {
 
 const interval = setInterval(() => void tick(), env.NOTIFICATION_WORKER_INTERVAL_MS);
 void tick();
+// Bank timeouts must not block delivery notifications or reservation expiry.
+let pixWork:Promise<void>|undefined;
+function tickPix(){
+  if(pixWork)return;
+  pixWork=maintainCommercePix(database,env).catch(()=>{process.stderr.write('commerce worker: Pix reconciliation failed; retry scheduled\n');}).finally(()=>{pixWork=undefined;});
+}
+const pixInterval=setInterval(tickPix,10000);
+tickPix();
 
 async function close(): Promise<void> {
   clearInterval(interval);
+  clearInterval(pixInterval);
+  await pixWork;
   await redis.close();
   await database.end();
   process.exit(0);

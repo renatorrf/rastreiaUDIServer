@@ -71,6 +71,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0062_commerce_live_video.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0063_commerce_finance.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0064_commerce_store_identity.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0067_commerce_pix_checkout.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -380,6 +381,71 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     const checkout=async(hash=ownerHash,cartVersion=2)=>(await pg.query<{data:TestOrder}>('SELECT commerce_checkout($1,$2,$3,$4,$5,$6,$7) AS data',[id,hash,cartVersion,requestHash({id,profile}),'DELIVERY',profile,version])).rows[0]!.data;
     return {id,v,profile,checkout,profileVersion:version};
   }
+  async function pixFixture(mode='DELIVERY'){
+    const fixture=await checkoutFixture();
+    await pg.query('INSERT INTO commerce_payment_settings(store_id,tenant_id,enabled,delivery_fee_cents) VALUES($1,$2,true,750)',[store,tenant]);
+    const submit=async(paymentVersion:number|null=1)=>(await pg.query<{data:TestOrder&{totalCents:number;deliveryFeeCents:number;payment:{status:string;refundRequired:boolean}}}>(
+      'SELECT commerce_checkout_with_payment($1,$2,2,$3,$4,$5,$6,$7) AS data',[fixture.id,ownerHash,requestHash({pix:fixture.id}),mode,fixture.profile,fixture.profileVersion,paymentVersion])).rows[0]!.data;
+    return {...fixture,submit};
+  }
+  async function privileged(sql:string,values:unknown[]=[]){await pg.exec('RESET ROLE');const result=await pg.query(sql,values);await pg.exec('SET LOCAL ROLE rastreia_runtime');return result;}
+  it('Pix snapshots fixed delivery fee, reserves 15 minutes and replays one order',()=>context('manager',async()=>{
+    const {submit,v}=await pixFixture();const order=await submit();expect(order).toMatchObject({status:'WAITING_PAYMENT',subtotalCents:5000,deliveryFeeCents:750,totalCents:5750,payment:{status:'CREATED'}});
+    expect(await submit()).toEqual(order);
+    expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:2});
+    expect((await pg.query('SELECT extract(epoch FROM reservation_expires_at-created_at)::int AS seconds FROM commerce_orders WHERE id=$1',[order.id])).rows[0]).toEqual({seconds:900});
+    expect((await pg.query("SELECT id FROM commerce_orders WHERE status IN ('RECEIVED','CONFIRMED')")).rows).toHaveLength(0);
+  }));
+  it('Pix pickup has zero delivery fee',()=>context('manager',async()=>{const {submit}=await pixFixture('PICKUP');expect(await submit()).toMatchObject({deliveryFeeCents:0,totalCents:5000});}));
+  it('old checkout cannot bypass Pix and stale fee quote cannot create an order',()=>context('manager',async()=>{
+    const {checkout,submit}=await pixFixture();
+    for(const run of [()=>checkout(),()=>submit(0)]){await pg.exec('SAVEPOINT pix_check');await expect(run()).rejects.toMatchObject({code:'40001'});await pg.exec('ROLLBACK TO SAVEPOINT pix_check');}
+    expect((await pg.query('SELECT id FROM commerce_orders')).rows).toHaveLength(0);
+  }));
+  it('manager cannot accept unpaid Pix and runtime cannot mark payment paid',()=>context('manager',async()=>{
+    const {submit}=await pixFixture();const o=await submit();
+    await pg.exec('SAVEPOINT pix_check');await expect(pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[o.id,store])).rejects.toMatchObject({code:'22023'});await pg.exec('ROLLBACK TO SAVEPOINT pix_check');
+    await pg.exec('SAVEPOINT pix_check');await expect(pg.query('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-test-confirmation'])).rejects.toMatchObject({code:'42501'});await pg.exec('ROLLBACK TO SAVEPOINT pix_check');
+  }));
+  it('confirmed Pix is settled once, releases to store and is revenue only on completion',()=>context('manager',async()=>{
+    const {submit,v}=await pixFixture();const o=await submit();
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-confirmed-'+o.id]);
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-confirmed-'+o.id]);
+    const report=await financeReport(client,store,today(),today());expect(report.orders).toBe(0);expect(report.cash.incomingCents).toBe(5750);
+    expect((await pg.query('SELECT count(*)::int AS n FROM commerce_finance_settlements')).rows[0]).toEqual({n:1});
+    await privileged("UPDATE commerce_orders SET reservation_expires_at=now()-interval '1 hour' WHERE id=$1",[o.id]);
+    await privileged('SELECT commerce_expire_store_orders($1)',[store]);
+    expect((await pg.query('SELECT status FROM commerce_orders WHERE id=$1',[o.id])).rows[0]).toEqual({status:'RECEIVED'});
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'CONFIRMED','')",[o.id,store]);await pg.query("SELECT commerce_order_transition($1,$2,3,'COMPLETED','')",[o.id,store]);
+    expect((await pg.query('SELECT revenue_cents FROM commerce_finance_sales WHERE order_id=$1',[o.id])).rows[0]).toEqual({revenue_cents:5750});
+    expect((await financeReport(client,store,today(),today())).cash.incomingCents).toBe(5750);
+    expect((await pg.query('SELECT on_hand,reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({on_hand:8,reserved:0});
+  }));
+  it('expiry releases stock once and a late Pix never resurrects the order',()=>context('manager',async()=>{
+    const {submit,v}=await pixFixture();const o=await submit();
+    await privileged("UPDATE commerce_orders SET reservation_expires_at=now()-interval '1 minute' WHERE id=$1",[o.id]);
+    await privileged('SELECT commerce_expire_store_orders($1)',[store]);await privileged('SELECT commerce_expire_store_orders($1)',[store]);
+    await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-late-'+o.id]);
+    const detail=(await pg.query<{data:unknown}>('SELECT commerce_order_read($1) AS data',[o.id])).rows[0]!.data;
+    expect(detail).toMatchObject({status:'EXPIRED',payment:{status:'REVIEW_REQUIRED',refundRequired:true}});
+    expect((await pg.query('SELECT reserved FROM commerce_inventory_balances WHERE variant_id=$1',[v.id])).rows[0]).toEqual({reserved:0});
+    expect((await financeReport(client,store,today(),today())).cash.incomingCents).toBe(5750);
+  }));
+  it('paid cancellation flags refund without claiming to return money',()=>context('manager',async()=>{
+    const {submit}=await pixFixture();const o=await submit();await privileged('SELECT commerce_pix_settle($1,5750,$2,now())',[o.id,'E-cancel-'+o.id]);
+    const r=await pg.query<{data:unknown}>("SELECT commerce_order_transition($1,$2,2,'CANCELLED','Cliente desistiu') AS data",[o.id,store]);
+    expect(r.rows[0]!.data).toMatchObject({status:'CANCELLED',payment:{refundRequired:true}});
+    expect((await financeReport(client,store,today(),today())).cash.incomingCents).toBe(5750);
+    await expect(pg.query("UPDATE commerce_finance_settlements SET reversed_date=current_date,reverse_reason='Não houve devolução' ")).rejects.toMatchObject({code:'42501'});
+  }));
+  it('payment settings and DTO stay scoped to the store and customer',()=>context('manager',async()=>{
+    const {submit}=await pixFixture();const o=await submit();
+    await privileged("UPDATE commerce_pix_payments SET provider_id='private-bank-id',tax_id='12345678900000' WHERE order_id=$1",[o.id]);
+    const json=JSON.stringify((await pg.query('SELECT commerce_order_read($1) AS data',[o.id])).rows[0]);expect(json).not.toMatch(/private-bank-id|12345678900000/);
+    await pg.query("SELECT set_config('app.user_id',$1,true)",[courier]);
+    expect((await pg.query('SELECT * FROM commerce_payment_settings')).rows).toHaveLength(0);
+    expect((await pg.query('SELECT commerce_order_read($1) AS data',[o.id])).rows[0]).toEqual({data:null});
+  }));
   it('does not oversell the same stock across different customer carts',()=>context('manager',async()=>{
     const {v,profile,profileVersion,checkout}=await checkoutFixture();
     const second=(await pg.query<{id:string}>("SELECT commerce_cart_open('loja-carrinho',$1) AS id",[otherHash])).rows[0]!.id;
