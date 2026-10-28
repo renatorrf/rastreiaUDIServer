@@ -77,9 +77,10 @@ export class IfoodIntegrationService {
   async processEvents(limit=25): Promise<number> {
     await this.db.query(`UPDATE integration_events e SET integration_id=c.id,status='RECEIVED',attempts=0,next_attempt_at=now(),last_error=NULL
       FROM integration_connections c WHERE e.integration_id IS NULL AND c.merchant_id=e.merchant_id AND c.mode=e.mode AND c.provider=e.provider AND c.enabled`);
+    // Each company owns its mode; the sole bind parameter is the numeric batch limit.
     const pending = (await this.db.query<EventRow>(`SELECT e.* FROM integration_events e LEFT JOIN integration_connections c ON c.id=e.integration_id
-      WHERE e.mode=$1 AND e.status IN ('RECEIVED','ERROR') AND e.attempts<5 AND e.next_attempt_at<=now()
-      AND (c.id IS NULL OR (c.enabled AND (c.auto_import_orders OR EXISTS(SELECT 1 FROM external_orders o WHERE o.integration_id=c.id AND o.external_order_id=e.external_order_id)))) ORDER BY e.event_created_at,e.received_at LIMIT $1`,[limit])).rows;
+      WHERE e.provider='IFOOD' AND e.status IN ('RECEIVED','ERROR') AND e.attempts<5 AND e.next_attempt_at<=now()
+      AND (c.id IS NULL OR (c.provider=e.provider AND c.mode=e.mode AND c.enabled AND (c.auto_import_orders OR EXISTS(SELECT 1 FROM external_orders o WHERE o.integration_id=c.id AND o.external_order_id=e.external_order_id)))) ORDER BY e.event_created_at,e.received_at LIMIT $1`,[limit])).rows;
     for (const event of pending) {
       try {
         const status=externalStatus(event.event_code,event.event_full_code);
