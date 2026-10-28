@@ -7,7 +7,7 @@ import { authenticate, requireRoles } from '../../modules/auth/auth.guard.js';
 import { confirmManagerPassword } from '../../modules/auth/confirm-manager-password.js';
 import { AppError } from '../../shared/errors.js';
 import { createBtgStore, type BtgStore } from './btg.store.js';
-import { BTG_CALLBACK, authorizationUrl, btgConfig,btgInfrastructure,assertStateCredentials,stateAuth, createState, exchangeCode, hash, invalidAuthorization, readState } from './btg.oauth.js';
+import { BTG_CALLBACK, BtgTokenExchangeError, authorizationUrl, btgConfig,btgInfrastructure,assertStateCredentials,stateAuth, createState, exchangeCode, hash, invalidAuthorization, readState } from './btg.oauth.js';
 
 const cookieName = '__Secure-rastreia-btg';
 const cookieOptions = { path: BTG_CALLBACK, httpOnly:true, secure:true, sameSite:'none' as const, maxAge:600 };
@@ -38,26 +38,38 @@ export async function btgRoutes(app:FastifyInstance,database:Database,env:AppEnv
       .send({authorizationUrl:authorizationUrl(env,ticket,credentials),expiresAt:new Date(state.exp).toISOString()});
   });
   app.get(BTG_CALLBACK,{config:{rateLimit:{max:20,timeWindow:'1 minute'}}},async(request,reply)=>{
+    let stage:'configuration'|'state'|'browser'|'company'|'issuer'|'consume'|'exchange'|'save'='configuration';
     try {
       btgInfrastructure(env);
+      stage='state';
       const query=querySchema.parse(request.query);
       const state=readState(env,query.state),browser=request.cookies[cookieName];
+      stage='browser';
       if (!browser || !/^[A-Za-z0-9_-]{43}$/.test(browser)) throw invalidAuthorization();
+      stage='company';
       const credentials=await store.configuration(stateAuth(state),state.companyId);
       assertStateCredentials(state,credentials);
       const config=btgConfig(env,credentials);
+      stage='issuer';
       if (query.iss !== config.issuer || Boolean(query.code) === Boolean(query.error)) throw invalidAuthorization();
       // Commit one-time consumption before any network call; timeout/failure requires a fresh authorization.
+      stage='consume';
       if (!await store.consume(state,hash(query.state),hash(browser))) throw invalidAuthorization();
       reply.clearCookie(cookieName,cookieOptions);
-      if (query.error) return resultPage(reply,400,false);
+      if (query.error) {
+        request.log.warn({reason:'BTG_AUTHORIZATION_NOT_GRANTED',stage:'provider_response'},'BTG authorization not completed');
+        return resultPage(reply,400,false);
+      }
+      stage='exchange';
       const tokens=await exchangeCode(env,query.code!,credentials,dependencies.fetcher);
+      stage='save';
       await store.save(state,hash(query.state),tokens);
       return resultPage(reply,200,true);
     } catch(error) {
       const status=error instanceof AppError?error.statusCode:400;
       // Only fixed reason codes; never log callback URL, query, provider response or exception objects.
-      request.log.warn({reason:error instanceof AppError?error.code:'BTG_CALLBACK_REJECTED'},'BTG authorization not completed');
+      request.log.warn({reason:error instanceof AppError?error.code:'BTG_CALLBACK_REJECTED',stage,
+        ...(error instanceof BtgTokenExchangeError?{diagnostic:error.diagnostic}:{})},'BTG authorization not completed');
       return resultPage(reply,status,false);
     }
   });

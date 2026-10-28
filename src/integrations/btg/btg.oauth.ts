@@ -58,18 +58,60 @@ export const tokenSchema = z.object({ access_token: z.string().min(1).max(32768)
   refresh_token: z.string().min(1).max(32768), token_type: z.string().refine(v => v.toLowerCase() === 'bearer'),
   expires_in: z.number().int().positive().max(31_536_000), scope: z.string().max(4096) });
 export type BtgTokens = z.infer<typeof tokenSchema>;
+const oauthErrors = ['invalid_client','invalid_grant','invalid_scope','unauthorized_client',
+  'unsupported_grant_type','invalid_request','access_denied','server_error','temporarily_unavailable'] as const;
+const tokenFields = ['access_token','refresh_token','token_type','expires_in','scope'] as const;
+type TokenField = typeof tokenFields[number];
+export interface BtgExchangeDiagnostic {
+  category:'HTTP_REJECTED'|'TIMEOUT'|'NETWORK_ERROR'|'INVALID_JSON'|'INVALID_TOKEN_RESPONSE'|'MISSING_SCOPES';
+  httpStatus?:number;
+  oauthError?:typeof oauthErrors[number]|'unrecognized';
+  invalidFields?:TokenField[];
+  missingScopes?:Array<'openid'|'pix_cash_in'>;
+}
+/** Contains only locally defined codes/field names. Never retain provider bodies or error causes. */
+export class BtgTokenExchangeError extends AppError {
+  constructor(public readonly diagnostic:BtgExchangeDiagnostic){
+    super(502,'BTG_TOKEN_EXCHANGE_FAILED','Não foi possível concluir a autorização com o BTG. Inicie uma nova tentativa.');
+  }
+}
+function transportDiagnostic(error:unknown):BtgExchangeDiagnostic{
+  return {category:error instanceof Error && ['TimeoutError','AbortError'].includes(error.name)?'TIMEOUT':'NETWORK_ERROR'};
+}
 export async function exchangeCode(env: AppEnv, code: string, credentials:BtgCredentials,fetcher: typeof fetch = fetch): Promise<BtgTokens> {
+  const issuer=btgConfig(env,credentials).issuer;
+  let response:Response;
   try {
-    const response = await fetcher(`${btgConfig(env,credentials).issuer}/oauth2/token`, { method: 'POST', redirect: 'error',
+    response = await fetcher(`${issuer}/oauth2/token`, { method: 'POST', redirect: 'error',
       signal: AbortSignal.timeout(15_000), headers: { 'Content-Type': 'application/x-www-form-urlencoded',
         Authorization: `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString('base64')}` },
       body: new URLSearchParams({ code, redirect_uri: env.BTG_REDIRECT_URI, grant_type: 'authorization_code' }) });
-    if (!response.ok) throw new Error();
-    const tokens = tokenSchema.parse(await response.json());
-    if (!BTG_SCOPE.split(' ').every(scope => tokens.scope.split(' ').includes(scope))) throw new Error();
-    return tokens;
-  } catch {
-    // Never propagate provider bodies, authorization codes or tokens to logs/clients.
-    throw new AppError(502, 'BTG_TOKEN_EXCHANGE_FAILED', 'Não foi possível concluir a autorização com o BTG. Inicie uma nova tentativa.');
+  } catch(error) {
+    throw new BtgTokenExchangeError(transportDiagnostic(error));
   }
+  if(!response.ok){
+    let oauthError:BtgExchangeDiagnostic['oauthError']='unrecognized';
+    try{
+      const body:unknown=await response.json();
+      const value=body && typeof body==='object' && 'error' in body?body.error:undefined;
+      oauthError=oauthErrors.find(known=>known===value)??'unrecognized';
+    }catch{ /* HTTP status still identifies rejection if the body is absent/unreadable. */ }
+    throw new BtgTokenExchangeError({category:'HTTP_REJECTED',httpStatus:response.status,oauthError});
+  }
+  let body:unknown;
+  try{body=await response.json();}
+  catch(error){throw new BtgTokenExchangeError(error instanceof SyntaxError
+    ?{category:'INVALID_JSON',httpStatus:response.status}:transportDiagnostic(error));}
+  const parsed=tokenSchema.safeParse(body);
+  if(!parsed.success){
+    const invalidFields=tokenFields.filter(field=>parsed.error.issues.some(issue=>issue.path[0]===field));
+    throw new BtgTokenExchangeError({category:'INVALID_TOKEN_RESPONSE',httpStatus:response.status,invalidFields:[...invalidFields]});
+  }
+  const tokens=parsed.data;
+  const granted=tokens.scope.split(' ');
+  const missingScopes:Array<'openid'|'pix_cash_in'>=[];
+  if(!granted.includes('openid'))missingScopes.push('openid');
+  if(!granted.includes('empresas.btgpactual.com/pix-cash-in'))missingScopes.push('pix_cash_in');
+  if(missingScopes.length)throw new BtgTokenExchangeError({category:'MISSING_SCOPES',httpStatus:response.status,missingScopes});
+  return tokens;
 }

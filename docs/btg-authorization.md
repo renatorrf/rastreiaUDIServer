@@ -48,7 +48,25 @@ Nota de evolução: a integração de emissão/consulta, renovação de tokens e
 
 Build TypeScript e lint dos arquivos alterados aprovados. 59 testes selecionados aprovados (22 BTG, mais regressões de configuração, comunicações e iFood). A migração 0066 foi executada somente em PostgreSQL isolado PGlite, com checagem de RLS entre tenants/unidades, perfil, consumo único, expiração, criptografia, credenciais independentes e rejeição de callback após troca de configuração. Inclui GET/PUT de configuração via HTTP autenticado sem exposição dos segredos. Não foi usado o banco contratado nem houve autorização real no BTG nesta revisão. Os testes HTTP usam retorno simulado do provedor; homologação real e verificação dos cookies no navegador permanecem pendentes.
 
-## Referências oficiais consultadas
+## Diagnóstico seguro do callback (28/10/2026)
+
+Filtrar os logs da API por `jsonPayload.msg="BTG authorization not completed"`.
+O campo `stage` identifica a etapa (`configuration`, `state`, `browser`, `company`,
+`issuer`, `consume`, `provider_response`, `exchange` ou `save`). Em `exchange`,
+o diagnóstico diferencia:
+
+- `HTTP_REJECTED`: status HTTP e código OAuth de uma lista fechada; valores desconhecidos viram `unrecognized`.
+- `TIMEOUT` / `NETWORK_ERROR`: interrupção de transporte, sem texto da exceção.
+- `INVALID_JSON` / `INVALID_TOKEN_RESPONSE`: resposta incompatível; apenas nomes de campos conhecidos, nunca os valores.
+- `MISSING_SCOPES`: identifica somente `openid` e/ou `pix_cash_in` ausentes na resposta, mantendo a validação vigente.
+
+Nunca registrar corpo do provedor, `error_description`, URL do callback, código,
+state, cookies, credenciais ou tokens. A página pública continua genérica. O diagnóstico
+não realiza nova tentativa automática, não amplia escopos e não altera consentimentos.
+Após falha na troca, iniciar uma nova autorização no portal do gestor. Não reutilizar
+o callback consumido. Confirmar a causa com o novo diagnóstico antes de alterar credenciais.
+
+## Referências oficiais
 
 - [Authorization Code](https://developers.empresas.btgpactual.com/es/docs/starting-doc/Integrando/Fluxo%20de%20autoriza%C3%A7%C3%A3o/Authorization%20Code)
 - [Aplicações e URI de redirecionamento](https://developers.empresas.btgpactual.com/es/docs/starting-doc/Integrando/Aplicativos/Caracter%C3%ADsticas)

@@ -20,10 +20,10 @@ const auth:AuthContext={tenantId:randomUUID(),userId:randomUUID(),storeIds:[rand
 const tokens={access_token:'private-access-token',refresh_token:'private-refresh-token',token_type:'Bearer',expires_in:3600,scope:BTG_SCOPE};
 afterEach(()=>vi.restoreAllMocks());
 
-async function fixture(enabled=true){
+async function fixture(enabled=true,logs?:string[]){
   const store:BtgStore={configuration:vi.fn(async()=>credentials),begin:vi.fn(),consume:vi.fn(async()=>true),save:vi.fn()};
   const fetcher=vi.fn<typeof fetch>(async()=>new Response(JSON.stringify(tokens)));
-  const app=Fastify();await app.register(cookie);
+  const app=Fastify({logger:logs?{level:'warn',stream:{write:(line:string)=>{logs.push(line);}}}:false});await app.register(cookie);
   await btgRoutes(app,{} as Database,{...env,BTG_ENABLED:enabled},{store,fetcher});
   const {state,ticket}=createState(env,auth,randomUUID(),credentials);
   return {app,store,fetcher,state,ticket};
@@ -59,6 +59,66 @@ describe('BTG authorization security',()=>{
     for(const response of [new Response('private-provider-details',{status:400}),new Response(JSON.stringify({...tokens,scope:'openid'}))]){
       await expect(exchangeCode(env,'sensitive-code',credentials,async()=>response)).rejects.toMatchObject({code:'BTG_TOKEN_EXCHANGE_FAILED'});
     }
+  });
+  it.each([
+    [400,'invalid_grant'],[401,'invalid_client'],[403,'unauthorized_client'],[429,'temporarily_unavailable'],[500,'server_error'],
+  ])('diagnoses HTTP %i with only an allowlisted OAuth code',async(status,error)=>{
+    const fetcher=vi.fn<typeof fetch>(async()=>new Response(JSON.stringify({error,error_description:'private-code secret token',access_token:'sensitive'}),{status}));
+    await expect(exchangeCode(env,'private-code',credentials,fetcher)).rejects.toMatchObject({
+      code:'BTG_TOKEN_EXCHANGE_FAILED',diagnostic:{category:'HTTP_REJECTED',httpStatus:status,oauthError:error},
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+  it('never includes arbitrary provider errors, token values or schema input in diagnostics',async()=>{
+    for(const response of [
+      new Response(JSON.stringify({error:'private-token',error_description:'private-secret'}),{status:400}),
+      new Response(JSON.stringify({...tokens,expires_in:'private-token',refresh_token:null,extra:'private-secret'})),
+      new Response('private-token'),
+    ]){
+      const error=await exchangeCode(env,'private-code',credentials,async()=>response).catch((e:unknown)=>e);
+      const serialized=JSON.stringify(error);
+      for(const secret of ['private-token','private-secret','private-code',tokens.access_token])expect(serialized).not.toContain(secret);
+      expect(error).toMatchObject({code:'BTG_TOKEN_EXCHANGE_FAILED'});
+    }
+  });
+  it('distinguishes JSON, schema and scope validation failures without relaxing validation',async()=>{
+    await expect(exchangeCode(env,'code',credentials,async()=>new Response('not json'))).rejects.toMatchObject({diagnostic:{category:'INVALID_JSON',httpStatus:200}});
+    await expect(exchangeCode(env,'code',credentials,async()=>new Response(JSON.stringify({...tokens,expires_in:'3600',refresh_token:null})))).rejects.toMatchObject({
+      diagnostic:{category:'INVALID_TOKEN_RESPONSE',invalidFields:['refresh_token','expires_in']},
+    });
+    await expect(exchangeCode(env,'code',credentials,async()=>new Response(JSON.stringify({...tokens,scope:'openid'})))).rejects.toMatchObject({
+      diagnostic:{category:'MISSING_SCOPES',missingScopes:['pix_cash_in']},
+    });
+  });
+  it.each(['TimeoutError','AbortError','TypeError'])('classifies %s without logging exception text or retrying',async name=>{
+    const failure=new Error('private-url-with-code');failure.name=name;
+    const fetcher=vi.fn<typeof fetch>().mockRejectedValue(failure);
+    await expect(exchangeCode(env,'private-code',credentials,fetcher)).rejects.toMatchObject({
+      diagnostic:{category:name==='TypeError'?'NETWORK_ERROR':'TIMEOUT'},
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+  it('logs safe exchange details without exposing provider data in logs or HTML',async()=>{
+    const logs:string[]=[];const {app,fetcher,store,ticket}=await fixture(true,logs);
+    fetcher.mockResolvedValue(new Response(JSON.stringify({error:'invalid_client',error_description:'DO_NOT_LOG_THIS',access_token:tokens.access_token}),{status:401}));
+    try{
+      const result=await app.inject({url:`/integrations/btg/callback?${new URLSearchParams({state:ticket,iss:'https://id.sandbox.btgpactual.com',code:'private-code'}).toString()}`,headers:{cookie:`__Secure-rastreia-btg=${'x'.repeat(43)}`}});
+      expect(result.statusCode).toBe(502);expect(store.save).not.toHaveBeenCalled();
+      const record=logs.map(line=>JSON.parse(line) as Record<string,unknown>).find(line=>line['msg']==='BTG authorization not completed');
+      expect(record).toMatchObject({reason:'BTG_TOKEN_EXCHANGE_FAILED',stage:'exchange',diagnostic:{category:'HTTP_REJECTED',httpStatus:401,oauthError:'invalid_client'}});
+      for(const secret of ['DO_NOT_LOG_THIS','private-code',tokens.access_token,ticket,'x'.repeat(43),credentials.clientSecret]){
+        expect(logs.join('')).not.toContain(secret);expect(result.body).not.toContain(secret);
+      }
+      expect(result.body).not.toContain('invalid_client');
+    }finally{await app.close();}
+  });
+  it('identifies save failures without logging database exception details',async()=>{
+    const logs:string[]=[];const {app,store,ticket}=await fixture(true,logs);
+    vi.mocked(store.save).mockRejectedValue(new Error('private-database-details'));
+    try{
+      await app.inject({url:`/integrations/btg/callback?${new URLSearchParams({state:ticket,iss:'https://id.sandbox.btgpactual.com',code:'private-code'}).toString()}`,headers:{cookie:`__Secure-rastreia-btg=${'x'.repeat(43)}`}});
+      expect(logs.join('')).toContain('"stage":"save"');expect(logs.join('')).not.toContain('private-database-details');
+    }finally{await app.close();}
   });
   it('requires authentication to initiate and fails closed when disabled',async()=>{
     const {app,fetcher}=await fixture(false);
