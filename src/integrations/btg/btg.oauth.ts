@@ -4,6 +4,7 @@ import type { AppEnv } from '../../config/env.js';
 import type { AuthContext } from '../../modules/auth/auth.types.js';
 import { encryptPayload, decryptPayload } from '../../shared/encrypted-payload.js';
 import { AppError } from '../../shared/errors.js';
+import { rejectionDiagnostic, type BtgRejectionDiagnostic } from './btg.diagnostic.js';
 
 export const BTG_CALLBACK = '/integrations/btg/callback';
 export const BTG_SCOPE = 'openid empresas.btgpactual.com/pix-cash-in';
@@ -58,14 +59,11 @@ export const tokenSchema = z.object({ access_token: z.string().min(1).max(32768)
   refresh_token: z.string().min(1).max(32768), token_type: z.string().refine(v => v.toLowerCase() === 'bearer'),
   expires_in: z.number().int().positive().max(31_536_000), scope: z.string().max(4096) });
 export type BtgTokens = z.infer<typeof tokenSchema>;
-const oauthErrors = ['invalid_client','invalid_grant','invalid_scope','unauthorized_client',
-  'unsupported_grant_type','invalid_request','access_denied','server_error','temporarily_unavailable'] as const;
 const tokenFields = ['access_token','refresh_token','token_type','expires_in','scope'] as const;
 type TokenField = typeof tokenFields[number];
-export interface BtgExchangeDiagnostic {
+export interface BtgExchangeDiagnostic extends Partial<BtgRejectionDiagnostic> {
   category:'HTTP_REJECTED'|'TIMEOUT'|'NETWORK_ERROR'|'INVALID_JSON'|'INVALID_TOKEN_RESPONSE'|'MISSING_SCOPES';
   httpStatus?:number;
-  oauthError?:typeof oauthErrors[number]|'unrecognized';
   invalidFields?:TokenField[];
   missingScopes?:Array<'openid'|'pix_cash_in'>;
 }
@@ -90,13 +88,7 @@ export async function exchangeCode(env: AppEnv, code: string, credentials:BtgCre
     throw new BtgTokenExchangeError(transportDiagnostic(error));
   }
   if(!response.ok){
-    let oauthError:BtgExchangeDiagnostic['oauthError']='unrecognized';
-    try{
-      const body:unknown=await response.json();
-      const value=body && typeof body==='object' && 'error' in body?body.error:undefined;
-      oauthError=oauthErrors.find(known=>known===value)??'unrecognized';
-    }catch{ /* HTTP status still identifies rejection if the body is absent/unreadable. */ }
-    throw new BtgTokenExchangeError({category:'HTTP_REJECTED',httpStatus:response.status,oauthError});
+    throw new BtgTokenExchangeError({category:'HTTP_REJECTED',httpStatus:response.status,...await rejectionDiagnostic(response)});
   }
   let body:unknown;
   try{body=await response.json();}

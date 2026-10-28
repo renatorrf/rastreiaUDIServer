@@ -66,6 +66,17 @@ não realiza nova tentativa automática, não amplia escopos e não altera conse
 Após falha na troca, iniciar uma nova autorização no portal do gestor. Não reutilizar
 o callback consumido. Confirmar a causa com o novo diagnóstico antes de alterar credenciais.
 
+O refinamento do diagnóstico também informa `responseMedia` e `bodyFormat` por enums
+locais, reconhece códigos OAuth conhecidos em `error`, `code`, `errorCode`, objetos
+aninhados e listas de erros, JSON, formulário ou texto. `errorFields` lista somente
+nomes predefinidos; nunca nomes arbitrários, códigos desconhecidos ou identificadores.
+`reasonHints` indica assuntos mencionados (credenciais, código de autorização,
+redirect URI, PKCE, grant type ou scope), **não comprova a causa da recusa**.
+Não registrar mensagens/descrições brutas, headers, cookies ou IDs do provedor.
+A leitura do corpo de erro é limitada a 16 KiB, profundidade 4 e 8 itens por lista.
+`too_large` e `unreadable` preservam o status HTTP sem tentar novamente o código.
+Este refinamento não altera a requisição OAuth, credenciais, escopos ou consentimento.
+
 ## Referências oficiais
 
 - [Authorization Code](https://developers.empresas.btgpactual.com/es/docs/starting-doc/Integrando/Fluxo%20de%20autoriza%C3%A7%C3%A3o/Authorization%20Code)

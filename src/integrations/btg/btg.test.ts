@@ -100,12 +100,12 @@ describe('BTG authorization security',()=>{
   });
   it('logs safe exchange details without exposing provider data in logs or HTML',async()=>{
     const logs:string[]=[];const {app,fetcher,store,ticket}=await fixture(true,logs);
-    fetcher.mockResolvedValue(new Response(JSON.stringify({error:'invalid_client',error_description:'DO_NOT_LOG_THIS',access_token:tokens.access_token}),{status:401}));
+    fetcher.mockResolvedValue(new Response(JSON.stringify({error:{code:'invalid_client',message:'DO_NOT_LOG_THIS'},access_token:tokens.access_token}),{status:401,headers:{'content-type':'application/json'}}));
     try{
       const result=await app.inject({url:`/integrations/btg/callback?${new URLSearchParams({state:ticket,iss:'https://id.sandbox.btgpactual.com',code:'private-code'}).toString()}`,headers:{cookie:`__Secure-rastreia-btg=${'x'.repeat(43)}`}});
       expect(result.statusCode).toBe(502);expect(store.save).not.toHaveBeenCalled();
       const record=logs.map(line=>JSON.parse(line) as Record<string,unknown>).find(line=>line['msg']==='BTG authorization not completed');
-      expect(record).toMatchObject({reason:'BTG_TOKEN_EXCHANGE_FAILED',stage:'exchange',diagnostic:{category:'HTTP_REJECTED',httpStatus:401,oauthError:'invalid_client'}});
+      expect(record).toMatchObject({reason:'BTG_TOKEN_EXCHANGE_FAILED',stage:'exchange',diagnostic:{category:'HTTP_REJECTED',httpStatus:401,oauthError:'invalid_client',responseMedia:'json',bodyFormat:'json_object',errorFields:['error','code','message']}});
       for(const secret of ['DO_NOT_LOG_THIS','private-code',tokens.access_token,ticket,'x'.repeat(43),credentials.clientSecret]){
         expect(logs.join('')).not.toContain(secret);expect(result.body).not.toContain(secret);
       }
