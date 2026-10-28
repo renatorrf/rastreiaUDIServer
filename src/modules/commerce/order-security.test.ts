@@ -12,7 +12,7 @@ vi.mock('../auth/identity.service.js',()=>({
 describe('checkout HTTP boundary',()=>{
   const query=vi.fn(),db={connect:async()=>({query,release:()=>{}})} as unknown as Database;
   let app:FastifyInstance;const id=randomUUID(),headers={authorization:'Bearer valid-customer','x-commerce-cart-token':'a'.repeat(43),'idempotency-key':'checkout-test-key'};
-  const payload={expectedVersion:2,profileId:randomUUID(),profileVersion:'2026-10-23 12:34:56.123456+00',fulfillment:'DELIVERY',consent:true};
+  const payload={expectedVersion:2,paymentVersion:1,paymentMethod:'PIX',profileId:randomUUID(),profileVersion:'2026-10-23 12:34:56.123456+00',fulfillment:'DELIVERY',consent:true};
   beforeEach(async()=>{query.mockReset();query.mockResolvedValue({rows:[{must_change_password:false,data:{id,status:'RECEIVED'}}],rowCount:1});app=Fastify();app.setErrorHandler((error,_req,reply)=>{const e=error as Error&{statusCode?:number;code?:string};reply.code(error instanceof ZodError?422:e.statusCode??500).send({error:{code:e.code,message:e.message}});});await orderRoutes(app,db,{} as AppEnv);await app.ready();});
   afterEach(()=>app.close());
   const request=()=>({method:'POST' as const,url:`/customer/commerce/carts/${id}/checkout`,headers,payload});
@@ -38,5 +38,12 @@ describe('checkout HTTP boundary',()=>{
   it('requires password replacement before submitting and protects private history',async()=>{
     query.mockResolvedValue({rows:[{must_change_password:true}],rowCount:1});expect((await app.inject(request())).statusCode).toBe(409);
     expect((await app.inject({url:'/customer/commerce/orders'})).statusCode).toBe(401);
+  });
+  it.each(['/customer/commerce/orders',`/customer/commerce/orders/${id}`,`/customer/commerce/orders/${id}/payment`])('returns a server timestamp without removing customer scope: %s',async url=>{
+    const serverTime='2026-10-28T01:00:00.000Z';
+    query.mockImplementation(async(sql:string)=>({rows:[{must_change_password:false,data:{id,status:'RECEIVED',...(sql.includes('clock_timestamp()')?{serverTime}:{})}}],rowCount:1}));
+    const response=await app.inject({url,headers:{authorization:headers.authorization}});expect(response.statusCode).toBe(200);expect(response.headers['cache-control']).toBe('no-store');
+    const body=response.json();expect((Array.isArray(body.data)?body.data[0]:body).serverTime).toBe(serverTime);
+    expect(query.mock.calls.some(([sql])=>String(sql).includes('clock_timestamp()')&&String(sql).includes('customer_user_id=current_user_id()'))).toBe(true);
   });
 });

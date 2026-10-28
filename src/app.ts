@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { btgRoutes } from './integrations/btg/btg.routes.js';
+import { btgWebhookRoutes } from './integrations/btg/btg.webhook.js';
 import { financeRoutes } from './modules/commerce/finance.routes.js';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
@@ -203,6 +204,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await geoRoutes(app, env, database, geoapify, geoapify);
   await ifoodRoutes(app, database, env);
   await btgRoutes(app, database, env);
+  await btgWebhookRoutes(app, database, env);
 
   app.setNotFoundHandler(async (request, reply) => reply.header('X-Correlation-Id', request.id).status(404).send({
     error: { code: 'NOT_FOUND', message: 'Rota não encontrada.', correlation_id: request.id },

@@ -2,18 +2,19 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppEnv } from '../../config/env.js';
 import { withTenantTransaction,type Database } from '../../database/pool.js';
-import { forbidden,notFound } from '../../shared/errors.js';
+import { conflict,forbidden,notFound } from '../../shared/errors.js';
 import { writeAudit } from '../../shared/audit.js';
 import { authenticate,requireRoles } from '../auth/auth.guard.js';
 import { confirmationPasswordSchema,confirmManagerPassword } from '../auth/confirm-manager-password.js';
 import { companyProviders,resolveCompanyService,safeCompanyService,saveCompanyService } from './company-settings.service.js';
+import { BTG_PIX_WEBHOOK } from '../../integrations/btg/btg.webhook.js';
 
 const id=z.object({id:z.uuid()});
 const provider=z.enum(companyProviders);
 const common=z.object({enabled:z.boolean(),provider});
 const schemas={
-  BTG:common.extend({provider:z.literal('BTG'),publicConfig:z.object({mode:z.enum(['sandbox','production']),clientId:z.string().trim().max(200),pixKey:z.string().trim().max(140).default('')}),
-    secrets:z.object({clientSecret:z.string().trim().max(2048).default('')})}),
+  BTG:common.extend({provider:z.literal('BTG'),publicConfig:z.object({mode:z.enum(['sandbox','production']),clientId:z.string().trim().max(200),pixKey:z.string().trim().max(140).default(''),webhookId:z.union([z.literal(''),z.uuid()]).optional()}),
+    secrets:z.object({clientSecret:z.string().trim().max(2048).default(''),webhookSecret:z.union([z.literal(''),z.string().regex(/^[\x21-\x7e]{32,2048}$/)]).default('')})}),
   WEB_PUSH:common.extend({provider:z.literal('WEB_PUSH'),publicConfig:z.object({subject:z.string().trim().max(240),publicKey:z.string().trim().max(512),
     appUrl:z.union([z.literal(''),z.url()]),iconUrl:z.union([z.literal(''),z.url()]),badgeUrl:z.union([z.literal(''),z.url()])}),secrets:z.object({privateKey:z.string().trim().max(512).default('')})}),
   WHATSAPP:common.extend({provider:z.literal('WHATSAPP'),publicConfig:z.object({phoneNumberId:z.string().trim().max(100),businessAccountId:z.string().trim().max(100),
@@ -31,6 +32,7 @@ export async function companySettingsRoutes(app:FastifyInstance,database:Databas
   const expose=(service:Parameters<typeof safeCompanyService>[0])=>{
     const safe=safeCompanyService(service);
     return service.provider==='BTG'?{...safe,publicConfig:{...safe.publicConfig,redirectUri:env.BTG_REDIRECT_URI,
+      webhookUrl:env.BTG_REDIRECT_URI?new URL(BTG_PIX_WEBHOOK,env.BTG_REDIRECT_URI).toString():'',
       serverReady:Boolean(env.BTG_ENABLED&&(env.BTG_ENCRYPTION_SECRET?.length??0)>=32&&env.BTG_REDIRECT_URI)}}:safe;
   };
   const auth=authenticate(env,database);const manager=[auth,requireRoles('TENANT_MANAGER')];
@@ -48,8 +50,13 @@ export async function companySettingsRoutes(app:FastifyInstance,database:Databas
       if(!company)throw notFound('Empresa não encontrada no seu escopo.');
       if(value.provider==='IFOOD'&&value.publicConfig.mode==='mock'&&env.NODE_ENV==='production')throw forbidden('O modo simulado do iFood não pode ser ativado em produção.');
       const before=safeCompanyService(await resolveCompanyService(client,env,companyId,value.provider));
+      const publicConfig:Record<string,string|number|boolean>={};
+      for(const [key,item] of Object.entries(value.publicConfig))if(item!==undefined)publicConfig[key]=item;
       const saved=await saveCompanyService(client,env,{tenantId:request.auth.tenantId,companyId,provider:value.provider,enabled:value.enabled,
-        publicConfig:value.publicConfig,secrets:value.secrets,updatedBy:request.auth.userId});
+        publicConfig,secrets:value.secrets,updatedBy:request.auth.userId}).catch((error:unknown)=>{
+          if((error as {constraint?:string}).constraint==='company_btg_webhook_id_unique')throw conflict('Este webhook já está vinculado a outra configuração.');
+          throw error;
+        });
       if(value.provider==='IFOOD'){
         await client.query(`UPDATE integration_connections SET events_mode=$2,
           enabled=CASE WHEN $3 THEN enabled ELSE false END,

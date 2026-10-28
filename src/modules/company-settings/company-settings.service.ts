@@ -1,7 +1,7 @@
 import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
 import { decryptPayload, encryptPayload } from '../../shared/encrypted-payload.js';
-import { AppError } from '../../shared/errors.js';
+import { AppError,conflict } from '../../shared/errors.js';
 
 export const companyProviders=['WEB_PUSH','WHATSAPP','SMS','IFOOD','BTG'] as const;
 export type CompanyProvider=(typeof companyProviders)[number];
@@ -69,6 +69,18 @@ export async function saveCompanyService(client:PoolClient,env:AppEnv,input:{ten
   if(existing?.secret_config_encrypted)retained=decryptPayload<Record<string,string>>(existing.secret_config_encrypted,key);
   if(input.provider==='BTG'&&existing&&(existing.public_config['mode']!==input.publicConfig['mode']||existing.public_config['clientId']!==input.publicConfig['clientId']))retained={};
   const merged={...retained,...Object.fromEntries(Object.entries(input.secrets).filter(([,value])=>value.trim().length>0))};
+  if(input.provider==='BTG'){
+    const unchanged=existing?.public_config['mode']===input.publicConfig['mode']&&existing?.public_config['clientId']===input.publicConfig['clientId'];
+    const previousWebhookId=existing?.public_config['webhookId'];
+    if(input.publicConfig['webhookId']===undefined)input.publicConfig['webhookId']=unchanged&&typeof previousWebhookId==='string'?previousWebhookId:'';
+    input.publicConfig['webhookId']=String(input.publicConfig['webhookId']).toLowerCase();
+    if(input.publicConfig['webhookId']&&!merged['webhookSecret'])throw new AppError(422,'BTG_WEBHOOK_SECRET_REQUIRED','Informe o segredo do webhook desta empresa.');
+    if(input.publicConfig['webhookId']){
+      // Unique index in 0069 also protects concurrent edits.
+      const used=await client.query("SELECT 1 FROM company_service_settings WHERE provider='BTG' AND company_id<>$1 AND lower(public_config->>'webhookId')=$2",[input.companyId,input.publicConfig['webhookId']]);
+      if(used.rowCount)throw conflict('Este webhook já está vinculado a outra configuração.');
+    }
+  }
   if(input.provider==='BTG'&&input.enabled&&(!input.publicConfig['clientId']||!merged['clientSecret']))throw new AppError(422,'BTG_CREDENTIALS_REQUIRED','Informe Client ID e Client Secret desta empresa. Ao trocar o ambiente ou Client ID, informe novamente o Client Secret.');
   const row=(await client.query<{id:string;updated_at:Date}>(`INSERT INTO company_service_settings
     (tenant_id,company_id,provider,enabled,public_config,secret_config_encrypted,updated_by)
@@ -82,7 +94,7 @@ export async function saveCompanyService(client:PoolClient,env:AppEnv,input:{ten
 
 export function safeCompanyService(service:ResolvedCompanyService){
   const secretKeys:Record<CompanyProvider,string[]>={WEB_PUSH:['privateKey'],WHATSAPP:['accessToken','webhookVerifyToken','appSecret'],
-    SMS:['apiKey'],IFOOD:['clientSecret','webhookSecret'],BTG:['clientSecret']};
+    SMS:['apiKey'],IFOOD:['clientSecret','webhookSecret'],BTG:['clientSecret','webhookSecret']};
   const publicConfig=Object.fromEntries(Object.entries(service.values).filter(([key])=>!secretKeys[service.provider].includes(key)));
   return {provider:service.provider,enabled:service.enabled,source:service.source,configured:companyServiceConfigured(service),publicConfig,
     configuredSecrets:secretKeys[service.provider].filter(key=>Boolean(String(service.values[key]??'').trim()))};

@@ -38,7 +38,7 @@ O callback OAuth ainda depende de cookies entre frontend e backend: Safari/bloqu
 
 ## Confirmação, falhas e operação
 
-- Nesta versão a confirmação é por **consulta autenticada do worker ao BTG**, não webhook público. O app consulta apenas o status local a cada 10 segundos; o botão Conferir não cria nova cobrança. API retorna `Cache-Control: no-store` e o service worker Angular não tem cache de dados da API.
+- A confirmação financeira continua por **consulta autenticada do worker ao BTG**. O webhook implementado em `btg-pix-webhook.md` antecipa essa consulta ao receber `instant-collection.paid`; o corpo da notificação nunca liquida pedidos diretamente. O app consulta apenas o status local a cada 10 segundos; o botão Conferir não cria nova cobrança. API retorna `Cache-Control: no-store` e o service worker Angular não tem cache de dados da API.
 - Rotina Pix independente da rotina de notificações, até 3 pedidos concorrentes, consulta normalmente a cada 30 segundos, timeout de 15 segundos por chamada. Expirados com cobrança conhecida são reconsultados a cada 10 minutos durante 7 dias. Dimensionar filas/limites bancários antes de ampliar o volume. Após esse prazo, conciliação operacional no banco é necessária.
 - Antes de POSTar uma cobrança, grava REQUESTED. Timeout, resposta inesperada ou encerramento do processo nunca provocam outro POST para o mesmo pedido. A próxima execução pesquisa a cobrança existente pela location/ID e, se necessário, pela referência única no displayText. Resultado ausente ou ambíguo permanece em conferência. Não substitui o QR por outro.
 - Confirmação confere empresa/CNPJ, chave, ID, txId, location, valor original fixo, paidAmount, data e endToEndId. EndToEndId único e transação por loja impedem liquidação duplicada. Somente confirmação bancária confiável altera o estado financeiro.
@@ -62,6 +62,15 @@ O callback OAuth ainda depende de cookies entre frontend e backend: Safari/bloqu
 - [Refresh Token](https://developers.empresas.btgpactual.com/es/docs/starting-doc/Integrando/Fluxo%20de%20autoriza%C3%A7%C3%A3o/Refresh%20Token)
 
 Valores da API BTG são reais decimais; armazenamento/cálculo da aplicação usa centavos inteiros. URLs são fixas em código e redirecionamentos HTTP rejeitados.
+
+## Checkout e prazo de aprovação — revisão de 27/10/2026
+
+- Migração 0069 aplicada na base do `.env` em 28/10/2026 01:11:01 UTC; sem publicação ou transação bancária real.
+- Leituras de pedidos do cliente incluem `serverTime` obtido do PostgreSQL, mantendo o escopo do cliente autenticado. Contador usa `reservationExpiresAt` e a hora de recebimento local: não reinicia ao abrir o detalhe e não cancela pedidos pelo navegador. Consulta periódica continua após expiração para identificar pagamentos tardios.
+- Mantido o contrato da 0068: 10 minutos antes da aprovação, sem cobrança Pix. Recusa/expiração libera a reserva sem gerar cobrança; aprovação inicia prazo separado de 15 minutos para o Pix. Pagamento após cancelamento/vencimento continua em conferência/devolução sem reativar atendimento.
+- O cliente vê **Devolução pendente** quando `refundRequired` está marcado. A mensagem informa o dever de restituição conforme a legislação aplicável, sem inventar prazo universal nem afirmar devolução já executada. `REVIEW_REQUIRED` sem pagamento confirmado permanece em conferência.
+- **Devolução bancária automática não implementada/habilitada.** O BTG descreve `PIX_REVERSAL` na API de Pagamentos e Transferências usando `originalEndToEndId`; as iniciações dependem de aprovação no internet banking/app e das permissões bancárias da empresa. O escopo Pix Cash-in atual não substitui essa autorização. A loja precisa providenciar e confirmar a devolução pelo banco; não há baixa fictícia nem chamada de transferência nesta revisão.
+- Referências: [BTG — Pagamentos e Transferências](https://developers.empresas.btgpactual.com/docs/starting-doc/Produtos%20de%20API/Conta%20PJ/Pagamentos%20e%20Transfer%C3%AAncias/pagamentos) e [CDC, art. 35](https://planalto.gov.br/ccivil_03/leis/l8078compilado.htm). Prazo/comunicação de restituição deve ser validado com o responsável jurídico e o contrato bancário antes de prometer data ao cliente.
 
 ## Verificações locais e pendências gerais
 

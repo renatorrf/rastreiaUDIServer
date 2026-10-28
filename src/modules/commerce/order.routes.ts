@@ -55,17 +55,17 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
   // Read-only polling. Only the worker can create/reconcile charges; browsers cannot assert payment.
   app.get('/customer/commerce/orders/:id/payment',{config:{rateLimit:{max:30,timeWindow:'1 minute'}}},async(req,reply)=>{
     const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
-    const order=await identity(req,async c=>(await c.query('SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE id=$1 AND customer_user_id=current_user_id()',[id])).rows[0]?.data as {payment?:{copyPaste?:string};status:string}|undefined);
+    const order=await identity(req,async c=>(await c.query("SELECT commerce_order_read(id)||jsonb_build_object('serverTime',clock_timestamp()) AS data FROM commerce_orders WHERE id=$1 AND customer_user_id=current_user_id()",[id])).rows[0]?.data as {payment?:{copyPaste?:string};status:string}|undefined);
     if(!order)throw notFound();
     return {...order,qrDataUrl:order.payment?.copyPaste?await QRCode.toDataURL(order.payment.copyPaste,{width:320,margin:2,errorCorrectionLevel:'M'}):null};
   });
   app.get('/customer/commerce/orders',async(req,reply)=>{
     const f=pageSchema.parse(req.query);reply.header('Cache-Control','no-store');return identity(req,async c=>({data:(await c.query(
-      'SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE customer_user_id=current_user_id() ORDER BY created_at DESC,id LIMIT $1 OFFSET $2',[f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)}));
+      "SELECT commerce_order_read(id)||jsonb_build_object('serverTime',clock_timestamp()) AS data FROM commerce_orders WHERE customer_user_id=current_user_id() ORDER BY created_at DESC,id LIMIT $1 OFFSET $2",[f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)}));
   });
   app.get('/customer/commerce/orders/:id',async(req,reply)=>{
     const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');return identity(req,async c=>{
-      const data=(await c.query('SELECT commerce_order_read(id) AS data FROM commerce_orders WHERE id=$1 AND customer_user_id=current_user_id()',[id])).rows[0]?.data;
+      const data=(await c.query("SELECT commerce_order_read(id)||jsonb_build_object('serverTime',clock_timestamp()) AS data FROM commerce_orders WHERE id=$1 AND customer_user_id=current_user_id()",[id])).rows[0]?.data;
       if(!data)throw notFound('Pedido não encontrado.');return data;
     });
   });
