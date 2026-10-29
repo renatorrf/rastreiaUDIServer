@@ -1,0 +1,91 @@
+BTG — ATIVACAO CENTRALIZADA / PRIMEIRA ENTREGA
+Data: 29/10/2026
+
+ESCOPO IMPLEMENTADO LOCALMENTE
+
+Master > Plataforma > Ativacao BTG (/platform/ativacao-btg):
+- Cadastro de revisoes imutaveis da aplicacao integradora (sandbox/producao).
+- Client Secret e segredo do webhook cifrados, nunca devolvidos pelas telas.
+- Vinculo explicito da aplicacao e chave Pix por empresa.
+- Confirmacao da senha master, motivo, auditoria e controle de versao concorrente.
+- Bloqueio da troca quando existem Pix pendentes, cobranças recentes nao pagas
+  ou devolucoes que precisam de conferencia.
+- Listagem paginada, pesquisa, estados de carregamento/erro e protecao de edicao.
+
+Loja > Contas bancarias (/app/contas-bancarias):
+- Consulta da configuracao e inicio do consentimento no proprio BTG.
+- Confirmacao com a senha RastreiaAPP; nenhuma senha bancaria e coletada.
+- Credenciais tecnicas nao sao editaveis pela loja, inclusive pela API.
+- iFood e WhatsApp continuam em Integracoes, com as permissoes anteriores.
+
+Compatibilidade e seguranca:
+- Nenhuma configuracao existente e migrada automaticamente.
+- O vinculo preserva o ciphertext e os metadados legados, mas passa a usar
+  exclusivamente a aplicacao selecionada. Nao ha fallback silencioso.
+- Cada alteracao incrementa a versao e exige novo consentimento.
+- O webhook compartilhado resolve a empresa pela cobranca persistida e pelo
+  vinculo da aplicacao. Confere versao, CNPJ e identificadores; eventos ambiguos
+  nao sao enfileirados. O evento apenas agenda consulta, nunca liquida o pedido.
+- Esta entrega nao altera os contratos OAuth, escopos ou APIs financeiras BTG.
+
+MIGRACAO PENDENTE
+
+0071_btg_platform_activation.sql cria btg_platform_applications, politicas/RLS,
+protecoes de escrita BTG e company_bank_accounts (fundacao, sem contas criadas).
+Testada em PostgreSQL embarcado PGlite isolado. NAO aplicada ao banco compartilhado.
+
+Ordem recomendada para uma implantacao futura autorizada:
+1. Conferir backup e migracoes anteriores; aplicar 0071 com o migrador existente.
+2. Publicar a mesma revisao de API e worker, depois o frontend.
+3. Conferir a chave BTG_ENCRYPTION_SECRET existente, sem troca ou reexposicao,
+   BTG_ENABLED e callback. Manter credenciais da aplicacao no cadastro master.
+4. Preparar uma empresa de sandbox sem pendencias financeiras, vincular e obter
+   novo consentimento. Validar no BTG a habilitacao comercial multi-CNPJ.
+5. Homologar o fluxo antes de vincular empresas de producao.
+
+Nao foi implementado rollback pela interface. Um retorno ao modelo anterior
+exige procedimento coordenado e auditado. Nao alterar versoes/credenciais de uma
+conexao que ainda esteja processando pagamentos.
+
+LIMITES DESTA ENTREGA / PROXIMAS ETAPAS
+
+- Autorizacao recebida e exibida como "validar conta", nunca como titularidade
+  confirmada. A verificacao autenticada da conta/CNPJ ainda sera implementada.
+- company_bank_accounts ainda nao tem cadastro/validacao operacional na UI/API.
+- O Pix ja existente continua com suas regras atuais apos consentimento valido;
+  esta entrega nao adiciona um bloqueio de cobranca baseado na nova tabela de
+  contas. Antes de producao, implementar/homologar a validacao de titularidade.
+- Saldo, extrato, conciliacao, cadastro manual/OFX, links de pagamento e carteiras
+  Apple Pay/Google Pay nao estao implementados nesta etapa.
+- Nao houve chamada real ao banco, homologacao OAuth, deploy, commit ou push.
+- Nao houve alteracao de segredos, .env, saldo, estoque ou pedidos reais.
+
+VALIDACAO LOCAL
+
+- Build TypeScript backend e build Angular production aprovados.
+- 139 testes direcionados do backend (BTG, integracoes e Pix).
+- 26 testes direcionados do frontend (ativacao, integracoes e shell).
+- ESLint direcionado aos arquivos alterados e verificacao de whitespace.
+- QA navegador com API simulada e rede externa bloqueada: 320, 375, 390, 430,
+  768, 1024 e 1200px; sem overflow horizontal ou excecoes JS nas novas paginas.
+- Console do QA: apenas HTTP 503 deliberado no teste de erro/retry.
+- Fixtures unitarias de shell ainda emitem aviso ion-menu/content; nao observado
+  na navegacao real isolada. O build mantem avisos CommonJS preexistentes do IVS.
+- Build de QA em .data/btg-activation-build, sem sobrescrever www ou o APK
+  preparado anteriormente. Capturas em .data/btg-activation-qa no frontend.
+
+ARQUIVOS / DESIGN SYSTEM
+
+Backend novos: migration 0071; btg-activation.routes.ts;
+btg-activation.integration.test.ts; este relatorio.
+Backend ajustados: app.ts; company-settings routes/service; btg.store.ts;
+btg.webhook.ts e testes BTG associados.
+
+Frontend novos: btg-activation-api.service.ts; pagina btg-activation (TS/HTML/SCSS
+e testes); bank-connection.page.ts; scripts/verify-btg-activation.cjs.
+Frontend ajustados: rotas; menus master e loja; CompanyServices e testes;
+teste da pagina Integracoes.
+
+UI preserva tema escuro, tokens globais, formularios master, MasterPageHeader,
+MasterState e FilterToolbar. CSS local somente para composicao responsiva,
+lista/seleção e espacamento. Nao foram removidos ou substituidos estilos globais.

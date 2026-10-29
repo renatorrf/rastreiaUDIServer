@@ -38,12 +38,12 @@ describe('BTG webhook persistence and tenant isolation',()=>{
  beforeAll(async()=>{
   await pg.exec(`CREATE SCHEMA rastreia;SET search_path=rastreia,public;CREATE ROLE rastreia_runtime;
    CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
-   CREATE TABLE company_service_settings(company_id uuid,tenant_id uuid,provider text,enabled boolean,public_config jsonb,secret_config_encrypted text);
-   CREATE TABLE commerce_pix_payments(order_id uuid PRIMARY KEY,company_id uuid,tax_id text,pix_key text,provider_id text,tx_id text,location_id text,paid_at timestamptz,created_at timestamptz DEFAULT now(),next_check_at timestamptz);
+   CREATE TABLE company_service_settings(company_id uuid,tenant_id uuid,provider text,enabled boolean,public_config jsonb,secret_config_encrypted text,version integer DEFAULT 1);
+   CREATE TABLE commerce_pix_payments(order_id uuid PRIMARY KEY,company_id uuid,tax_id text,pix_key text,provider_id text,tx_id text,location_id text,paid_at timestamptz,created_at timestamptz DEFAULT now(),next_check_at timestamptz,settings_version integer DEFAULT 1);
   `);
   await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0069_btg_pix_webhook.sql',import.meta.url),'utf8')+'COMMIT');
   await query('INSERT INTO companies(id,tenant_id) VALUES($1,$1),($2,$2)',[companyId,otherCompany]);
-  await query("INSERT INTO company_service_settings VALUES($1,$1,'BTG',true,$2,$3)",[companyId,JSON.stringify({webhookId,mode:'production'}),encryptPayload({webhookSecret:secret},env.BTG_ENCRYPTION_SECRET)]);
+  await query("INSERT INTO company_service_settings(company_id,tenant_id,provider,enabled,public_config,secret_config_encrypted) VALUES($1,$1,'BTG',true,$2,$3)",[companyId,JSON.stringify({webhookId,mode:'production'}),encryptPayload({webhookSecret:secret},env.BTG_ENCRYPTION_SECRET)]);
   await query("INSERT INTO commerce_pix_payments(order_id,company_id,tax_id,pix_key,provider_id,tx_id,location_id,next_check_at) VALUES($1,$2,'12345678000199','pix-a','charge-a','tx-a','location-a',now()+interval '10 minutes')",[orderId,companyId]);
  },30000);
  afterAll(()=>pg.close());
@@ -59,4 +59,21 @@ describe('BTG webhook persistence and tenant isolation',()=>{
   expect((await query('SELECT * FROM btg_pix_webhook_receipts')).rowCount).toBe(1);expect((await query('SELECT next_check_at>now() AS future FROM commerce_pix_payments')).rows[0]).toEqual({future:true});
  });
  it('does not grant runtime access to webhook receipts',async()=>{expect((await query("SELECT has_table_privilege('rastreia_runtime','rastreia.btg_pix_webhook_receipts','SELECT') AS allowed")).rows[0]).toEqual({allowed:false});});
+ it('routes a shared application webhook by saved charge and binding, never by arbitrary company tags',async()=>{
+  const applicationId=randomUUID(),centralWebhook=randomUUID();
+  await pg.exec('CREATE TABLE btg_platform_applications(id uuid PRIMARY KEY,mode text,webhook_id uuid,secrets_encrypted text)');
+  await query("INSERT INTO btg_platform_applications VALUES($1,'production',$2,$3)",[applicationId,centralWebhook,encryptPayload({webhookSecret:secret},env.BTG_ENCRYPTION_SECRET)]);
+  await query("UPDATE company_service_settings SET public_config=public_config||jsonb_build_object('platformApplicationId',$1::text)",[applicationId]);
+  expect(await store.configuration(webhookId)).toBeNull();
+  expect(await store.configuration(centralWebhook)).toEqual({companyId:'',applicationId,secret});
+  await query('DELETE FROM btg_pix_webhook_receipts');
+  await store.enqueue('',centralWebhook,payload.data,randomUUID());expect((await query('SELECT * FROM btg_pix_webhook_receipts')).rowCount).toBe(0);
+  await store.enqueue('',centralWebhook,{...payload.data,payee:{taxId:'99999999000199'}},applicationId);expect((await query('SELECT * FROM btg_pix_webhook_receipts')).rowCount).toBe(0);
+  await store.enqueue('',centralWebhook,payload.data,applicationId);expect((await query('SELECT company_id FROM btg_pix_webhook_receipts')).rows).toEqual([{company_id:companyId}]);
+ });
+ it('rejects a shared event if the payment belongs to a previous connection version',async()=>{
+  const row=(await pg.query<{id:string;webhook_id:string}>('SELECT id,webhook_id FROM btg_platform_applications')).rows[0]!;await query('DELETE FROM btg_pix_webhook_receipts');
+  await query('UPDATE company_service_settings SET version=2');
+  await store.enqueue('',row.webhook_id,payload.data,row.id);expect((await query('SELECT * FROM btg_pix_webhook_receipts')).rowCount).toBe(0);
+ });
 });

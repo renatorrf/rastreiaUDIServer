@@ -7,7 +7,6 @@ import { writeAudit } from '../../shared/audit.js';
 import { authenticate,requireRoles } from '../auth/auth.guard.js';
 import { confirmationPasswordSchema,confirmManagerPassword } from '../auth/confirm-manager-password.js';
 import { companyProviders,resolveCompanyService,safeCompanyService,saveCompanyService } from './company-settings.service.js';
-import { BTG_PIX_WEBHOOK } from '../../integrations/btg/btg.webhook.js';
 
 const id=z.object({id:z.uuid()});
 const provider=z.enum(companyProviders);
@@ -31,8 +30,7 @@ const input=z.discriminatedUnion('provider',[schemas.WHATSAPP.extend({confirmati
 export async function companySettingsRoutes(app:FastifyInstance,database:Database,env:AppEnv){
   const expose=(service:Parameters<typeof safeCompanyService>[0])=>{
     const safe=safeCompanyService(service);
-    return service.provider==='BTG'?{...safe,publicConfig:{...safe.publicConfig,redirectUri:env.BTG_REDIRECT_URI,
-      webhookUrl:env.BTG_REDIRECT_URI?new URL(BTG_PIX_WEBHOOK,env.BTG_REDIRECT_URI).toString():'',
+    return service.provider==='BTG'?{...safe,configuredSecrets:[],publicConfig:{mode:safe.publicConfig['mode']??'sandbox',managedByActivation:true,
       serverReady:Boolean(env.BTG_ENABLED&&(env.BTG_ENCRYPTION_SECRET?.length??0)>=32&&env.BTG_REDIRECT_URI)}}:safe;
   };
   const auth=authenticate(env,database);const manager=[auth,requireRoles('TENANT_MANAGER')];
@@ -44,6 +42,7 @@ export async function companySettingsRoutes(app:FastifyInstance,database:Databas
   }));
   app.put('/companies/:id/service-settings',{preHandler:[...manager,confirmManagerPassword(database)],config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async request=>{
     const companyId=id.parse(request.params).id;const value=input.parse(request.body);
+    if(value.provider==='BTG')throw forbidden('A configuração BTG é realizada pela equipe de ativação. Use Contas bancárias para autorizar o acesso.');
     return withTenantTransaction(database,request.auth,async client=>{
       const company=(await client.query<{id:string}>(`SELECT company.id FROM companies company WHERE company.id=$1 AND company.tenant_id=$2
         AND EXISTS(SELECT 1 FROM stores store WHERE store.company_id=company.id AND store_in_scope(store.id))`,[companyId,request.auth.tenantId])).rows[0];

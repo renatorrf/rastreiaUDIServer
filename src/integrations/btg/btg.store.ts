@@ -22,7 +22,7 @@ async function checkScope(client: PoolClient, state: Pick<BtgState,'tenantId'|'u
 }
 async function credentialsFor(client:PoolClient,env:AppEnv,companyId:string):Promise<BtgCredentials>{
   const settings=await resolveCompanyService(client,env,companyId,'BTG');
-  if(!companyServiceConfigured(settings)||!settings.version)throw new AppError(409,'BTG_COMPANY_NOT_CONFIGURED','Configure e habilite o BTG para esta empresa em Integrações.');
+  if(!companyServiceConfigured(settings)||!settings.version)throw new AppError(409,'BTG_COMPANY_NOT_CONFIGURED','Solicite à equipe de ativação a configuração BTG desta empresa.');
   return {mode:settings.values['mode'] as 'sandbox'|'production',clientId:String(settings.values['clientId']),clientSecret:String(settings.values['clientSecret']),version:settings.version};
 }
 export function createBtgStore(database: Database, env: AppEnv): BtgStore {

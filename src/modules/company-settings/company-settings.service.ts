@@ -40,6 +40,19 @@ export async function resolveCompanyService(client:Pick<PoolClient,'query'>,env:
   const row=(await client.query<{enabled:boolean;public_config:Record<string,string|boolean|number>;secret_config_encrypted:string|null;version:number}>(
     `SELECT enabled,public_config,secret_config_encrypted,version FROM rastreia.company_service_settings WHERE company_id=$1 AND provider=$2`,[companyId,provider])).rows[0];
   if(!row)return environmentValues(env,provider);
+  if(provider==='BTG' && row.public_config['platformApplicationId']){
+    const application=(await client.query<{mode:string;client_id:string;secrets_encrypted:string;webhook_id:string|null}>(
+      'SELECT mode,client_id,secrets_encrypted,webhook_id FROM rastreia.btg_platform_applications WHERE id=$1',
+      [row.public_config['platformApplicationId']])).rows[0];
+    // An explicit platform binding must never silently fall back to legacy credentials.
+    if(!application)return {provider,enabled:false,source:'company',version:row.version,values:{managedByActivation:true}};
+    const secrets=decryptPayload<Record<string,string>>(application.secrets_encrypted,btgEncryptionKey(env));
+    return {provider,enabled:row.enabled,source:'company',version:row.version,values:{
+      mode:application.mode,clientId:application.client_id,...secrets,webhookId:application.webhook_id??'',
+      pixKey:String(row.public_config['activationPixKey']??''),managedByActivation:true,
+      platformApplicationId:String(row.public_config['platformApplicationId']),
+    }};
+  }
   let secrets:Record<string,string>={};
   if(row.secret_config_encrypted)secrets=decryptPayload<Record<string,string>>(row.secret_config_encrypted,provider==='BTG'?btgEncryptionKey(env):encryptionKey(env));
   return {provider,enabled:row.enabled,source:'company',version:row.version,values:{...row.public_config,...secrets}};

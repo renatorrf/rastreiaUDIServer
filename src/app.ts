@@ -40,6 +40,7 @@ import { orderRoutes } from './modules/commerce/order.routes.js';
 import { communicationRoutes } from './modules/communications/communication.routes.js';
 import { communicationWebhookRoutes } from './modules/communications/webhook.routes.js';
 import { companySettingsRoutes } from './modules/company-settings/company-settings.routes.js';
+import { btgActivationRoutes } from './integrations/btg/btg-activation.routes.js';
 import { deliveryRoutes } from './modules/deliveries/delivery.routes.js';
 import { locationRoutes } from './modules/locations/location.routes.js';
 import { workdayRoutes } from './modules/workdays/workday.routes.js';
@@ -186,6 +187,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await cartRoutes(app, database);
   await orderRoutes(app, database, env);
   await companySettingsRoutes(app, database, env);
+  await btgActivationRoutes(app, database, env);
   await communicationRoutes(app, database, env);
   await communicationWebhookRoutes(app, database, env);
   await deliveryRoutes(app, database, env);

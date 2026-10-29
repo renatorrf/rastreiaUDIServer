@@ -149,7 +149,7 @@ describe('BTG migration and durable tenant isolation',()=>{
     await save(false,'production');
     await expect(store.configuration(auth,company)).rejects.toMatchObject({code:'BTG_COMPANY_NOT_CONFIGURED'});
   });
-  it('exposes safe company settings and saves credentials only in the authenticated company scope',async()=>{
+  it('exposes safe status and directs BTG configuration to platform activation',async()=>{
     const app=Fastify();app.decorateRequest('auth');await companySettingsRoutes(app,database,env);
     const access=await createTokenPair(env,other),headers={authorization:`Bearer ${access.accessToken}`};
     try{
@@ -157,12 +157,13 @@ describe('BTG migration and durable tenant isolation',()=>{
       expect(listed.statusCode).toBe(200);expect(listed.body).not.toContain('other-secret');
       const data=listed.json<{data:Array<{company:{id:string};services:Array<{provider:string;publicConfig:Record<string,unknown>}>}>}>().data;
       expect(data.map(item=>item.company.id)).toEqual([otherCompany]);
-      expect(data[0]!.services.find(service=>service.provider==='BTG')!.publicConfig).toMatchObject({clientId:'other-client',serverReady:true,redirectUri:env.BTG_REDIRECT_URI});
+      expect(data[0]!.services.find(service=>service.provider==='BTG')!.publicConfig).toMatchObject({managedByActivation:true,serverReady:true});
+      expect(listed.body).not.toContain('other-client');
       const payload={provider:'BTG',enabled:true,publicConfig:{mode:'sandbox',clientId:'other-client'},secrets:{clientSecret:'http-test-secret'},confirmationPassword:'test-only-manager-password'};
-      expect((await app.inject({method:'PUT',url:`/companies/${company}/service-settings`,headers,payload})).statusCode).toBe(404);
+      expect((await app.inject({method:'PUT',url:`/companies/${company}/service-settings`,headers,payload})).statusCode).toBe(403);
       const saved=await app.inject({method:'PUT',url:`/companies/${otherCompany}/service-settings`,headers,payload});
-      expect(saved.statusCode).toBe(200);expect(saved.body).not.toContain('http-test-secret');
-      expect((await store.configuration(other,otherCompany)).clientSecret).toBe('http-test-secret');
+      expect(saved.statusCode).toBe(403);expect(saved.body).not.toContain('http-test-secret');
+      expect((await store.configuration(other,otherCompany)).clientSecret).toBe('other-secret');
     }finally{await app.close();}
   });
 });
