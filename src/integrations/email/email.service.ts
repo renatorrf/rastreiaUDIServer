@@ -5,7 +5,7 @@ import type { Database } from '../../database/pool.js';
 import { withTransaction } from '../../database/pool.js';
 import { encryptPayload, decryptPayload } from '../../shared/encrypted-payload.js';
 
-export interface EmailPayload { to: string; subject: string; text: string }
+export interface EmailPayload { to: string; subject: string; text: string; html?: string }
 export const emailConfigured = (env: AppEnv) => Boolean(env.SMTP_HOST && env.SMTP_FROM);
 const secret = (env: AppEnv) => env.MESSAGE_PAYLOAD_SECRET || env.TRACKING_TOKEN_PEPPER;
 

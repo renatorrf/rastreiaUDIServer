@@ -6,6 +6,7 @@ import type { PoolClient } from 'pg';
 import type { AppEnv } from '../../config/env.js';
 import { withRuntimeTransaction, type Database } from '../../database/pool.js';
 import { enqueueEmail } from '../../integrations/email/email.service.js';
+import { createIdentityEmail } from '../../integrations/email/identity-email.js';
 import { AppError, conflict, unauthorized } from '../../shared/errors.js';
 import { createTokenPair, hashToken } from './token.service.js';
 import type { TenantRole } from './auth.types.js';
@@ -172,8 +173,8 @@ export async function createIdentityAction(client: PoolClient, env: AppEnv, inpu
   const path = input.kind==='INVITE'?'convite':input.kind==='VERIFY_EMAIL'?'verificar-email':'redefinir-senha';
   // Fragments are not sent to the web server or included in referrers.
   const url=new URL(`/${path}`,env.EMAIL_ACTION_BASE_URL); url.hash=token;
-  await enqueueEmail(client,env,`identity:${id}`,{to:input.email,subject:'RastreiaAPP — confirme seu acesso',
-    text:`Para ${input.kind==='RESET_PASSWORD'?'redefinir sua senha':'confirmar seu acesso'}, abra: ${url.toString()}\nEste link é temporário. Se você não solicitou, ignore esta mensagem.`},expiresAt);
+  await enqueueEmail(client,env,`identity:${id}`,createIdentityEmail({to:input.email,kind:input.kind,
+    actionUrl:url.toString(),expiresAt,requiresPassword:input.requiresPassword??false}),expiresAt);
   return { actionId:id, expiresAt };
 }
 export async function consumeIdentityAction(database: Database, env: AppEnv, token: string,
