@@ -77,6 +77,40 @@ A leitura do corpo de erro é limitada a 16 KiB, profundidade 4 e 8 itens por li
 `too_large` e `unreadable` preservam o status HTTP sem tentar novamente o código.
 Este refinamento não altera a requisição OAuth, credenciais, escopos ou consentimento.
 
+### Indícios específicos da recusa do código (29/10/2026)
+
+O campo opcional `diagnostic.codeRejectionHints` reconhece afirmações explícitas em
+campos de erro conhecidos. Só emite valores definidos no código:
+
+- `EXPIRED`: o texto menciona explicitamente expiração do código de autorização.
+- `ALREADY_USED`: o texto menciona uso/consumo anterior do código.
+- `NOT_FOUND`: o texto informa que o código não foi encontrado/não existe.
+- `INVALID`: o texto informa código inválido, sem determinar a causa.
+- `INVALID_OR_EXPIRED`: preserva a alternativa ambígua, sem afirmar expiração.
+- `CLIENT_MISMATCH`: o texto vincula o código a uma aplicação diferente.
+- `REDIRECT_URI_MISMATCH`: o texto informa divergência da URI de retorno.
+- `PKCE_MISMATCH`: o texto informa falha de verificação PKCE/verifier/challenge.
+
+São **indícios relatados pelo provedor**, não confirmação independente da causa.
+`invalid_grant` isolado, menções genéricas, recomendações e frases não reconhecidas
+não recebem uma classificação específica. O campo fica ausente nesses casos;
+isso não descarta nenhuma hipótese. A cobertura é conservadora, para expressões
+conhecidas em inglês e algumas em português, e pode exigir extensão para novos textos.
+Nenhum corpo/mensagem, código, state, segredo, URL ou identificador é copiado ao log.
+Continuam valendo os limites de leitura, profundidade e tamanho de listas.
+
+Exemplo **simulado** de diagnóstico (não representa uma nova resposta real do BTG):
+
+```json
+{"category":"HTTP_REJECTED","httpStatus":400,"oauthError":"unrecognized","codeRejectionHints":["ALREADY_USED"]}
+```
+
+Após publicar esta versão da **API**, iniciar uma autorização nova e consultar o
+evento `BTG authorization not completed`. Uma falha antiga não ganha detalhes
+retroativamente; seu corpo bruto não foi armazenado. O refinamento não corrige por
+si só a recusa, não troca credenciais, não tenta reaproveitar o código e não muda
+a página pública genérica. Não precisa de migração, atualização do frontend ou worker.
+
 ## Referências oficiais
 
 - [Authorization Code](https://developers.empresas.btgpactual.com/es/docs/starting-doc/Integrando/Fluxo%20de%20autoriza%C3%A7%C3%A3o/Authorization%20Code)

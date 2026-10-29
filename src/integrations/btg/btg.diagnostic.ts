@@ -12,12 +12,43 @@ const hintPatterns = {
 } as const;
 type ErrorField = typeof fields[number];
 type Hint = keyof typeof hintPatterns;
+// Recognize a small set of explicit statements, not arbitrary nearby keywords.
+// These are provider-reported hints, never proof of the underlying cause.
+const authorizationCode = '(?:authorization code|auth code|codigo de autorizacao)';
+const statementStart = '^(?:(?:the|o|provided|received|supplied) )?';
+const codeStatement = (predicate:string) => new RegExp(
+  `${statementStart}(?:${predicate} ${authorizationCode}|${authorizationCode} (?:(?:is|was|has|esta|foi) )?${predicate})(?:$|[ ,])`,
+);
+const codeRejectionPatterns = {
+  INVALID_OR_EXPIRED: codeStatement('(?:invalid or (?:has )?expired|expired or invalid|invalido ou expirado|expirado ou invalido)'),
+  EXPIRED: codeStatement('(?:expired|expirado|expirou)'),
+  ALREADY_USED: codeStatement('(?:already (?:been )?(?:used|consumed|redeemed)|ja (?:foi )?(?:utilizado|usado|consumido))'),
+  NOT_FOUND: codeStatement('(?:not found|does not exist|nao encontrado|nao existe)'),
+  INVALID: codeStatement('(?:invalid|invalido)'),
+  CLIENT_MISMATCH: new RegExp(`${statementStart}${authorizationCode} (?:was |is )?(?:issued (?:to|for) (?:a )?different client|belongs to (?:a )?different client|does not belong to (?:this|the) client)(?:$|[ ,])`),
+  REDIRECT_URI_MISMATCH: /^(?:the )?redirect (?:uri|url) (?:(?:does not|doesn't) match|mismatch|is mismatched)(?:$|[ ,])/,
+  PKCE_MISMATCH: /^(?:the )?(?:pkce|code verifier|code challenge) (?:verification failed|validation failed|mismatch|is invalid|does not match)(?:$|[ ,])/,
+} as const;
+type CodeRejectionHint = keyof typeof codeRejectionPatterns;
+const codeRejectionKeys = Object.keys(codeRejectionPatterns) as CodeRejectionHint[];
+
+function inspectCodeRejection(value:string,hints:Set<CodeRejectionHint>){
+  const normalized=value.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[_-]/g,' ');
+  for(const part of normalized.split(/[.!?;\n:]/)){
+    const statement=part.trim().replace(/\s+/g,' ');
+    if(codeRejectionPatterns.INVALID_OR_EXPIRED.test(statement)){
+      hints.add('INVALID_OR_EXPIRED');continue;
+    }
+    for(const hint of codeRejectionKeys)if(codeRejectionPatterns[hint].test(statement))hints.add(hint);
+  }
+}
 export interface BtgRejectionDiagnostic {
   oauthError:typeof oauthErrors[number]|'unrecognized';
   responseMedia:'json'|'html'|'form'|'text'|'other'|'missing';
   bodyFormat:'json_object'|'json_array'|'json_scalar'|'html'|'form'|'text'|'empty'|'unreadable'|'too_large';
   errorFields?:ErrorField[];
   reasonHints?:Hint[];
+  codeRejectionHints?:CodeRejectionHint[];
 }
 const maxBytes = 16_384;
 function mediaType(response:Response):BtgRejectionDiagnostic['responseMedia'] {
@@ -63,7 +94,7 @@ export async function rejectionDiagnostic(response:Response):Promise<BtgRejectio
       bodyFormat='form';
     }else {body={message:text};bodyFormat='text';}
   }
-  const seen=new Set<ErrorField>(),hints=new Set<Hint>();
+  const seen=new Set<ErrorField>(),hints=new Set<Hint>(),codeHints=new Set<CodeRejectionHint>();
   let oauthError:BtgRejectionDiagnostic['oauthError']='unrecognized';
   function inspect(value:unknown,depth:number){
     if(depth>4)return;
@@ -72,6 +103,7 @@ export async function rejectionDiagnostic(response:Response):Promise<BtgRejectio
       const known=oauthErrors.find(code=>code===normalized);
       if(known&&oauthError==='unrecognized')oauthError=known;
       for(const hint of Object.keys(hintPatterns) as Hint[])if(hintPatterns[hint].test(value))hints.add(hint);
+      inspectCodeRejection(value,codeHints);
     }else if(Array.isArray(value)){
       for(const item of value.slice(0,8))inspect(item,depth+1);
     }else if(value&&typeof value==='object'){
@@ -83,5 +115,6 @@ export async function rejectionDiagnostic(response:Response):Promise<BtgRejectio
   // Root scalar values may be tokens or identifiers; only inspect known error fields.
   if(body&&typeof body==='object')inspect(body,0);
   return {...base,bodyFormat,oauthError,errorFields:fields.filter(field=>seen.has(field)),
-    reasonHints:(Object.keys(hintPatterns) as Hint[]).filter(hint=>hints.has(hint))};
+    reasonHints:(Object.keys(hintPatterns) as Hint[]).filter(hint=>hints.has(hint)),
+    ...(codeHints.size?{codeRejectionHints:codeRejectionKeys.filter(hint=>codeHints.has(hint))}:{})};
 }

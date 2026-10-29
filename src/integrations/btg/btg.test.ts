@@ -120,6 +120,26 @@ describe('BTG authorization security',()=>{
       expect(logs.join('')).toContain('"stage":"save"');expect(logs.join('')).not.toContain('private-database-details');
     }finally{await app.close();}
   });
+  it('logs the classified HTTP 400 rejection once without leaking or retrying the authorization code',async()=>{
+    const logs:string[]=[];const {app,fetcher,store,ticket}=await fixture(true,logs);
+    const message='Authorization code has already been used; DO_NOT_LOG_PROVIDER_MESSAGE';
+    fetcher.mockResolvedValue(new Response(JSON.stringify({message,code:'private-code',state:ticket,
+      access_token:tokens.access_token,client_secret:credentials.clientSecret}),{status:400,headers:{'content-type':'application/json'}}));
+    try{
+      const result=await app.inject({url:`/integrations/btg/callback?${new URLSearchParams({state:ticket,iss:'https://id.sandbox.btgpactual.com',code:'private-code'}).toString()}`,headers:{cookie:`__Secure-rastreia-btg=${'x'.repeat(43)}`}});
+      expect(result.statusCode).toBe(502);expect(fetcher).toHaveBeenCalledOnce();
+      expect(store.consume).toHaveBeenCalledOnce();expect(store.save).not.toHaveBeenCalled();
+      const records=logs.map(line=>JSON.parse(line) as Record<string,unknown>).filter(line=>line['msg']==='BTG authorization not completed');
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({stage:'exchange',reason:'BTG_TOKEN_EXCHANGE_FAILED',diagnostic:{
+        category:'HTTP_REJECTED',httpStatus:400,oauthError:'unrecognized',codeRejectionHints:['ALREADY_USED'],
+      }});
+      for(const secret of [message,'DO_NOT_LOG_PROVIDER_MESSAGE','private-code',ticket,tokens.access_token,credentials.clientSecret,'x'.repeat(43)]){
+        expect(logs.join('')).not.toContain(secret);expect(result.body).not.toContain(secret);
+      }
+      expect(result.body).not.toContain('ALREADY_USED');
+    }finally{await app.close();}
+  });
   it('requires authentication to initiate and fails closed when disabled',async()=>{
     const {app,fetcher}=await fixture(false);
     try {

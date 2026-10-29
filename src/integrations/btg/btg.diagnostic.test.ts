@@ -57,4 +57,60 @@ describe('BTG bounded rejection diagnostics',()=>{
     const response=new Response(new ReadableStream({start(controller){controller.error(new Error('private-network-details'));}}));
     expect(await rejectionDiagnostic(response)).toEqual({responseMedia:'missing',bodyFormat:'unreadable',oauthError:'unrecognized'});
   });
+
+  it.each([
+    ['Authorization code has expired.','EXPIRED'],
+    ['Expired authorization code','EXPIRED'],
+    ['AUTHORIZATION_CODE_EXPIRED','EXPIRED'],
+    ['O código de autorização está expirado.','EXPIRED'],
+    ['Authorization code has already been used.','ALREADY_USED'],
+    ['Authorization code already redeemed','ALREADY_USED'],
+    ['Código de autorização já foi utilizado','ALREADY_USED'],
+    ['Authorization code not found','NOT_FOUND'],
+    ['Authorization code does not exist','NOT_FOUND'],
+    ['Código de autorização não encontrado','NOT_FOUND'],
+    ['Invalid authorization code','INVALID'],
+    ['Código de autorização inválido','INVALID'],
+    ['Invalid or expired authorization code','INVALID_OR_EXPIRED'],
+    ['Authorization code is invalid or has expired','INVALID_OR_EXPIRED'],
+    ['Expired or invalid authorization code','INVALID_OR_EXPIRED'],
+    ['Código de autorização inválido ou expirado','INVALID_OR_EXPIRED'],
+    ['Authorization code was issued for a different client','CLIENT_MISMATCH'],
+    ['Authorization code does not belong to this client','CLIENT_MISMATCH'],
+    ['Redirect URI does not match the registered callback','REDIRECT_URI_MISMATCH'],
+    ['Code verifier does not match the code challenge','PKCE_MISMATCH'],
+  ])('classifies an explicit provider statement without returning it: %s',async(message,hint)=>{
+    const result=await rejectionDiagnostic(new Response(JSON.stringify({message:message+'; PRIVATE_CODE_123'}),{status:400,headers:{'content-type':'application/json'}}));
+    expect(result).toMatchObject({oauthError:'unrecognized',codeRejectionHints:[hint]});
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_CODE_123');
+    expect(JSON.stringify(result)).not.toContain(message);
+  });
+
+  it.each([
+    'invalid_grant',
+    'Check authorization code, client_id and redirect_uri.',
+    'Authorization code is not expired.',
+    'Authorization code has not already been used.',
+    'Authorization code received; access token expired.',
+    'Refresh token is invalid.',
+    'Check whether authorization code is expired.',
+    'Do not report invalid authorization code.',
+    'Authorization code has expiredness.',
+  ])('does not turn generic, unrelated, negated or advisory text into a cause: %s',async message=>{
+    expect(await rejectionDiagnostic(new Response(JSON.stringify({message})))).not.toHaveProperty('codeRejectionHints');
+  });
+
+  it('keeps classifications bounded, deduplicated and only within known error fields',async()=>{
+    const result=await rejectionDiagnostic(new Response(JSON.stringify({errors:[
+      {message:'Authorization code expired'}, {detail:'Authorization code expired'},
+    ],access_token:'Authorization code invalid',custom:{message:'Authorization code already used'}})));
+    expect(result.codeRejectionHints).toEqual(['EXPIRED']);
+    for(const body of [
+      'Authorization code expired',
+      {errors:[...Array.from({length:8},()=>({message:'unknown'})),{message:'Authorization code expired'}]},
+      {error:{error:{error:{error:{message:'Authorization code expired'}}}}},
+    ])expect(await rejectionDiagnostic(new Response(JSON.stringify(body)))).not.toHaveProperty('codeRejectionHints');
+    const form=new Response('error_description=Authorization+code+expired&state=PRIVATE_STATE',{headers:{'content-type':'application/x-www-form-urlencoded'}});
+    expect((await rejectionDiagnostic(form)).codeRejectionHints).toEqual(['EXPIRED']);
+  });
 });
