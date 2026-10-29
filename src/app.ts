@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { btgRoutes } from './integrations/btg/btg.routes.js';
 import { btgWebhookRoutes } from './integrations/btg/btg.webhook.js';
 import { financeRoutes } from './modules/commerce/finance.routes.js';
+import { mobileExpenseRoutes } from './modules/commerce/mobile-expenses.routes.js';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -176,6 +177,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   await customerRoutes(app, database, objectStorage, env, locationState, options.routeDirectionsProvider ?? geoapify);
   await commerceRoutes(app, database, env);
   await financeRoutes(app, database, env);
+  await mobileExpenseRoutes(app, database);
   await liveRoutes(app, database, env);
   await liveVideoRoutes(app, database, env);
   await inventoryRoutes(app, database, env);

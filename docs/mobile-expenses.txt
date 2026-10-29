@@ -1,0 +1,63 @@
+LANÇAMENTO RÁPIDO DE DESPESAS — /despesas
+
+Entrega local, sem publicação nem execução na base compartilhada.
+Antes de disponibilizar: aplicar 0070_mobile_expense_sessions.sql pelo migrador
+habitual; publicar API e frontend compatíveis. Não há variáveis novas no .env.
+
+USO
+Abra /despesas no domínio do frontend ou o atalho no Financeiro de vendas.
+Entre uma vez com e-mail e senha pessoal de um gestor com e-mail verificado.
+Caso haja várias unidades, selecione a unidade antes de preencher o lançamento.
+A última unidade autorizada fica lembrada por usuário. O cabeçalho identifica
+empresa, unidade e usuário; o backend revalida vínculo e permissão a cada chamada.
+Instale a página pelo navegador para criar o atalho PWA "Despesas".
+Seu manifesto é separado dos PWAs operacional e de clientes.
+
+O formulário permite valor, descrição, tipo, competência e, opcionalmente,
+vencimento/documento. "Já foi paga" permite informar meio e data do pagamento.
+Despesa, baixa, auditoria e recibo idempotente são gravados na mesma transação.
+Sem a opção de pagamento, o lançamento fica em aberto no Financeiro.
+Custos/depreciação não permitem baixa. Compras não movimentam estoque por aqui.
+Esta etapa não inclui fotografia, anexos nem reconhecimento de comprovantes.
+
+AUTENTICAÇÃO
+Sessão exclusiva sem expiração por tempo, revogável, limitada a /mobile-expenses.
+Não altera os TTLs nem emite tokens de acesso/refresh para o restante do app.
+O segredo aleatório de 256 bits é armazenado apenas como SHA-256 na base.
+No dispositivo, a capacidade restrita fica no localStorage do próprio frontend,
+separada por URL da API. Não depende de cookies de terceiros entre Firebase e
+Cloud Run. Senhas não são persistidas. Como qualquer bearer acessível a JS,
+é necessário proteger o frontend contra XSS e evitar aparelhos compartilhados.
+Não colocar o token em URLs, logs ou parâmetros de navegação.
+
+Sair nesta página revoga a sessão deste acesso; troca de senha, bloqueio e mudança
+do estado de verificação/primeiro acesso revogam todas as sessões rápidas desse
+usuário. Sem permissão de gestor ou vínculo ativo, nenhuma gravação é aceita.
+O painel geral tem autenticação independente: sair dele não equivale a sair do
+atalho. Para revogar um dispositivo perdido, redefina a senha ou bloqueie a conta.
+Limpar os dados do navegador, reinstalar o PWA ou restrições do sistema podem
+exigir novo login; nenhuma aplicação web pode impedir essas ações do dispositivo.
+
+RECUPERAÇÃO DE REDE
+Antes de enviar, a solicitação e sua chave são salvas localmente, separadas por
+usuário/API. Em timeout/5xx, edição fica suspensa até conferir o MESMO envio.
+Recarga e novo login preservam payload e chave. O backend revalida acesso antes
+de qualquer replay. Os recibos financeiros deste fluxo usam expires_at=infinity
+para que a retenção padrão de 24h não permita duplicação de tentativas antigas.
+Rejeições definitivas de validação (422) permitem corrigir o formulário.
+Sem armazenamento local disponível, o envio é bloqueado com orientação.
+Não existe fila de novas despesas offline: é preciso conexão para autenticar e
+gravar. Não repetir pelo painel uma solicitação que ainda aguarda conferência.
+
+VALIDAÇÃO
+Backend: mobile-expenses.integration.test.ts usa PostgreSQL PGlite isolado e a
+migração 0070 real, com fixtures locais e sem acesso ao DATABASE_URL.
+Abrange isolamento, revogação, RLS, idempotência, baixa atômica e rollback.
+Frontend: specs de página/serviço/interceptor/picker e pwa-manifest.test.mjs.
+scripts/verify-mobile-expenses.cjs serve www em porta efêmera, intercepta TODOS
+os pedidos externos e usa dados sintéticos. Requer Playwright disponível em
+PLAYWRIGHT_MODULE (ou instalado no ambiente), e Chrome em CHROME_BIN ou no
+caminho padrão do Windows. Salva capturas em %TEMP%/rastreia-expenses-qa.
+Valida 320, 375, 390, 430, 768, 1024 e 1200 px, reabertura, retry e logout.
+Ainda necessário após publicação: validar instalação/reabertura em iPhone e
+Android reais e confirmar um lançamento autorizado no financeiro da unidade.
