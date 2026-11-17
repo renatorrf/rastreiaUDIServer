@@ -17,6 +17,8 @@ interface WhatsAppStatus {
   status: string;
   timestamp?: string;
   errors?: Array<{ code?: number | string }>;
+  biz_opaque_callback_data?: string;
+  phoneNumberId?: string;
 }
 
 function signatureValid(raw: Buffer, signature: string | undefined, secret: string): boolean {
@@ -45,7 +47,8 @@ function statuses(payload: unknown): WhatsAppStatus[] {
         if (!candidate || typeof candidate !== 'object') continue;
         const status = candidate as Partial<WhatsAppStatus>;
         if (typeof status.id === 'string' && typeof status.status === 'string') {
-          found.push(status as WhatsAppStatus);
+          const phoneNumberId = (value as {metadata?:{phone_number_id?:string}}).metadata?.phone_number_id;
+          found.push({...status,phoneNumberId} as WhatsAppStatus);
         }
       }
     }
@@ -57,10 +60,15 @@ async function applyStatus(database: Database, item: WhatsAppStatus, payloadHash
   await withTransaction(database, async (client) => {
     const message = await client.query<{ id: string; tenant_id: string }>(
       `SELECT id, tenant_id FROM rastreia.message_deliveries
-       WHERE provider_message_id = $1 LIMIT 1 FOR UPDATE`, [item.id],
+       WHERE channel='WHATSAPP' AND (provider_message_id = $1
+         OR (purpose='DELIVERY_STARTED' AND id::text=$2 AND provider_message_id IS NULL
+           AND attempt_count>0 AND status IN ('PROCESSING','UNKNOWN')))
+         AND (provider_phone_number_id IS NULL OR provider_phone_number_id=$3)
+       LIMIT 1 FOR UPDATE`, [item.id,item.biz_opaque_callback_data ?? '',item.phoneNumberId ?? ''],
     );
     const row = message.rows[0];
-    if (!row) return;
+    if (!row || !['sent','delivered','read','failed'].includes(item.status)) return;
+    await client.query(`UPDATE rastreia.message_deliveries SET provider_message_id=COALESCE(provider_message_id,$2) WHERE id=$1`,[row.id,item.id]);
     const eventId = `${item.id}:${item.status}:${item.timestamp ?? ''}`;
     const receipt = await client.query(
       `INSERT INTO rastreia.message_webhook_receipts
@@ -72,20 +80,22 @@ async function applyStatus(database: Database, item: WhatsAppStatus, payloadHash
     if (!receipt.rowCount) return;
     if (item.status === 'sent') {
       await client.query(
-        `UPDATE rastreia.message_deliveries SET status = 'SENT', sent_at = COALESCE(sent_at, now()) WHERE id = $1`,
+        `UPDATE rastreia.message_deliveries SET status = 'SENT', sent_at = COALESCE(sent_at, now()),
+          last_error_code=NULL,last_error_message=NULL WHERE id = $1 AND status NOT IN ('DELIVERED','FAILED')`,
         [row.id],
       );
     } else if (item.status === 'delivered' || item.status === 'read') {
       await client.query(
         `UPDATE rastreia.message_deliveries
-         SET status = 'DELIVERED', sent_at = COALESCE(sent_at, now()), delivered_at = COALESCE(delivered_at, now())
+         SET status = 'DELIVERED', sent_at = COALESCE(sent_at, now()), delivered_at = COALESCE(delivered_at, now()),
+             last_error_code=NULL,last_error_message=NULL
          WHERE id = $1`, [row.id],
       );
     } else if (item.status === 'failed') {
       await client.query(
         `UPDATE rastreia.message_deliveries
          SET status = 'FAILED', failed_at = now(), last_error_code = $2,
-             last_error_message = 'O provedor informou falha definitiva.' WHERE id = $1`,
+             last_error_message = 'O provedor informou falha definitiva.' WHERE id = $1 AND status<>'DELIVERED'`,
         [row.id, String(item.errors?.[0]?.code ?? 'WHATSAPP_FAILED').slice(0, 100)],
       );
     }

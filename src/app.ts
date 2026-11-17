@@ -101,6 +101,60 @@ export async function buildApp(options: BuildAppOptions = {}) {
     },
   });
 
+  // Install the error handler before plugins/routes capture it for their contexts.
+  app.setErrorHandler(async (error, request, reply) => {
+    reply.header('X-Correlation-Id', request.id);
+    if ((error as { statusCode?: number }).statusCode === 429) {
+      // The limiter has already set Retry-After; preserve its remaining window.
+      const retryAfter = Number(reply.getHeader('retry-after'));
+      const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : undefined;
+      const duration = seconds === undefined ? 'alguns minutos'
+        : seconds >= 60 ? `${Math.ceil(seconds / 60)} minuto${seconds > 60 ? 's' : ''}`
+          : `${seconds} segundo${seconds > 1 ? 's' : ''}`;
+      return reply.header('Cache-Control', 'no-store').status(429).send({ error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: `Muitas tentativas. Aguarde ${duration} e tente novamente.`,
+        correlation_id: request.id,
+        ...(seconds === undefined ? {} : { retry_after_seconds: seconds }),
+      } });
+    }
+    if (error instanceof Error && error.message === 'MASTER_REQUIRED') {
+      return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.', correlation_id: request.id } });
+    }
+    if (error instanceof Error && error.message === 'UNIT_UNAVAILABLE') {
+      return reply.status(409).send({ error: { code: 'UNIT_UNAVAILABLE',
+        message: 'A unidade está temporariamente indisponível para novas operações.', correlation_id: request.id } });
+    }
+    if (error instanceof ZodError) {
+      markRequestError(request, 'VALIDATION_ERROR');
+      return reply.status(400).send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Revise os campos informados.',
+          details: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
+          correlation_id: request.id,
+        },
+      });
+    }
+    if (error instanceof AppError) {
+      if (error.statusCode >= 500) markRequestError(request, error.code);
+      return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message,
+        ...(error.fieldErrors ? { field_errors: error.fieldErrors } : {}), correlation_id: request.id } });
+    }
+    if ((error as { code?: string }).code === '23505') {
+      return reply.status(409).send({ error: { code: 'CONFLICT', message: 'Já existe um registro com a mesma referência.', correlation_id: request.id } });
+    }
+    markRequestError(request, 'INTERNAL_ERROR');
+    request.log.error({
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+      errorCode: typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : undefined,
+      errorMessage: env.NODE_ENV === 'production' || !(error instanceof Error) ? undefined : error.message,
+    }, 'Erro não tratado');
+    return reply.status(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Erro interno.', correlation_id: request.id } });
+  });
+
   app.decorateRequest('auth');
   app.decorateRequest('platformAuth');
   await app.register(cookie);
@@ -213,59 +267,6 @@ export async function buildApp(options: BuildAppOptions = {}) {
   app.setNotFoundHandler(async (request, reply) => reply.header('X-Correlation-Id', request.id).status(404).send({
     error: { code: 'NOT_FOUND', message: 'Rota não encontrada.', correlation_id: request.id },
   }));
-
-  app.setErrorHandler(async (error, request, reply) => {
-    reply.header('X-Correlation-Id', request.id);
-    if ((error as { statusCode?: number }).statusCode === 429) {
-      // The limiter has already set Retry-After; preserve its remaining window.
-      const retryAfter = Number(reply.getHeader('retry-after'));
-      const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : undefined;
-      const duration = seconds === undefined ? 'alguns minutos'
-        : seconds >= 60 ? `${Math.ceil(seconds / 60)} minuto${seconds > 60 ? 's' : ''}`
-          : `${seconds} segundo${seconds > 1 ? 's' : ''}`;
-      return reply.header('Cache-Control', 'no-store').status(429).send({ error: {
-        code: 'RATE_LIMIT_EXCEEDED',
-        message: `Muitas tentativas. Aguarde ${duration} e tente novamente.`,
-        correlation_id: request.id,
-        ...(seconds === undefined ? {} : { retry_after_seconds: seconds }),
-      } });
-    }
-    if (error instanceof Error && error.message === 'MASTER_REQUIRED') {
-      return reply.status(403).send({ error: { code: 'FORBIDDEN', message: 'Somente o Master pode alterar unidades.', correlation_id: request.id } });
-    }
-    if (error instanceof Error && error.message === 'UNIT_UNAVAILABLE') {
-      return reply.status(409).send({ error: { code: 'UNIT_UNAVAILABLE',
-        message: 'A unidade está temporariamente indisponível para novas operações.', correlation_id: request.id } });
-    }
-    if (error instanceof ZodError) {
-      markRequestError(request, 'VALIDATION_ERROR');
-      return reply.status(400).send({
-        error: {
-          code: 'VALIDATION_ERROR',
-          message: 'Revise os campos informados.',
-          details: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
-          correlation_id: request.id,
-        },
-      });
-    }
-    if (error instanceof AppError) {
-      if (error.statusCode >= 500) markRequestError(request, error.code);
-      return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message,
-        ...(error.fieldErrors ? { field_errors: error.fieldErrors } : {}), correlation_id: request.id } });
-    }
-    if ((error as { code?: string }).code === '23505') {
-      return reply.status(409).send({ error: { code: 'CONFLICT', message: 'Já existe um registro com a mesma referência.', correlation_id: request.id } });
-    }
-    markRequestError(request, 'INTERNAL_ERROR');
-    request.log.error({
-      errorType: error instanceof Error ? error.name : 'UnknownError',
-      errorCode: typeof (error as { code?: unknown }).code === 'string'
-        ? (error as { code: string }).code
-        : undefined,
-      errorMessage: env.NODE_ENV === 'production' || !(error instanceof Error) ? undefined : error.message,
-    }, 'Erro não tratado');
-    return reply.status(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Erro interno.', correlation_id: request.id } });
-  });
 
   app.addHook('onClose', async () => {
     await realtime.close();

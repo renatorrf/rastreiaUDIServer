@@ -5,6 +5,7 @@ import type { Database } from '../database/pool.js';
 import { withTransaction } from '../database/pool.js';
 import { decryptPayload } from '../shared/encrypted-payload.js';
 import { companyServiceConfigured, resolveCompanyService, type ResolvedCompanyService } from '../modules/company-settings/company-settings.service.js';
+import { processStartedWhatsApp, queueAutomaticStartedWhatsApp } from '../modules/communications/tracking-whatsapp.service.js';
 
 interface OutboxEvent {
   id: string;
@@ -48,43 +49,7 @@ function payloadSecret(env: AppEnv): string {
   return env.MESSAGE_PAYLOAD_SECRET || env.TRACKING_TOKEN_PEPPER;
 }
 
-function masked(value: string): string {
-  const digits = value.replace(/\D/g, '');
-  return digits.length > 4 ? `****${digits.slice(-4)}` : '****';
-}
-
 function field(service:ResolvedCompanyService,key:string):string{return String(service.values[key]??'').trim();}
-
-function smsConfigured(env: AppEnv,service:ResolvedCompanyService): boolean {
-  return env.COMMUNICATIONS_MOCK || companyServiceConfigured(service);
-}
-
-async function sendWhatsApp(env: AppEnv, service:ResolvedCompanyService,payload: SensitiveMessagePayload): Promise<ProviderResult> {
-  if (env.COMMUNICATIONS_MOCK) return { messageId: `mock-wa-${crypto.randomUUID()}`, statusCode: 200 };
-  const response = await fetch(
-    `https://graph.facebook.com/${field(service,'graphVersion')}/${field(service,'phoneNumberId')}/messages`,
-    {
-      method: 'POST',
-      headers: { authorization: `Bearer ${field(service,'accessToken')}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: payload.whatsappTo.replace(/\D/g, ''),
-        type: 'template',
-        template: {
-          name: field(service,'trackingTemplate'),
-          language: { code: field(service,'templateLanguage') },
-          components: [{ type: 'body', parameters: [{ type: 'text', text: payload.trackingUrl }] }],
-        },
-      }),
-      signal: AbortSignal.timeout(10_000),
-    },
-  );
-  const body = await response.json().catch(() => ({})) as { messages?: Array<{ id?: string }> };
-  if (!response.ok) throw new ProviderError('WHATSAPP_REJECTED', response.status);
-  const messageId = body.messages?.[0]?.id;
-  if (!messageId) throw new ProviderError('WHATSAPP_RESPONSE_INVALID', response.status);
-  return { messageId, statusCode: response.status };
-}
 
 async function sendSms(env: AppEnv, service:ResolvedCompanyService,payload: SensitiveMessagePayload): Promise<ProviderResult> {
   if (env.COMMUNICATIONS_MOCK) return { messageId: `mock-sms-${crypto.randomUUID()}`, statusCode: 200 };
@@ -188,7 +153,7 @@ async function markRetry(
         `UPDATE rastreia.message_deliveries
          SET status = 'FAILED', failed_at = now(), last_error_code = $2,
              last_error_message = 'O provedor não confirmou o envio após as tentativas configuradas.'
-         WHERE id = $1`,
+         WHERE id = $1 AND status IN ('PENDING','RETRYING')`,
         [event.aggregate_id, code.slice(0, 100)],
       );
     }
@@ -197,6 +162,7 @@ async function markRetry(
 }
 
 async function processMessage(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
+  if (await processStartedWhatsApp(database,env,event.tenant_id,event.aggregate_id)) return;
   const result = await database.query<MessageRow>(
     `SELECT message.id,message.tenant_id,message.delivery_id,delivery.company_id,message.channel,message.status,
             message.encrypted_payload,message.attempt_count
@@ -206,6 +172,14 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
   );
   const message = result.rows[0];
   if (!message || ['SENT', 'DELIVERED'].includes(message.status)) return;
+  if (message.channel === 'WHATSAPP') {
+    // Legacy jobs used a one-variable/company template. Do not silently send
+    // stale notices or fall back to SMS after switching this notice to R3 Labs.
+    await database.query(`UPDATE rastreia.message_deliveries SET status='SKIPPED',
+      last_error_code='LEGACY_REVIEW_REQUIRED' WHERE id=$1 AND tenant_id=$2
+      AND status IN ('PENDING','PROCESSING','RETRYING')`,[message.id,event.tenant_id]);
+    return;
+  }
   const payload = decryptPayload<SensitiveMessagePayload>(message.encrypted_payload, payloadSecret(env));
   const attempt = message.attempt_count + 1;
   await database.query(
@@ -213,11 +187,9 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
     [message.id, attempt],
   );
   try {
-    const providerService=await resolveCompanyService(database,env,message.company_id,message.channel==='WHATSAPP'?'WHATSAPP':'SMS');
+    const providerService=await resolveCompanyService(database,env,message.company_id,'SMS');
     if(!env.COMMUNICATIONS_MOCK&&!companyServiceConfigured(providerService))throw new ProviderError(`${message.channel}_NOT_CONFIGURED`);
-    const provider = message.channel === 'WHATSAPP'
-      ? await sendWhatsApp(env,providerService,payload)
-      : await sendSms(env,providerService,payload);
+    const provider = await sendSms(env,providerService,payload);
     await withTransaction(database, async (client) => {
       await client.query(
         `UPDATE rastreia.message_deliveries
@@ -236,8 +208,6 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
     });
   } catch (error) {
     const providerError = error instanceof ProviderError ? error : new ProviderError('PROVIDER_UNAVAILABLE');
-    const smsService=await resolveCompanyService(database,env,message.company_id,'SMS');
-    const fallback = message.channel === 'WHATSAPP' && smsConfigured(env,smsService);
     await withTransaction(database, async (client) => {
       await client.query(
         `INSERT INTO rastreia.notification_attempts
@@ -249,12 +219,10 @@ async function processMessage(database: Database, env: AppEnv, event: OutboxEven
       );
       await client.query(
         `UPDATE rastreia.message_deliveries
-         SET channel = CASE WHEN $2 THEN 'SMS'::rastreia.notification_channel ELSE channel END,
-             destination_masked = CASE WHEN $2 THEN $3 ELSE destination_masked END,
-             status = 'RETRYING', next_attempt_at = now(),
-             last_error_code = $4, last_error_message = 'O provedor não confirmou o envio.'
+         SET status = 'RETRYING', next_attempt_at = now(),
+             last_error_code = $2, last_error_message = 'O provedor não confirmou o envio.'
          WHERE id = $1`,
-        [message.id, fallback, masked(payload.smsTo), providerError.code],
+        [message.id, providerError.code],
       );
     });
     throw providerError;
@@ -565,6 +533,8 @@ export async function processCustomerPush(database: Database, env: AppEnv, event
 }
 
 async function processEvent(database: Database, env: AppEnv, event: OutboxEvent): Promise<void> {
+  // Enqueue once before push: retrying a push must not enqueue another WhatsApp.
+  await queueAutomaticStartedWhatsApp(database,env,event);
   if (event.event_type === 'communication.tracking.requested') await processMessage(database, env, event);
   else if (event.event_type === 'push.test' || event.event_type.startsWith('delivery.') || event.event_type.startsWith('shift.')
       || event.event_type.startsWith('offer.') || event.event_type.startsWith('workday.')) {

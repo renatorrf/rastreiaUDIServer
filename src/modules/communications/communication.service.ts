@@ -10,6 +10,7 @@ import { withIdempotency } from '../../shared/idempotency.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { generateTrackingToken, trackingTokenHash } from '../tracking/tracking-token.js';
 import { companyServiceConfigured, resolveCompanyService, type ResolvedCompanyService } from '../company-settings/company-settings.service.js';
+import { queueStartedWhatsApp } from './tracking-whatsapp.service.js';
 
 export type CustomerMessageChannel = 'WHATSAPP' | 'SMS';
 
@@ -173,16 +174,21 @@ export async function queueTrackingMessage(
   deliveryId: string,
   channel: CustomerMessageChannel,
   ip?: string,
+  retry = false,
 ) {
   return withTenantTransaction(database, auth, async (client) =>
-    withIdempotency(client, auth, key, 'communication.tracking-message', { deliveryId, channel }, async () => {
+    withIdempotency<Record<string,unknown>>(client, auth, key, 'communication.tracking-message', { deliveryId, channel, retry }, async () => {
       const delivery = await loadDeliveryScope(client, auth, deliveryId);
+      if (channel === 'WHATSAPP') {
+        const message = await queueStartedWhatsApp(client,env,{tenantId:auth.tenantId,deliveryId,
+          source:'MANUAL',actorId:auth.userId,retry});
+        if (!message) throw notFound('Entrega não encontrada.');
+        return { statusCode: message.reused ? 200 : 202, body: message };
+      }
       const service=await resolveCompanyService(client,env,delivery.companyId,channel);
       if(!providerConfigured(env,service))throw new AppError(503,'MESSAGE_PROVIDER_NOT_CONFIGURED',
-        `O provedor ${channel === 'WHATSAPP' ? 'WhatsApp' : 'SMS'} ainda não foi configurado para esta empresa.`);
-      const destination = channel === 'WHATSAPP'
-        ? delivery.recipientWhatsapp ?? delivery.recipientPhone
-        : delivery.recipientPhone;
+        'O provedor SMS ainda não foi configurado para esta empresa.');
+      const destination = delivery.recipientPhone;
       const token = generateTrackingToken();
       const absoluteExpiry = new Date(Date.now() + env.TRACKING_TOKEN_TTL_SECONDS * 1000);
       const completedExpiry = delivery.deliveredAt
@@ -193,11 +199,7 @@ export async function queueTrackingMessage(
         throw new AppError(409, 'TRACKING_WINDOW_CLOSED', 'A janela pública desta entrega já foi encerrada.');
       }
 
-      await client.query(
-        `UPDATE tracking_tokens SET revoked_at = now(), revoked_by = $3
-         WHERE tenant_id = $1 AND delivery_id = $2 AND revoked_at IS NULL`,
-        [auth.tenantId, deliveryId, auth.userId],
-      );
+      // Legacy SMS must not invalidate a tracking link already shared by WhatsApp.
       await client.query(
         `INSERT INTO tracking_tokens (tenant_id, delivery_id, token_hash, expires_at, created_by)
          VALUES ($1, $2, $3, $4, $5)`,
@@ -246,9 +248,9 @@ export async function listDeliveryMessages(database: Database, auth: AuthContext
               provider_message_id AS "providerMessageId", attempt_count AS "attemptCount",
               sent_at AS "sentAt", delivered_at AS "deliveredAt", failed_at AS "failedAt",
               last_error_code AS "lastErrorCode", last_error_message AS "lastErrorMessage",
-              created_at AS "createdAt", updated_at AS "updatedAt"
-       FROM message_deliveries WHERE delivery_id = $1 ORDER BY created_at DESC LIMIT 20`,
-      [deliveryId],
+              created_at AS "createdAt", updated_at AS "updatedAt",trigger_source AS "triggerSource",purpose
+       FROM message_deliveries WHERE delivery_id = $1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 20`,
+      [deliveryId,auth.tenantId],
     );
     return { data: result.rows };
   });

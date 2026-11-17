@@ -156,12 +156,8 @@ export async function issueTrackingLink(
       throw conflict('A janela pública desta entrega já foi encerrada.');
     }
 
-    await client.query(
-      `UPDATE tracking_tokens
-       SET revoked_at = now(), revoked_by = $3
-       WHERE tenant_id = $1 AND delivery_id = $2 AND revoked_at IS NULL`,
-      [auth.tenantId, deliveryId, auth.userId],
-    );
+    // Issuing a manual link must not invalidate the notice already sent by WhatsApp.
+    // Explicit revocation below still invalidates all links for the delivery.
     const created = await client.query<{ id: string }>(
       `INSERT INTO tracking_tokens
          (tenant_id, delivery_id, token_hash, expires_at, created_by)

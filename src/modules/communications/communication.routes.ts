@@ -16,7 +16,7 @@ const subscriptionSchema = z.object({
 });
 const removeSchema = z.object({ endpoint: z.url().max(4096) });
 const deliveryIdSchema = z.object({ id: z.uuid() });
-const channelSchema = z.object({ channel: z.enum(['WHATSAPP', 'SMS']) });
+const channelSchema = z.object({ channel: z.enum(['WHATSAPP', 'SMS']), retry: z.boolean().default(false) });
 
 function sendIdempotent<T>(reply: FastifyReply, result: IdempotentResult<T>) {
   reply.header('Idempotency-Replayed', result.replayed ? 'true' : 'false');
@@ -51,9 +51,9 @@ export async function communicationRoutes(app: FastifyInstance, database: Databa
     preHandler: [auth, requireRoles('TENANT_MANAGER', 'STORE_OPERATOR')],
   }, async (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = deliveryIdSchema.parse(request.params);
-    const { channel } = channelSchema.parse(request.body);
+    const { channel, retry } = channelSchema.parse(request.body);
     const result = await queueTrackingMessage(database, env, request.auth,
-      parseIdempotencyKey(request.headers['idempotency-key']), id, channel, request.ip);
+      parseIdempotencyKey(request.headers['idempotency-key']), id, channel, request.ip, retry);
     return sendIdempotent(reply, result);
   });
 
