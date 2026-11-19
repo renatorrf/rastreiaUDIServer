@@ -20,11 +20,12 @@ export function assertVersion(actual:number,expected:number){if(actual!==expecte
 export async function saveVariant(client:PoolClient,auth:AuthContext,store:string,product:string,input:z.infer<typeof variantSchema>,id?:string,expected?:number){
   await requireCommerceStore(client,store);
   // Same order as product updates/default-variant synchronization: product, then variant.
-  const parent=(await client.query('SELECT id FROM commerce_products WHERE id=$1 AND store_id=$2 FOR UPDATE',[product,store])).rows[0];
+  const parent=(await client.query('SELECT id,addons FROM commerce_products WHERE id=$1 AND store_id=$2 FOR UPDATE',[product,store])).rows[0];
   if(!parent)throw notFound();
   if(!id&&(await client.query('SELECT count(*)::int AS count FROM commerce_variants WHERE product_id=$1',[product])).rows[0]!.count>=100)throw conflict('Limite de 100 variantes por produto atingido.');
   const before=id?(await client.query('SELECT * FROM commerce_variants WHERE id=$1 AND product_id=$2 AND store_id=$3 FOR UPDATE',[id,product,store])).rows[0]:undefined;
   if(id&&!before)throw notFound();if(before)assertVersion(Number(before.version),expected!);
+  if(before?.addon_keys || (parent.addons?.length && (!before?.is_default || !input.active || input.attributes.size || input.attributes.color)))throw conflict('Gerencie os adicionais no cadastro do produto.');
   if(before?.is_default&&(before.sku!==input.sku||before.price_cents!==input.priceCents||before.cost_cents!==input.costCents))throw conflict('Edite o SKU, preço e custo da variante padrão no cadastro do produto.');
   const values=[id??auth.tenantId,store,product,input.name,input.sku,JSON.stringify(input.attributes),input.priceCents,input.costCents,input.minimumStock,input.active];
   const row=(await client.query(id?`UPDATE commerce_variants SET name=$4,sku=$5,attributes=$6,price_cents=$7,cost_cents=$8,minimum_stock=$9,active=$10,version=version+1,updated_at=now()

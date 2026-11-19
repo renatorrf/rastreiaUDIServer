@@ -14,6 +14,7 @@ export const productSchema = z.object({
   description: z.string().trim().max(2000).default(''), categoryId: z.string().uuid().nullable(),
   priceCents: cents, costCents: cents, active: z.boolean(),
   stockMode: z.enum(['STOCKED', 'MADE_TO_ORDER']).optional(),
+  addons:z.array(z.object({name:z.string().trim().min(1).max(24).regex(/^[^+\r\n]+$/),priceCents:cents}).strict()).max(4).refine(a=>new Set(a.map(v=>v.name.toLowerCase())).size===a.length,'Nomes de adicionais devem ser únicos.').optional(),
   acceptsNotes: z.boolean().optional(),
 }).strict();
 export const planSchema = z.object({

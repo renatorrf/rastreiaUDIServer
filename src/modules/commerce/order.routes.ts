@@ -60,8 +60,8 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     return {...order,qrDataUrl:order.payment?.copyPaste?await QRCode.toDataURL(order.payment.copyPaste,{width:320,margin:2,errorCorrectionLevel:'M'}):null};
   });
   app.get('/customer/commerce/orders',async(req,reply)=>{
-    const f=pageSchema.parse(req.query);reply.header('Cache-Control','no-store');return identity(req,async c=>({data:(await c.query(
-      "SELECT commerce_order_read(id)||jsonb_build_object('serverTime',clock_timestamp()) AS data FROM commerce_orders WHERE customer_user_id=current_user_id() ORDER BY created_at DESC,id LIMIT $1 OFFSET $2",[f.limit,f.offset])).rows.map((r:{data:unknown})=>r.data)}));
+    const f=pageSchema.extend({status:z.enum(['ALL','ACTIVE']).default('ALL')}).parse(req.query);reply.header('Cache-Control','no-store');return identity(req,async c=>({data:(await c.query(
+      "SELECT commerce_order_read(id)||jsonb_build_object('serverTime',clock_timestamp()) AS data FROM commerce_orders WHERE customer_user_id=current_user_id() AND ($3::boolean OR status NOT IN ('COMPLETED','CANCELLED','EXPIRED')) ORDER BY created_at DESC,id LIMIT $1 OFFSET $2",[f.limit,f.offset,f.status==='ALL'])).rows.map((r:{data:unknown})=>r.data)}));
   });
   app.get('/customer/commerce/orders/:id',async(req,reply)=>{
     const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');return identity(req,async c=>{

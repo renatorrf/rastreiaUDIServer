@@ -76,6 +76,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0064_commerce_store_identity.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0067_commerce_pix_checkout.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0068_commerce_store_approval.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0073_product_addons.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -611,6 +612,20 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     expect((await pg.query('SELECT * FROM commerce_orders')).rows).toHaveLength(0);
     expect((await pg.query<{data:unknown}>('SELECT commerce_order_read($1) AS data',[order.id])).rows[0]!.data).toBeNull();
     await expect(pg.query('SELECT commerce_order_transition($1,$2,1,\'CONFIRMED\',\'\')',[order.id,store])).rejects.toMatchObject({code:'42501'});
+  }));
+  it('prices free and paid extras together and carries the selected preparation into checkout',()=>context('manager',async()=>{
+    const {id,v,checkout}=await checkoutFixture(true);
+    const addons=[{name:'Molho',priceCents:0},{name:'Bacon',priceCents:300}];
+    await saveProduct(client,auth,store,{...product,stockMode:'MADE_TO_ORDER',addons},v.productId,1);
+    const listing=(await pg.query<{data:{data:Array<{addons:unknown;variants:Array<{id:string;addonKeys:string[]|null;priceCents:number}>}>}}>("SELECT commerce_public_products('loja-carrinho','',null,10,0) AS data")).rows[0]!.data.data[0]!;
+    expect(listing.addons).toEqual(addons);
+    expect(listing.variants.find(v=>v.addonKeys?.join()==='Molho')?.priceCents).toBe(2500);
+    const both=listing.variants.find(v=>v.addonKeys?.length===2)!;expect(both.priceCents).toBe(2800);
+    await setCart(id,v.id,0,2);
+    await pg.query('SELECT commerce_cart_change_with_notes($1,$2,$3,2,3,$4,$5,false,$6)',[id,ownerHash,both.id,randomUUID(),requestHash({test:'extras'}),'Sem alface']);
+    const order=await checkout(ownerHash,4);
+    expect(order.subtotalCents).toBe(5600);
+    expect(order.items[0]).toMatchObject({variantName:'Com Bacon + Molho',preparationNotes:'Sem alface'});
   }));
   it('uses company activity for new products without rewriting existing stock settings',()=>context('manager',async()=>{
     const existing=await saveProduct(client,auth,store,product);
