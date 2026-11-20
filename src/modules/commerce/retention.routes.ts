@@ -16,11 +16,11 @@ export const retentionSql=`WITH sales AS (
  (o.created_at AT TIME ZONE 'America/Sao_Paulo')::date AS order_day FROM commerce_orders o
  JOIN commerce_finance_sales s ON s.order_id=o.id AND s.store_id=o.store_id WHERE o.store_id=$1
 ), customers AS (
- SELECT uid,(array_agg(customer_name ORDER BY created_at DESC,id))[1] name,count(*)::int orders,
+ SELECT uid,(array_agg(customer_name ORDER BY created_at DESC,id))[1] AS name,count(*)::int orders,
  sum(revenue_cents)::float8 revenue,(now() AT TIME ZONE 'America/Sao_Paulo')::date-max(order_day) AS days,
  round((max(order_day)-min(order_day))::numeric/nullif(count(*)-1,0),1)::float8 cadence FROM sales GROUP BY uid
 ), products AS (
- SELECT s.uid,v.product_id,(array_agg(i.product_name ORDER BY s.created_at DESC,i.variant_id))[1] name,sum(i.quantity)::int units,
+ SELECT s.uid,v.product_id,(array_agg(i.product_name ORDER BY s.created_at DESC,i.variant_id))[1] AS name,sum(i.quantity)::int units,
  row_number() OVER(PARTITION BY s.uid ORDER BY sum(i.quantity) DESC,max(s.created_at) DESC,v.product_id) rank
  FROM sales s JOIN commerce_order_items i ON i.order_id=s.id AND i.store_id=$1 JOIN commerce_variants v ON v.id=i.variant_id
  GROUP BY s.uid,v.product_id
@@ -35,7 +35,7 @@ export const retentionSql=`WITH sales AS (
  FROM products p WHERE p.uid=a.uid AND rank<=3),'[]') favorites FROM audience a ORDER BY days DESC,uid LIMIT 30 OFFSET $5
 ) SELECT (SELECT count(*)::int FROM registered) registered,(SELECT count(*)::int FROM customers) buyers,
  (SELECT coalesce(sum(revenue),0)::float8 FROM customers) revenue,(SELECT count(*)::int FROM customers WHERE days >= $2 AND orders >= $3) candidates,
- (SELECT count(*)::int FROM audience) total,coalesce((SELECT jsonb_agg(to_jsonb(page) ORDER BY days DESC,uid) FROM page),'[]') rows`;
+ (SELECT count(*)::int FROM audience) total,coalesce((SELECT jsonb_agg(to_jsonb(page) ORDER BY days DESC,uid) FROM page),'[]') AS rows`;
 export async function retentionRoutes(app:FastifyInstance,db:Database,env:AppEnv){
  const manager=[authenticate(env,db),requireRoles('TENANT_MANAGER')],base='/commerce/stores/:storeId/retention';
  const store=(params:unknown)=>z.object({storeId:z.uuid()}).parse(params).storeId;
