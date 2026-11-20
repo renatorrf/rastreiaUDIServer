@@ -7,14 +7,15 @@ export const listSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
   offset: z.coerce.number().int().min(0).max(100000).default(0),
 });
-export const categorySchema = z.object({ name: z.string().trim().min(2).max(100), active: z.boolean() }).strict();
+const addonList=z.array(z.object({name:z.string().trim().min(1).max(24).regex(/^[^+\r\n]+$/),priceCents:cents}).strict()).max(4).refine(a=>new Set(a.map(v=>v.name.toLowerCase())).size===a.length,'Nomes de adicionais devem ser únicos.').optional();
+export const categorySchema = z.object({ name: z.string().trim().min(2).max(100), active: z.boolean(),isAddon:z.boolean().optional(),addons:addonList }).strict();
 export const productSchema = z.object({
   name: z.string().trim().min(2).max(160), sku: z.string().trim().min(1).max(80),
   barcode: z.string().regex(/^[0-9]{8,14}$/).nullable().optional(),
   description: z.string().trim().max(2000).default(''), categoryId: z.string().uuid().nullable(),
   priceCents: cents, costCents: cents, active: z.boolean(),
   stockMode: z.enum(['STOCKED', 'MADE_TO_ORDER']).optional(),
-  addons:z.array(z.object({name:z.string().trim().min(1).max(24).regex(/^[^+\r\n]+$/),priceCents:cents}).strict()).max(4).refine(a=>new Set(a.map(v=>v.name.toLowerCase())).size===a.length,'Nomes de adicionais devem ser únicos.').optional(),
+  addons:addonList,addonCategoryId:z.uuid().nullable().optional(),
   acceptsNotes: z.boolean().optional(),
 }).strict();
 export const planSchema = z.object({

@@ -7,7 +7,7 @@ import { AppError, conflict, notFound } from '../../shared/errors.js';
 import type { categorySchema, planSchema, productSchema, subscriptionSchema } from './commerce.schemas.js';
 
 export const productSelect = `SELECT p.id,p.store_id AS "storeId",p.name,p.sku,p.barcode,p.description,
- p.addons,p.stock_mode AS "stockMode",p.accepts_notes AS "acceptsNotes",c.active AS "categoryActive",
+ p.addon_category_id AS "addonCategoryId",p.addons,p.stock_mode AS "stockMode",p.accepts_notes AS "acceptsNotes",c.active AS "categoryActive",
  (SELECT count(*)::int FROM commerce_variants v WHERE v.product_id=p.id AND v.active) AS "activeVariantCount",
  (SELECT i.id FROM commerce_product_images i WHERE i.product_id=p.id AND NOT i.archived ORDER BY i.position,i.id LIMIT 1) AS "coverImageId",
  p.category_id AS "categoryId",c.name AS "categoryName",p.price_cents AS "priceCents",
@@ -39,10 +39,15 @@ export async function saveCategory(client: PoolClient, auth: AuthContext, storeI
   const before = id ? (await client.query('SELECT * FROM commerce_categories WHERE id=$1 AND store_id=$2 FOR UPDATE', [id,storeId])).rows[0] : undefined;
   if (id && !before) throw notFound();
   if (before) checkVersion(before.version as number, expectedVersion!);
+  const group=input.isAddon??before?.is_addon??false, options=group?(input.addons??before?.addons??[]):[];
+  if(group && !options.length)throw conflict('Cadastre ao menos um adicional nesta categoria.');
+  if(group && id && (await client.query('SELECT 1 FROM commerce_products WHERE category_id=$1 LIMIT 1',[id])).rowCount)throw conflict('Mova os produtos desta categoria antes de transformá-la em adicionais.');
+  if(id && (!group||!input.active) && (await client.query('SELECT 1 FROM commerce_products WHERE addon_category_id=$1 LIMIT 1',[id])).rowCount)throw conflict('Desvincule os produtos antes de arquivar ou alterar o tipo desta categoria.');
   const row = (await client.query(id
-    ? 'UPDATE commerce_categories SET name=$3,active=$4,version=version+1,updated_at=now() WHERE id=$1 AND store_id=$2 RETURNING id'
-    : 'INSERT INTO commerce_categories(tenant_id,store_id,name,active) VALUES($1,$2,$3,$4) RETURNING id',
-  [id ?? auth.tenantId,storeId,input.name,input.active])).rows[0]!;
+    ? 'UPDATE commerce_categories SET name=$3,active=$4,is_addon=$5,addons=$6,version=version+1,updated_at=now() WHERE id=$1 AND store_id=$2 RETURNING id'
+    : 'INSERT INTO commerce_categories(tenant_id,store_id,name,active,is_addon,addons) VALUES($1,$2,$3,$4,$5,$6) RETURNING id',
+  [id ?? auth.tenantId,storeId,input.name,input.active,group,JSON.stringify(options)])).rows[0]!;
+  if(group && id)await client.query('UPDATE commerce_products SET addons=$2,version=version+1,updated_at=now() WHERE addon_category_id=$1 AND addons<>$2::jsonb',[id,JSON.stringify(options)]);
   await writeAudit(client,{tenantId:auth.tenantId,actorUserId:auth.userId,action:id?'commerce.category.updated':'commerce.category.created',
     entityType:'commerce_category',entityId:row.id as string,beforeData:before,afterData:input});
   return row;
@@ -53,23 +58,26 @@ export async function saveProduct(client: PoolClient, auth: AuthContext, storeId
   const before = id ? (await client.query('SELECT * FROM commerce_products WHERE id=$1 AND store_id=$2 FOR UPDATE',[id,storeId])).rows[0] : undefined;
   if (id && !before) throw notFound();
   if (before) checkVersion(before.version as number,expectedVersion!);
-  if (input.categoryId && !(await client.query('SELECT id FROM commerce_categories WHERE id=$1 AND store_id=$2',[input.categoryId,storeId])).rowCount)
+  if (input.categoryId && !(await client.query('SELECT id FROM commerce_categories WHERE id=$1 AND store_id=$2 AND NOT is_addon FOR SHARE',[input.categoryId,storeId])).rowCount)
     throw conflict('Selecione uma categoria desta unidade.');
   const company=(await client.query<{activity:string}>('SELECT c.business_activity AS activity FROM companies c JOIN stores s ON s.company_id=c.id AND s.tenant_id=c.tenant_id WHERE s.id=$1',[storeId])).rows[0];
   const food=company?.activity==='FOOD';
   if(input.acceptsNotes && !food && !before?.accepts_notes)throw conflict('Observações de preparo são habilitadas para empresas de alimentação.');
-  const addons=input.addons??before?.addons??[];
+  const groupId=input.addonCategoryId===undefined?before?.addon_category_id??null:input.addonCategoryId;
+  const category=groupId?(await client.query('SELECT addons FROM commerce_categories WHERE id=$1 AND store_id=$2 AND is_addon AND active FOR SHARE',[groupId,storeId])).rows[0]:null;
+  if(groupId&&!category)throw conflict('Selecione uma categoria de adicionais ativa desta unidade.');
+  const addons=category?.addons??input.addons??(before?.addon_category_id?[]:before?.addons??[]);
   if(addons.length){
     if((input.stockMode??before?.stock_mode??(food?'MADE_TO_ORDER':'STOCKED'))!=='MADE_TO_ORDER')throw conflict('Adicionais exigem produção sob encomenda.');
     if(input.priceCents+addons.reduce((n:number,a:{priceCents:number})=>n+a.priceCents,0)>100000000)throw conflict('Preço com adicionais acima do limite.');
     if(id && (await client.query('SELECT 1 FROM commerce_variants WHERE product_id=$1 AND active AND NOT is_default AND addon_keys IS NULL',[id])).rowCount)throw conflict('Arquive as variantes personalizadas antes de ativar adicionais.');
     if(id && !(await client.query("SELECT 1 FROM commerce_variants WHERE product_id=$1 AND is_default AND active AND coalesce(attributes->>'size','')='' AND coalesce(attributes->>'color','')=''",[id])).rowCount)throw conflict('Ative a opção padrão sem tamanho ou cor para configurar adicionais.');
   }
-  const values=[id ?? auth.tenantId,storeId,input.name,input.sku,input.description,input.categoryId,input.priceCents,input.costCents,input.active,input.barcode===undefined?(before?.barcode??null):input.barcode,input.stockMode??before?.stock_mode??(food?'MADE_TO_ORDER':'STOCKED'),input.acceptsNotes??before?.accepts_notes??food,JSON.stringify(addons)];
+  const values=[id ?? auth.tenantId,storeId,input.name,input.sku,input.description,input.categoryId,input.priceCents,input.costCents,input.active,input.barcode===undefined?(before?.barcode??null):input.barcode,input.stockMode??before?.stock_mode??(food?'MADE_TO_ORDER':'STOCKED'),input.acceptsNotes??before?.accepts_notes??food,JSON.stringify(addons),groupId];
   const row=(await client.query(id ? `UPDATE commerce_products SET name=$3,sku=$4,description=$5,category_id=$6,
-    price_cents=$7,cost_cents=$8,active=$9,barcode=$10,stock_mode=$11,accepts_notes=$12,addons=$13,version=version+1,updated_at=now() WHERE id=$1 AND store_id=$2 RETURNING id`
-    : `INSERT INTO commerce_products(tenant_id,store_id,name,sku,description,category_id,price_cents,cost_cents,active,barcode,stock_mode,accepts_notes,addons)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,values)).rows[0]!;
+    price_cents=$7,cost_cents=$8,active=$9,barcode=$10,stock_mode=$11,accepts_notes=$12,addons=$13,addon_category_id=$14,version=version+1,updated_at=now() WHERE id=$1 AND store_id=$2 RETURNING id`
+    : `INSERT INTO commerce_products(tenant_id,store_id,name,sku,description,category_id,price_cents,cost_cents,active,barcode,stock_mode,accepts_notes,addons,addon_category_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,values)).rows[0]!;
   await writeAudit(client,{tenantId:auth.tenantId,actorUserId:auth.userId,action:id?'commerce.product.updated':'commerce.product.created',
     entityType:'commerce_product',entityId:row.id as string,beforeData:before,afterData:input});
   return (await client.query(`${productSelect} WHERE p.id=$1`,[row.id])).rows[0];

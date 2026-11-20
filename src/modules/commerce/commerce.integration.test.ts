@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { retentionSql } from './retention.routes.js';
 import { financeReport,seedFinanceCategories,createFinanceEntry,settleFinanceEntry,reverseFinanceSettlement,cancelFinanceEntry,initializeFinanceCost,today } from './finance.service.js';
 import { financeEntry,financePeriod,financeCategory } from './finance.schemas.js';
 import Fastify from 'fastify';
@@ -53,7 +54,8 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
       CREATE TABLE tenants(id uuid PRIMARY KEY,status text DEFAULT 'ACTIVE');
       CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
       CREATE TABLE stores(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,name text DEFAULT 'Loja teste',status text DEFAULT 'ACTIVE',UNIQUE(id,tenant_id));
-      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,status text);
+      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,status text,customer_profile_id uuid);
+      GRANT SELECT ON deliveries TO rastreia_runtime;
       CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE',must_change_password boolean DEFAULT false);
       CREATE TABLE customer_profiles(id uuid PRIMARY KEY,user_id uuid,tenant_id uuid,first_name text,last_name text,whatsapp_normalized text,status text DEFAULT 'ACTIVE',updated_at timestamptz DEFAULT now(),address_line text,address_number text,complement text,neighborhood text,city text,state text,postal_code text,latitude float8,longitude float8);
       CREATE TABLE tenant_users(tenant_id uuid,user_id uuid,role text,status text DEFAULT 'ACTIVE');
@@ -77,6 +79,9 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0067_commerce_pix_checkout.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0068_commerce_store_approval.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0073_product_addons.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0074_addon_categories.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0075_retention_rules.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0076_retention_offers.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -92,6 +97,30 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     expect(financeCategory.safeParse({name:'Aluguel',direction:'IN',dreGroup:'FIXED'}).success).toBe(false);
     expect(financeEntry.safeParse({categoryId:randomUUID(),description:'Despesa teste',amountCents:10.1,competenceDate:today(),dueDate:today()}).success).toBe(false);
   });
+  it('retention separates registered buyers from recognized revenue and ranks bought units',()=>context('manager',async()=>{
+    const {checkout}=await checkoutFixture();const order=await checkout();
+    const report=async(s=store,preview=false)=>(await pg.query(retentionSql,[s,30,2,preview,0])).rows[0];
+    expect(await report()).toMatchObject({registered:1,buyers:0,revenue:0});
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    expect(await report()).toMatchObject({buyers:1,revenue:order.subtotalCents,rows:[{orders:1,cadence:null,favorites:[{units:2}]}]});
+    expect(await report(store,true)).toMatchObject({candidates:0,rows:[]});
+    expect(await report(sibling)).toMatchObject({buyers:0,rows:[]});
+  }));
+  it('redeems only one favorite unit, preserves freight and replays without a second discount',()=>context('manager',async()=>{
+    const f=await approvalFixture(),o=await f.submit(),id=randomUUID();
+    await pg.query("INSERT INTO retention_offers(id,store_id,user_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch) VALUES($1,$2,$3,$3,$4,'Café','Loja','loja-carrinho','Cliente',10,now()+interval '1 day','APP')",[id,store,manager,f.v.productId]);
+    for(let i=0;i<2;i++)expect((await pg.query<{data:TestOrder&{totalCents:number}}>('SELECT retention_apply($1,$2,250) data',[id,o.id])).rows[0]?.data).toMatchObject({subtotalCents:4750,totalCents:5500});
+  }));
+  it('rejects a discount different from the one-unit quote',()=>context('manager',async()=>{
+    const f=await approvalFixture(),o=await f.submit(),id=randomUUID();
+    await pg.query("INSERT INTO retention_offers(id,store_id,user_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch) VALUES($1,$2,$3,$3,$4,'Café','Loja','loja-carrinho','Cliente',10,now()+interval '1 day','APP')",[id,store,manager,f.v.productId]);
+    await expect(pg.query('SELECT retention_apply($1,$2,500)',[id,o.id])).rejects.toThrow('Review offer');
+  }));
+  it('rejects WhatsApp opt-in after a number-wide unsubscribe',()=>context('manager',async()=>{
+    await privileged("INSERT INTO retention_whatsapp_stops VALUES('5534999999999',now())");
+    await expect(pg.query("INSERT INTO retention_preferences VALUES($1,$2,'5534999999999',true,now())",[store,manager])).rejects.toThrow('Number opted out');
+  }));
   it('finance freezes weighted cost on confirmation and recognizes only completed sales',()=>context('manager',async()=>{
     const {v,checkout}=await checkoutFixture();
     await initializeFinanceCost(client,auth,store,v.id,{expectedVersion:2,unitCostCents:1000,reason:'Custo inicial conferido'});
@@ -612,6 +641,18 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     expect((await pg.query('SELECT * FROM commerce_orders')).rows).toHaveLength(0);
     expect((await pg.query<{data:unknown}>('SELECT commerce_order_read($1) AS data',[order.id])).rows[0]!.data).toBeNull();
     await expect(pg.query('SELECT commerce_order_transition($1,$2,1,\'CONFIRMED\',\'\')',[order.id,store])).rejects.toMatchObject({code:'42501'});
+  }));
+  it('shares addon prices across linked products and rejects cross-store links',()=>context('manager',async()=>{
+    const group={name:'Extras',active:true,isAddon:true,addons:[{name:'Bacon',priceCents:300}]};
+    const category=await saveCategory(client,auth,store,group);
+    const input={...product,stockMode:'MADE_TO_ORDER' as const,addonCategoryId:category.id};
+    for(const sku of ['L1','L2'])expect(await saveProduct(client,auth,store,{...input,sku})).toMatchObject({addons:group.addons});
+    await expect(saveProduct(client,auth,sibling,input)).rejects.toMatchObject({statusCode:404});
+    await expect(saveProduct(client,auth,store,{...input,addonCategoryId:randomUUID()})).rejects.toMatchObject({statusCode:409});
+    await expect(saveProduct(client,auth,store,{...product,categoryId:category.id})).rejects.toMatchObject({statusCode:409});
+    await saveCategory(client,auth,store,{...group,addons:[{name:'Bacon',priceCents:400}]},category.id,1);
+    expect((await pg.query('SELECT v.price_cents FROM commerce_variants v JOIN commerce_products p ON p.id=v.product_id WHERE p.addon_category_id=$1 AND v.active AND v.addon_keys IS NOT NULL',[category.id])).rows).toEqual([{price_cents:2900},{price_cents:2900}]);
+    await expect(saveCategory(client,auth,store,{...group,active:false},category.id,2)).rejects.toMatchObject({statusCode:409});
   }));
   it('prices free and paid extras together and carries the selected preparation into checkout',()=>context('manager',async()=>{
     const {id,v,checkout}=await checkoutFixture(true);

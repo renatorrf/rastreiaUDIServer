@@ -57,7 +57,7 @@ export async function commerceRoutes(app: FastifyInstance, database: Database, e
   });
   app.get('/commerce/stores/:storeId/categories',{preHandler:manager},request=>withTenantTransaction(database,request.auth,async client=>{
     const {storeId}=storeParams.parse(request.params);await requireCommerceStore(client,storeId);
-    return {data:(await client.query('SELECT id,name,active,version FROM commerce_categories WHERE store_id=$1 ORDER BY name,id LIMIT 500',[storeId])).rows};
+    return {data:(await client.query('SELECT id,name,active,version,is_addon AS "isAddon",addons FROM commerce_categories WHERE store_id=$1 ORDER BY name,id LIMIT 500',[storeId])).rows};
   }));
   app.post('/commerce/stores/:storeId/categories',{preHandler:manager},(request,reply)=>{
     const {storeId}=storeParams.parse(request.params);const input=categorySchema.parse(request.body);

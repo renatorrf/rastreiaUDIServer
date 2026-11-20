@@ -13,9 +13,11 @@ import { confirmationPasswordSchema,confirmManagerPassword } from '../auth/confi
 import { pixConnection,storePaymentSettings } from './pix.service.js';
 import QRCode from 'qrcode';
 import { writeAudit } from '../../shared/audit.js';
+import {whatsappRecipient} from '../communications/tracking-whatsapp.service.js';
 
 export const checkoutSchema=z.object({expectedVersion:z.number().int().positive(),paymentVersion:z.number().int().nonnegative(),paymentMethod:z.enum(['PIX','CARD_PRESENT']),fulfillment:z.enum(['DELIVERY','PICKUP']),
-  profileId:z.uuid(),profileVersion:z.string().min(10).max(80).refine(value=>!Number.isNaN(Date.parse(value)), 'Confira a versão do cadastro.'),consent:z.literal(true)}).strict();
+  profileId:z.uuid(),profileVersion:z.string().min(10).max(80).refine(value=>!Number.isNaN(Date.parse(value)), 'Confira a versão do cadastro.'),consent:z.literal(true),
+  offer:z.object({id:z.uuid(),discount:z.number().int().positive()}).strict().optional()}).strict();
 export const orderTransitionSchema=z.object({expectedVersion:z.number().int().positive(),status:z.enum(['CONFIRMED','CANCELLED','READY_PICKUP','COMPLETED']),reason:z.string().trim().max(500).default('')}).strict()
   .refine(v=>v.status!=='CANCELLED'||v.reason.length>=5,{message:'Informe o motivo do cancelamento.',path:['reason']});
 const pageSchema=z.object({limit:z.coerce.number().int().min(1).max(50).default(20),offset:z.coerce.number().int().min(0).max(10000).default(0)});
@@ -33,6 +35,33 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
       const user=(await c.query<{must_change_password:boolean}>('SELECT must_change_password FROM users WHERE id=$1',[auth.userId])).rows[0];
       if(user?.must_change_password)throw conflict('Defina sua senha pessoal antes de continuar.');return run(c);});
   };
+  const offerSelect=`SELECT id,store_name AS "storeName",slug,product_name AS "productName",product_id AS "productId",
+    percent,expires_at AS "expiresAt",order_id IS NOT NULL AS used,expires_at<=now() AS expired
+    FROM retention_offers WHERE user_id=current_user_id()`;
+  app.get('/customer/commerce/offers/:id',async(req,reply)=>{
+    const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
+    return identity(req,async c=>{const row=(await c.query(offerSelect+' AND id=$1',[id])).rows[0];if(!row)throw notFound();return row;});
+  });
+  app.get('/customer/commerce/offers',async(req,reply)=>{
+    reply.header('Cache-Control','no-store');return identity(req,async c=>({
+      offers:(await c.query(offerSelect+' AND expires_at>now() AND order_id IS NULL ORDER BY expires_at LIMIT 100')).rows,
+      stores:(await c.query(`SELECT DISTINCT ON(o.store_id) o.store_id AS id,commerce_order_read(o.id)->>'storeName' AS name,
+        coalesce(p.enabled,false) AS enabled FROM commerce_orders o LEFT JOIN retention_preferences p
+        ON p.user_id=o.customer_user_id AND p.store_id=o.store_id WHERE o.customer_user_id=current_user_id() ORDER BY o.store_id,o.created_at DESC`)).rows
+    }));
+  });
+  app.patch('/customer/commerce/offers/preferences/:storeId',async(req,reply)=>{
+    const {storeId}=z.object({storeId:z.uuid()}).parse(req.params),{enabled}=z.object({enabled:z.boolean()}).strict().parse(req.body);
+    reply.header('Cache-Control','no-store');return identity(req,async c=>{
+      if(!enabled){await c.query('UPDATE retention_preferences SET enabled=false,updated_at=now() WHERE user_id=current_user_id() AND store_id=$1',[storeId]);return {enabled};}
+      const row=(await c.query(`SELECT cp.whatsapp_normalized phone FROM customer_profiles cp WHERE cp.user_id=current_user_id() AND cp.status='ACTIVE'
+        AND EXISTS(SELECT 1 FROM commerce_orders o WHERE o.customer_user_id=cp.user_id AND o.tenant_id=cp.tenant_id AND o.store_id=$1)
+        ORDER BY cp.updated_at DESC,cp.id LIMIT 1`,[storeId])).rows[0];
+      const phone=whatsappRecipient(row?.phone??'');if(!phone)throw conflict('Confira o WhatsApp do cadastro antes de autorizar.');
+      await c.query(`INSERT INTO retention_preferences(store_id,user_id,whatsapp,enabled) VALUES($1,current_user_id(),$2,true)
+        ON CONFLICT(store_id,user_id) DO UPDATE SET whatsapp=excluded.whatsapp,enabled=true,updated_at=now()`,[storeId,phone]).catch((e:unknown)=>{if((e as {code?:string}).code==='23514')throw conflict('As ofertas estão bloqueadas para este número.');throw e;});return {enabled};
+    });
+  });
   app.get('/customer/commerce/checkout-profile',async(req,reply)=>{
     reply.header('Cache-Control','no-store');return identity(req,async c=>{
       const row=(await c.query(`SELECT id AS "profileId",updated_at::text AS "profileVersion",first_name||' '||last_name AS name,whatsapp_normalized AS whatsapp,
@@ -45,8 +74,10 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     const {id}=z.object({id:z.uuid()}).parse(req.params),input=checkoutSchema.parse(req.body);
     parseIdempotencyKey(req.headers['idempotency-key']);const owner=cartTokenHash(req.headers['x-commerce-cart-token']);
     reply.header('Cache-Control','no-store');
-    try{return await identity(req,async c=>(await c.query('SELECT commerce_checkout_for_approval($1,$2,$3,$4,$5,$6,$7,$8,$9) AS data',
-      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion,input.paymentVersion,input.paymentMethod])).rows[0]!.data);}catch(e){return orderError(e);}
+    try{return await identity(req,async c=>{const order=(await c.query('SELECT commerce_checkout_for_approval($1,$2,$3,$4,$5,$6,$7,$8,$9) AS data',
+      [id,owner,input.expectedVersion,requestHash(input),input.fulfillment,input.profileId,input.profileVersion,input.paymentVersion,input.paymentMethod])).rows[0]!.data;
+      return input.offer?(await c.query('SELECT retention_apply($1,$2,$3) AS data',[input.offer.id,order.id,input.offer.discount])).rows[0]!.data:order;
+    });}catch(e){return orderError(e);}
   });
   app.get('/customer/commerce/carts/:id/payment-quote',async(req,reply)=>{
     const {id}=z.object({id:z.uuid()}).parse(req.params),owner=cartTokenHash(req.headers['x-commerce-cart-token']);reply.header('Cache-Control','no-store');

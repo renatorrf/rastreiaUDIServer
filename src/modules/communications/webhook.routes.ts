@@ -5,6 +5,7 @@ import type { AppEnv } from '../../config/env.js';
 import type { Database } from '../../database/pool.js';
 import { withTransaction } from '../../database/pool.js';
 import { AppError } from '../../shared/errors.js';
+import {stoppedRecipients} from './retention-whatsapp.js';
 
 const verificationSchema = z.object({
   'hub.mode': z.string(),
@@ -125,6 +126,15 @@ export async function communicationWebhookRoutes(
       throw new AppError(401, 'WEBHOOK_SIGNATURE_INVALID', 'Assinatura do webhook inválida.');
     }
     const payloadHash = createHash('sha256').update(raw).digest('hex');
+    for(const phone of stoppedRecipients(request.body,env.WHATSAPP_PHONE_NUMBER_ID)){
+      if(!signatureValid(raw,request.headers['x-hub-signature-256'] as string|undefined,env.WHATSAPP_APP_SECRET))
+        throw new AppError(401,'WEBHOOK_SIGNATURE_INVALID','Assinatura inválida.');
+      await withTransaction(database,async c=>{
+        await c.query("SELECT pg_advisory_xact_lock(hashtext('retention-phone:'||$1))",[phone]);
+        await c.query('INSERT INTO rastreia.retention_whatsapp_stops(phone_key) VALUES($1) ON CONFLICT DO NOTHING',[phone]);
+        await c.query('UPDATE rastreia.retention_preferences SET enabled=false,updated_at=now() WHERE whatsapp=$1 AND enabled',[phone]);
+      });
+    }
     for (const item of statuses(request.body)) await applyStatus(database, item, payloadHash);
     return reply.send({ received: true });
   });

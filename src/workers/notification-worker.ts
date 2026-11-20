@@ -19,6 +19,7 @@ import { maintainCommerceFulfillment } from '../modules/commerce/order-fulfillme
 import { expireCommerceLives } from '../modules/commerce/live-maintenance.js';
 import { maintainLiveVideo } from '../modules/commerce/live-video.service.js';
 import { createIvsProvider } from '../integrations/ivs/ivs.provider.js';
+import {processRetentionOffer} from '../modules/communications/retention-whatsapp.js';
 
 loadLocalEnv();
 const env = getEnv();
@@ -72,6 +73,7 @@ async function tick(): Promise<void> {
       await releaseLease?.();
     }
     const result = await processNotificationBatch(database, env, 25, workerId);
+    try{await processRetentionOffer(database,env);}catch{process.stderr.write('retention worker: falha no processamento de oferta\n');}
     await processEmailBatch(database, env);
     if (workdays.reminded || recurring.generatedSlots || confirmations.created || reminders.reminded || offers.expired
         || maintenance.released || searches.advanced || retention.ran
