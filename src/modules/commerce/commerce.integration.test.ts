@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { retentionSql } from './retention.routes.js';
+import {contactQuery} from './retention-contacts.routes.js';
+import {claimRetentionNotice} from '../communications/retention-whatsapp.js';
 import { financeReport,seedFinanceCategories,createFinanceEntry,settleFinanceEntry,reverseFinanceSettlement,cancelFinanceEntry,initializeFinanceCost,today } from './finance.service.js';
 import { financeEntry,financePeriod,financeCategory } from './finance.schemas.js';
 import Fastify from 'fastify';
@@ -54,9 +56,10 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
       CREATE TABLE tenants(id uuid PRIMARY KEY,status text DEFAULT 'ACTIVE');
       CREATE TABLE companies(id uuid PRIMARY KEY,tenant_id uuid,status text DEFAULT 'ACTIVE');
       CREATE TABLE stores(id uuid PRIMARY KEY,tenant_id uuid,company_id uuid,name text DEFAULT 'Loja teste',status text DEFAULT 'ACTIVE',UNIQUE(id,tenant_id));
-      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,status text,customer_profile_id uuid);
+      CREATE TABLE deliveries(id uuid PRIMARY KEY,tenant_id uuid,store_id uuid,status text,customer_profile_id uuid,origin text DEFAULT 'MANUAL',
+        recipient_name text,recipient_phone text,recipient_whatsapp text,created_at timestamptz DEFAULT now());
       GRANT SELECT ON deliveries TO rastreia_runtime;
-      CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE',must_change_password boolean DEFAULT false);
+      CREATE TABLE users(id uuid PRIMARY KEY,name text DEFAULT 'Gestor teste',status text DEFAULT 'ACTIVE',must_change_password boolean DEFAULT false,customer_login_phone text);
       CREATE TABLE customer_profiles(id uuid PRIMARY KEY,user_id uuid,tenant_id uuid,first_name text,last_name text,whatsapp_normalized text,status text DEFAULT 'ACTIVE',updated_at timestamptz DEFAULT now(),address_line text,address_number text,complement text,neighborhood text,city text,state text,postal_code text,latitude float8,longitude float8);
       CREATE TABLE tenant_users(tenant_id uuid,user_id uuid,role text,status text DEFAULT 'ACTIVE');
       CREATE TABLE store_access(user_id uuid,store_id uuid);
@@ -82,6 +85,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0074_addon_categories.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0075_retention_rules.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0076_retention_offers.sql',import.meta.url),'utf8')+'COMMIT');
+    await pg.exec('BEGIN;'+await readFile(new URL('../../../migrations/0077_retention_phone_contacts.sql',import.meta.url),'utf8')+'COMMIT');
     await pg.query('INSERT INTO platform_admins VALUES($1)',[masterId]);
     await pg.query('INSERT INTO tenants(id) VALUES($1),($2)',[tenant,otherTenant]);
     const company=randomUUID();await pg.query('INSERT INTO companies(id,tenant_id) VALUES($1,$2)',[company,tenant]);
@@ -121,6 +125,47 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await privileged("INSERT INTO retention_whatsapp_stops VALUES('5534999999999',now())");
     await expect(pg.query("INSERT INTO retention_preferences VALUES($1,$2,'5534999999999',true,now())",[store,manager])).rejects.toThrow('Number opted out');
   }));
+  it('counts distinct numbers per store without merging people or treating imported proxy numbers as contacts',()=>context('manager',async()=>{
+    for(const [phone,origin,unit,status,days] of [
+      ['+55 (34) 99999-8888','MANUAL',store,'DELIVERED',5],['34999998888','MANUAL',store,'DELIVERED',1],
+      ['34999998888','MANUAL',store,'CANCELLED',2],['34999997777','IFOOD',store,'DELIVERED',1],
+      ['12345','MANUAL',store,'DELIVERED',1],['34999998888','MANUAL',sibling,'DELIVERED',1]]){
+      await privileged("INSERT INTO deliveries(id,tenant_id,store_id,recipient_name,recipient_phone,status,origin,created_at) VALUES($1,$2,$3,'Contato',$4,$5,$6,now()-make_interval(days=>$7))",[randomUUID(),tenant,unit,phone,status,origin,days]);
+    }
+    const contacts=async()=>(await pg.query(contactQuery,[store])).rows;
+    expect(await contacts()).toMatchObject([{phone:'5534999998888',orders:2,days:1,cadence:4,registered:false,revenue:null,permitted:false,blocked:false}]);
+    await pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,'5534999998888',true,'Protocolo 42',$2)",[store,manager]);
+    expect(await contacts()).toMatchObject([{permitted:true}]);
+    await pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,'5534999998888',false,'Revogação 43',$2)",[store,manager]);
+    expect(await contacts()).toMatchObject([{permitted:false}]);
+  }));
+  it('counts a fulfilled catalog order just once even with a linked delivery',()=>context('manager',async()=>{
+    const f=await checkoutFixture(),order=await f.checkout(),id=randomUUID();
+    await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
+    await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
+    await privileged("INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_phone) VALUES($1,$2,$3,'DELIVERED','34999999999')",[id,tenant,store]);
+    await privileged('UPDATE commerce_orders SET delivery_id=$2 WHERE id=$1',[order.id,id]);
+    expect((await pg.query(contactQuery,[store])).rows).toMatchObject([{orders:1,registered:true,revenue:order.subtotalCents}]);
+  }));
+  for(const mode of ['valid','revoked','blocked','changed'] as const){
+    it('rechecks guest consent and recipient before dispatch: '+mode,()=>context('manager',async()=>{
+      const {v}=await cartFixture(),delivery=randomUUID(),id=randomUUID(),phone='5534999998888';
+      await privileged("INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_phone) VALUES($1,$2,$3,'DELIVERED',$4)",[delivery,tenant,store,phone]);
+      const consent=(await pg.query<{id:string}>("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,$2,true,'Ticket 42',$3) RETURNING id",[store,phone,manager])).rows[0]!.id;
+      await pg.query(`INSERT INTO retention_offers(id,store_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch,phone_consent_id,source_delivery_id)
+        VALUES($1,$2,$3,$4,'Café','Loja','loja-carrinho','Ana',10,now()+interval '1 day','QUEUED',$5,$6)`,[id,store,manager,v.productId,consent,delivery]);
+      if(mode==='revoked')await pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,$2,false,'Ticket 43',$3)",[store,phone,manager]);
+      if(mode==='blocked')await privileged('INSERT INTO retention_whatsapp_stops(phone_key) VALUES($1)',[phone]);
+      if(mode==='changed')await privileged("UPDATE deliveries SET recipient_phone='34999997777' WHERE id=$1",[delivery]);
+      await pg.exec('RESET ROLE');const notice=await claimRetentionNotice(client);expect(await claimRetentionNotice(client)).toBeUndefined();
+      if(mode!=='valid'){expect(notice).toBeUndefined();expect((await pg.query('SELECT dispatch FROM retention_offers WHERE id=$1',[id])).rows[0]).toMatchObject({dispatch:'SKIPPED'});return;}
+      expect(notice).toMatchObject({id,whatsapp:phone});
+      await pg.query("INSERT INTO customer_profiles(id,user_id,tenant_id,first_name,last_name,whatsapp_normalized) VALUES($1,$2,$3,'Ana','Teste',$4)",[randomUUID(),manager,tenant,phone.slice(2)]);
+      await pg.query('SELECT retention_claim_phone_offer($1)',[id]);expect((await pg.query('SELECT user_id FROM retention_offers WHERE id=$1',[id])).rows[0]).toMatchObject({user_id:null});
+      await pg.query('UPDATE users SET customer_login_phone=$2 WHERE id=$1',[manager,phone.slice(2)]);await pg.exec('SET LOCAL ROLE rastreia_runtime');
+      await pg.query('SELECT retention_claim_phone_offer($1)',[id]);expect((await pg.query('SELECT user_id FROM retention_offers WHERE id=$1',[id])).rows[0]).toMatchObject({user_id:manager});
+    }));
+  }
   it('finance freezes weighted cost on confirmation and recognizes only completed sales',()=>context('manager',async()=>{
     const {v,checkout}=await checkoutFixture();
     await initializeFinanceCost(client,auth,store,v.id,{expectedVersion:2,unitCostCents:1000,reason:'Custo inicial conferido'});

@@ -42,6 +42,11 @@ export async function orderRoutes(app:FastifyInstance,db:Database,env:AppEnv){
     const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
     return identity(req,async c=>{const row=(await c.query(offerSelect+' AND id=$1',[id])).rows[0];if(!row)throw notFound();return row;});
   });
+  app.post('/customer/commerce/offers/:id/claim',{config:{rateLimit:{max:15,timeWindow:'1 minute'}}},async(req,reply)=>{
+    const {id}=z.object({id:z.uuid()}).parse(req.params);reply.header('Cache-Control','no-store');
+    return identity(req,async c=>{await c.query('SELECT retention_claim_phone_offer($1)',[id]);
+      const row=(await c.query(offerSelect+' AND id=$1',[id])).rows[0];if(!row)throw notFound();return row;});
+  });
   app.get('/customer/commerce/offers',async(req,reply)=>{
     reply.header('Cache-Control','no-store');return identity(req,async c=>({
       offers:(await c.query(offerSelect+' AND expires_at>now() AND order_id IS NULL ORDER BY expires_at LIMIT 100')).rows,

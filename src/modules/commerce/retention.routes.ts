@@ -59,7 +59,10 @@ export async function retentionRoutes(app:FastifyInstance,db:Database,env:AppEnv
            AND EXISTS(SELECT 1 FROM commerce_variants v JOIN commerce_inventory_balances b ON b.variant_id=v.id
              WHERE v.product_id=p.id AND v.active AND v.price_cents>0 AND (p.stock_mode='MADE_TO_ORDER' OR b.on_hand>b.reserved))`,[id,target.productId])).rows[0];
          if(!product)throw conflict('O produto favorito não está disponível no catálogo.');
-         if((await c.query("SELECT id FROM retention_offers WHERE store_id=$1 AND user_id=$2 AND expires_at>now() LIMIT 1",[id,target.uid])).rowCount)
+         if((await c.query(`SELECT o.id FROM retention_offers o WHERE o.store_id=$1 AND o.expires_at>now() AND (o.user_id=$2 OR EXISTS(
+           SELECT 1 FROM retention_phone_consents pc JOIN customer_profiles cp ON retention_phone(cp.whatsapp_normalized)=pc.whatsapp
+           JOIN stores s ON s.id=pc.store_id AND s.tenant_id=cp.tenant_id WHERE pc.id=o.phone_consent_id AND pc.store_id=$1
+           AND cp.user_id=$2 AND cp.status='ACTIVE')) LIMIT 1`,[id,target.uid])).rowCount)
            throw conflict('Um cliente selecionado já recebeu uma oferta neste período.');
          await c.query(`INSERT INTO retention_offers(store_id,user_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch)
            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now()+make_interval(days=>$10),CASE WHEN $11 AND EXISTS(
