@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { retentionSql } from './retention.routes.js';
-import {contactQuery} from './retention-contacts.routes.js';
+import {contactQuery,phoneReportSql,queuePhoneOffers} from './retention-contacts.routes.js';
 import {claimRetentionNotice} from '../communications/retention-whatsapp.js';
 import { financeReport,seedFinanceCategories,createFinanceEntry,settleFinanceEntry,reverseFinanceSettlement,cancelFinanceEntry,initializeFinanceCost,today } from './finance.service.js';
 import { financeEntry,financePeriod,financeCategory } from './finance.schemas.js';
@@ -138,6 +138,27 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     expect(await contacts()).toMatchObject([{permitted:true}]);
     await pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,'5534999998888',false,'Revogação 43',$2)",[store,manager]);
     expect(await contacts()).toMatchObject([{permitted:false}]);
+  }));
+  it('paginates phone contacts, queues a reviewed batch atomically and reports the real dispatch state',()=>context('manager',async()=>{
+    const {v}=await cartFixture();
+    await privileged(`INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_name,recipient_phone,created_at)
+      SELECT gen_random_uuid(),$1,$2,'DELIVERED','Cliente','3499999'||lpad(n::text,4,'0'),now()-interval '5 days' FROM generate_series(1,21) AS n`,[tenant,store]);
+    type Row={id:string;phone:string;last_offer:{percent:number;dispatch:string;productName:string}|null};
+    const page=async(offset:number)=>(await pg.query<{entries:Row[];total:number}>(phoneReportSql,[store,offset])).rows[0]!;
+    const first=await page(0),second=await page(20);expect(first.entries).toHaveLength(20);expect(second.entries).toHaveLength(1);
+    expect(new Set([...first.entries,...second.entries].map(x=>x.id)).size).toBe(21);
+    const contacts=[first.entries[0]!,second.entries[0]!];const key=(unit:string,phone:string)=>requestHash([unit,phone]);
+    const body={kind:'offer' as const,productId:v.productId,validDays:7,percent:100,inactiveDays:1,minOrders:1,recipients:contacts.map(x=>({id:x.id,key:key(store,x.phone)}))};
+    const grant=(phone:string)=>pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,$2,true,'Atendimento 42',$3)",[store,phone,manager]);
+    const enqueue=()=>queuePhoneOffers(client,store,manager,true,key,body);
+    await grant(contacts[0]!.phone);await expect(enqueue()).rejects.toThrow('não está elegível');expect((await page(0)).entries[0]?.last_offer).toBeNull();
+    await grant(contacts[1]!.phone);
+    await expect(queuePhoneOffers(client,store,manager,false,key,body)).rejects.toThrow('desativado');
+    await expect(queuePhoneOffers(client,store,manager,true,key,{...body,recipients:[body.recipients[0]!,body.recipients[0]!]})).rejects.toThrow('apenas uma vez');
+    expect(await enqueue()).toEqual({queued:2});await expect(enqueue()).rejects.toThrow('oferta vigente');
+    expect((await page(20)).entries[0]?.last_offer).toMatchObject({dispatch:'QUEUED',percent:100});
+    await privileged("UPDATE retention_offers SET dispatch='ACCEPTED' WHERE source_delivery_id=$1",[contacts[0]!.id]);
+    expect((await page(0)).entries[0]?.last_offer).toMatchObject({dispatch:'ACCEPTED',percent:100,productName:product.name});
   }));
   it('counts a fulfilled catalog order just once even with a linked delivery',()=>context('manager',async()=>{
     const f=await checkoutFixture(),order=await f.checkout(),id=randomUUID();

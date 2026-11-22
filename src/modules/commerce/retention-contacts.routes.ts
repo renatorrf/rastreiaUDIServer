@@ -1,5 +1,6 @@
 import {createHmac} from 'node:crypto';
 import type {FastifyInstance} from 'fastify';
+import type {PoolClient} from 'pg';
 import {z} from 'zod';
 import type {Database} from '../../database/pool.js';
 import {withTenantTransaction} from '../../database/pool.js';
@@ -40,6 +41,39 @@ const params=z.object({storeId:z.uuid(),id:z.uuid().optional()});
 const criteria=z.object({inactiveDays:z.coerce.number().int().min(1).max(365),minOrders:z.coerce.number().int().min(1).max(100)});
 const proof=z.object({kind:z.literal('permission'),enabled:z.boolean(),reference:z.string().trim().min(3).max(160)});
 const issue=z.object({kind:z.literal('offer'),productId:z.uuid(),percent:z.number().int().min(1).max(100),validDays:z.number().int().min(1).max(30)}).extend(criteria.shape);
+const recipient=z.object({id:z.uuid(),key:z.string().regex(/^[a-f0-9]{64}$/)});
+const batch=issue.extend({recipients:z.array(recipient).min(1).max(100)});
+interface PhoneRow{id:string;name:string|null;phone:string;orders:number;days:number;cadence:number|null;revenue:number|null;registered:boolean;permitted:boolean;blocked:boolean;recently_offered:boolean;delivery:string|null;consent:string|null}
+type ReportRow=PhoneRow&{last_offer:{productName:string;percent:number;createdAt:string;dispatch:string}|null};
+export const phoneReportSql=`WITH report AS (${contactQuery}) SELECT (SELECT count(*)::int FROM report) AS total,
+ (SELECT count(*)::int FROM report WHERE NOT registered) AS guests,
+ coalesce((SELECT json_agg(to_jsonb(page)||jsonb_build_object('last_offer',(
+   SELECT jsonb_build_object('productName',o.product_name,'percent',o.percent,'createdAt',o.created_at,'dispatch',o.dispatch)
+   FROM retention_phone_consents pc JOIN retention_offers o ON o.phone_consent_id=pc.id AND o.store_id=pc.store_id
+   WHERE pc.store_id=$1 AND pc.whatsapp=page.phone ORDER BY o.created_at DESC,o.id DESC LIMIT 1))
+   ORDER BY page.days DESC,page.id) FROM (SELECT * FROM report ORDER BY days DESC,id LIMIT 20 OFFSET $2) page),'[]') AS entries`;
+
+// The caller holds the store lock, including for legacy single-contact requests.
+export async function queuePhoneOffers(c:PoolClient,storeId:string,actor:string,enabled:boolean,
+  key:(unit:string,phone:string)=>string,input:z.infer<typeof batch>){
+ const {recipients}=input;
+ const identities=new Map(recipients.map(r=>[r.id,r.key]));
+ if(!enabled)throw conflict('O WhatsApp promocional está desativado.');
+ if(identities.size!==recipients.length||new Set(identities.values()).size!==recipients.length)throw conflict('Selecione cada telefone apenas uma vez.');
+ const {rows}=await c.query<PhoneRow>(contactQuery+' WHERE c.id=ANY($2::uuid[])',[storeId,[...identities.keys()]]);
+ if(rows.length!==recipients.length||rows.some(x=>x.registered||!x.delivery||key(storeId,x.phone)!==identities.get(x.id)||
+   !x.permitted||x.blocked||x.recently_offered||x.days<input.inactiveDays||x.orders<input.minOrders)){
+   throw conflict('Um contato mudou, já tem oferta vigente ou não está elegível. Atualize a lista e revise a seleção.');
+ }
+ const p=(await c.query(productSql+' AND p.id=$2',[storeId,input.productId])).rows[0];if(!p)throw conflict('Escolha um produto disponível no catálogo.');
+ await c.query(`INSERT INTO retention_offers(store_id,approved_by,product_id,product_name,store_name,slug,percent,expires_at,dispatch,first_name,phone_consent_id,source_delivery_id)
+   SELECT $1,$2,$3,$4,$5,$6,$7,now()+make_interval(days=>$8),'QUEUED',x.first_name,x.consent,x.delivery
+   FROM jsonb_to_recordset($9::jsonb) AS x(first_name text,consent bigint,delivery uuid)`,
+   [storeId,actor,p.id,p.name,p.store_name,p.slug,input.percent,input.validDays,JSON.stringify(rows.map(x=>({
+     first_name:x.name?.trim().split(/\s+/)[0]||'Cliente',consent:x.consent,delivery:x.delivery
+   })))]);
+ return {queued:rows.length};
+}
 export async function retentionContactRoutes(app:FastifyInstance,db:Database,env:AppEnv){
  const base='/commerce/stores/:storeId/retention/contacts',preHandler=[authenticate(env,db),requireRoles('TENANT_MANAGER')];
  const key=(unit:string,phone:string)=>createHmac('sha256',env.TRACKING_TOKEN_PEPPER).update(unit+':retention:'+phone).digest('hex');
@@ -47,12 +81,10 @@ export async function retentionContactRoutes(app:FastifyInstance,db:Database,env
    const {storeId}=params.parse(req.params),q=criteria.extend({offset:z.coerce.number().int().min(0).max(1000000).default(0)}).parse(req.query);
    reply.header('Cache-Control','no-store');
    return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
-     const {rows}=await c.query(`WITH report AS (${contactQuery}) SELECT (SELECT count(*)::int FROM report) AS total,
-       (SELECT count(*)::int FROM report WHERE NOT registered) AS guests,
-       coalesce((SELECT json_agg(page ORDER BY days DESC,id) FROM (SELECT * FROM report ORDER BY days DESC,id LIMIT 30 OFFSET $2) page),'[]') AS entries`,[storeId,q.offset]);
-     const r=rows[0]!;return {total:r.total,guests:r.guests,enabled:env.WHATSAPP_OFFERS_ENABLED,data:r.entries.map((x:{id:string;name:string;phone:string;orders:number;days:number;cadence:number|null;revenue:number|null;registered:boolean;permitted:boolean;blocked:boolean;recently_offered:boolean})=>({
-       id:x.id,key:key(storeId,x.phone),name:x.name,ending:x.phone.slice(-4),orders:x.orders,days:x.days,cadence:x.cadence,revenue:x.revenue,registered:x.registered,
-       permitted:x.permitted&&!x.blocked,blocked:x.blocked,recentlyOffered:x.recently_offered,eligible:x.days>=q.inactiveDays&&x.orders>=q.minOrders
+     const {rows}=await c.query<{total:number;guests:number;entries:ReportRow[]}>(phoneReportSql,[storeId,q.offset]);
+     const r=rows[0]!;return {total:r.total,guests:r.guests,enabled:env.WHATSAPP_OFFERS_ENABLED,data:r.entries.map(x=>({
+       id:x.id,key:key(storeId,x.phone),name:x.name||'Cliente',ending:x.phone.slice(-4),orders:x.orders,days:x.days,cadence:x.cadence,revenue:x.revenue,registered:x.registered,
+       permitted:x.permitted&&!x.blocked,blocked:x.blocked,recentlyOffered:x.recently_offered,lastOffer:x.last_offer,eligible:x.days>=q.inactiveDays&&x.orders>=q.minOrders
      }))};
    });
  });
@@ -60,22 +92,27 @@ export async function retentionContactRoutes(app:FastifyInstance,db:Database,env
    const {storeId}=params.parse(req.params),{search}=z.object({search:z.string().trim().max(100).default('')}).parse(req.query);reply.header('Cache-Control','no-store');
    return withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);return {data:(await c.query(productSql+" AND strpos(lower(p.name),lower($2))>0 ORDER BY p.name,p.id LIMIT 40",[storeId,search])).rows.map(x=>({id:x.id,name:x.name}))};});
  });
+ app.post(base+'/offers',{preHandler},async(req,reply)=>{
+   const {storeId}=params.parse(req.params),input=batch.parse(req.body);
+   const response=await withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
+     return withIdempotency(c,req.auth,parseIdempotencyKey(req.headers['idempotency-key']),'retention.contacts.offers',{storeId,...input},async()=>{
+       await c.query("SELECT pg_advisory_xact_lock(hashtext('retention:'||$1))",[storeId]);
+       return {statusCode:200,body:await queuePhoneOffers(c,storeId,req.auth.userId,env.WHATSAPP_OFFERS_ENABLED,key,input)};
+     });
+   });return reply.header('Cache-Control','no-store').code(response.statusCode).send(response.body);
+ });
  app.post(base+'/:id',{preHandler},async(req,reply)=>{
    const {storeId,id}=params.required().parse(req.params),input=z.discriminatedUnion('kind',[proof,issue]).and(z.object({key:z.string().length(64)})).parse(req.body);
    const response=await withTenantTransaction(db,req.auth,async c=>{await requireCommerceStore(c,storeId);
      return withIdempotency(c,req.auth,parseIdempotencyKey(req.headers['idempotency-key']),'retention.contact',{storeId,id,...input},async()=>{
        await c.query("SELECT pg_advisory_xact_lock(hashtext('retention:'||$1))",[storeId]);
-       const x=(await c.query(contactQuery+' WHERE c.id=$2',[storeId,id])).rows[0];
-       if(!x||x.registered||!x.delivery||key(storeId,x.phone)!==input.key)throw conflict('O contato mudou ou já possui conta. Atualize a lista.');
        if(input.kind==='permission'){
+         const x=(await c.query<PhoneRow>(contactQuery+' WHERE c.id=$2',[storeId,id])).rows[0];
+         if(!x||x.registered||!x.delivery||key(storeId,x.phone)!==input.key)throw conflict('O contato mudou ou já possui conta. Atualize a lista.');
          if(x.blocked&&input.enabled)throw conflict('O cliente bloqueou ofertas no WhatsApp.');
          await c.query('INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,$2,$3,$4,$5)',[storeId,x.phone,input.enabled,input.reference,req.auth.userId]);
        }else{
-         if(!env.WHATSAPP_OFFERS_ENABLED||!x.permitted||x.blocked||x.days<input.inactiveDays||x.orders<input.minOrders)throw conflict('Confira a autorização, o canal e os critérios do público.');
-         if((await c.query('SELECT 1 FROM retention_offers o JOIN retention_phone_consents pc ON pc.id=o.phone_consent_id WHERE o.store_id=$1 AND pc.whatsapp=$2 AND o.expires_at>now()',[storeId,x.phone])).rowCount)throw conflict('Este telefone já recebeu uma oferta no período.');
-         const p=(await c.query(productSql+' AND p.id=$2',[storeId,input.productId])).rows[0];if(!p)throw conflict('Escolha um produto disponível no catálogo.');
-         await c.query(`INSERT INTO retention_offers(store_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch,phone_consent_id,source_delivery_id)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()+make_interval(days=>$9),'QUEUED',$10,$11)`,[storeId,req.auth.userId,p.id,p.name,p.store_name,p.slug,x.name.trim().split(/\s+/)[0]||'Cliente',input.percent,input.validDays,x.consent,x.delivery]);
+         await queuePhoneOffers(c,storeId,req.auth.userId,env.WHATSAPP_OFFERS_ENABLED,key,{...input,recipients:[{id,key:input.key}]});
        }
        return {statusCode:200,body:{ok:true}};
      });
