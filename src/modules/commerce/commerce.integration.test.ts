@@ -160,6 +160,18 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await privileged("UPDATE retention_offers SET dispatch='ACCEPTED' WHERE source_delivery_id=$1",[contacts[0]!.id]);
     expect((await page(0)).entries[0]?.last_offer).toMatchObject({dispatch:'ACCEPTED',percent:100,productName:product.name});
   }));
+  it('manual review accepts first-time guests outside suggestions but never overwrites opt-outs or duplicates a live offer',()=>context('manager',async()=>{
+    const {v}=await cartFixture(),key=(unit:string,phone:string)=>requestHash([unit,phone]);
+    const people=['5534999996701','5534999996702','5534999996703'].map(phone=>({id:randomUUID(),phone,key:key(store,phone)}));
+    for(const x of people)await privileged("INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_phone) VALUES($1,$2,$3,'DELIVERED',$4)",[x.id,tenant,store,x.phone]);
+    const run=(recipients:typeof people)=>queuePhoneOffers(client,store,manager,true,key,{kind:'offer',selection:'MANAGER_CONFIRMED_OPT_IN',productId:v.productId,validDays:7,percent:10,inactiveDays:60,minOrders:5,recipients});
+    await pg.query("INSERT INTO retention_phone_consents(store_id,whatsapp,enabled,proof_ref,actor_id) VALUES($1,$2,false,'Solicitação do cliente',$3)",[store,people[1]!.phone,manager]);
+    await privileged("INSERT INTO retention_whatsapp_stops(phone_key) VALUES($1)",[people[2]!.phone]);
+    for(const blocked of people.slice(1))await expect(run([people[0]!,blocked])).rejects.toThrow('não está elegível');
+    expect((await pg.query('SELECT id FROM retention_phone_consents WHERE whatsapp=$1',[people[0]!.phone])).rows).toHaveLength(0);
+    expect(await run([people[0]!])).toEqual({queued:1});await expect(run([people[0]!])).rejects.toThrow('oferta vigente');
+    await pg.exec('RESET ROLE');expect(await claimRetentionNotice(client)).toMatchObject({whatsapp:people[0]!.phone});
+  }));
   it('counts a fulfilled catalog order just once even with a linked delivery',()=>context('manager',async()=>{
     const f=await checkoutFixture(),order=await f.checkout(),id=randomUUID();
     await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);

@@ -11,12 +11,16 @@ const fields=z.object({inactiveDays:z.number().int().min(1).max(365),minOrders:z
   benefit:z.enum(['DISCOUNT','GIFT']),discountPercent:z.number().int().min(1).max(100).nullable(),validDays:z.number().int().min(1).max(30)}).strict()
   .refine(r=>(r.benefit==='DISCOUNT')===(r.discountPercent!==null));
 const defaults={inactiveDays:30,minOrders:2,benefit:'DISCOUNT',discountPercent:10,validDays:7};
+const activeOffer=(uid:'$2'|'a.uid')=>`SELECT o.id FROM retention_offers o WHERE o.store_id=$1 AND o.expires_at>now() AND (o.user_id=${uid} OR EXISTS(
+ SELECT 1 FROM retention_phone_consents pc JOIN customer_profiles cp ON retention_phone(cp.whatsapp_normalized)=pc.whatsapp
+ JOIN stores st ON st.id=pc.store_id AND st.tenant_id=cp.tenant_id WHERE pc.id=o.phone_consent_id AND pc.store_id=$1 AND cp.user_id=${uid} AND cp.status='ACTIVE')) LIMIT 1`;
 export const retentionSql=`WITH sales AS (
  SELECT o.id,o.customer_user_id uid,o.customer_name,o.created_at,s.revenue_cents,
  (o.created_at AT TIME ZONE 'America/Sao_Paulo')::date AS order_day FROM commerce_orders o
  JOIN commerce_finance_sales s ON s.order_id=o.id AND s.store_id=o.store_id WHERE o.store_id=$1
 ), customers AS (
  SELECT uid,(array_agg(customer_name ORDER BY created_at DESC,id))[1] AS name,count(*)::int orders,
+ max(created_at) AS "lastOrderAt",(array_agg(revenue_cents ORDER BY created_at DESC,id))[1]::float8 AS "lastRevenue",
  sum(revenue_cents)::float8 revenue,(now() AT TIME ZONE 'America/Sao_Paulo')::date-max(order_day) AS days,
  round((max(order_day)-min(order_day))::numeric/nullif(count(*)-1,0),1)::float8 cadence FROM sales GROUP BY uid
 ), products AS (
@@ -31,17 +35,17 @@ export const retentionSql=`WITH sales AS (
 ), audience AS (
  SELECT * FROM customers WHERE NOT $4::boolean OR (days >= $2 AND orders >= $3)
 ), page AS (
- SELECT a.*,coalesce((SELECT jsonb_agg(jsonb_build_object('id',p.product_id,'name',p.name,'units',p.units) ORDER BY rank)
- FROM products p WHERE p.uid=a.uid AND rank<=3),'[]') favorites FROM audience a ORDER BY days DESC,uid LIMIT 30 OFFSET $5
+ SELECT a.*,EXISTS(${activeOffer('a.uid')}) AS "activeOffer",coalesce((SELECT jsonb_agg(jsonb_build_object('id',p.product_id,'name',p.name,'units',p.units) ORDER BY rank)
+ FROM products p WHERE p.uid=a.uid AND rank<=3),'[]') favorites FROM audience a ORDER BY "lastOrderAt",uid LIMIT 20 OFFSET $5
 ) SELECT (SELECT count(*)::int FROM registered) registered,(SELECT count(*)::int FROM customers) buyers,
  (SELECT coalesce(sum(revenue),0)::float8 FROM customers) revenue,(SELECT count(*)::int FROM customers WHERE days >= $2 AND orders >= $3) candidates,
- (SELECT count(*)::int FROM audience) total,coalesce((SELECT jsonb_agg(to_jsonb(page) ORDER BY days DESC,uid) FROM page),'[]') AS rows`;
+ (SELECT count(*)::int FROM audience) total,coalesce((SELECT jsonb_agg(to_jsonb(page) ORDER BY "lastOrderAt",uid) FROM page),'[]') AS rows`;
 export async function retentionRoutes(app:FastifyInstance,db:Database,env:AppEnv){
  const manager=[authenticate(env,db),requireRoles('TENANT_MANAGER')],base='/commerce/stores/:storeId/retention';
  const store=(params:unknown)=>z.object({storeId:z.uuid()}).parse(params).storeId;
  app.post(base+'/offers',{preHandler:manager},async(req,reply)=>{
    const id=store(req.params);
-   const input=z.object({rule:fields,offset:z.number().int().min(0).max(1000000),
+   const input=z.object({rule:fields,offset:z.number().int().min(0).max(1000000),audience:z.literal('buyers').optional(),
      recipients:z.array(z.object({uid:z.uuid(),productId:z.uuid()})).min(1).max(30)}).strict().parse(req.body);
    const result=await withTenantTransaction(db,req.auth,async c=>{
      await requireCommerceStore(c,id);
@@ -50,19 +54,16 @@ export async function retentionRoutes(app:FastifyInstance,db:Database,env:AppEnv
        const r=input.rule;
        const shop=(await c.query('SELECT s.name,f.slug FROM stores s JOIN commerce_storefronts f ON f.store_id=s.id WHERE s.id=$1 AND f.published AND commerce_public_store(f.slug) IS NOT NULL',[id])).rows[0];
        if(!shop)throw conflict('Publique o catálogo da unidade antes de criar ofertas.');
-       const audience=(await c.query(retentionSql,[id,r.inactiveDays,r.minOrders,true,input.offset])).rows[0]!.rows as {uid:string;name:string;favorites:{id:string}[]}[];
+       const audience=(await c.query(retentionSql,[id,r.inactiveDays,r.minOrders,input.audience!=='buyers',input.offset])).rows[0]!.rows as {uid:string;name:string;favorites:{id:string}[]}[];
        for(const target of input.recipients){
-         const buyer=audience.find(x=>x.uid===target.uid && x.favorites[0]?.id===target.productId);
+         const buyer=audience.find(x=>x.uid===target.uid && x.favorites.some(f=>f.id===target.productId));
          if(!buyer)throw conflict('O público mudou. Simule novamente.');
          const product=(await c.query(`SELECT p.name FROM commerce_products p LEFT JOIN commerce_categories k ON k.id=p.category_id
            WHERE p.store_id=$1 AND p.id=$2 AND p.active AND p.published AND (k.id IS NULL OR k.active)
-           AND EXISTS(SELECT 1 FROM commerce_variants v JOIN commerce_inventory_balances b ON b.variant_id=v.id
+           AND EXISTS(SELECT 1 FROM commerce_variants v LEFT JOIN commerce_inventory_balances b ON b.variant_id=v.id
              WHERE v.product_id=p.id AND v.active AND v.price_cents>0 AND (p.stock_mode='MADE_TO_ORDER' OR b.on_hand>b.reserved))`,[id,target.productId])).rows[0];
          if(!product)throw conflict('O produto favorito não está disponível no catálogo.');
-         if((await c.query(`SELECT o.id FROM retention_offers o WHERE o.store_id=$1 AND o.expires_at>now() AND (o.user_id=$2 OR EXISTS(
-           SELECT 1 FROM retention_phone_consents pc JOIN customer_profiles cp ON retention_phone(cp.whatsapp_normalized)=pc.whatsapp
-           JOIN stores s ON s.id=pc.store_id AND s.tenant_id=cp.tenant_id WHERE pc.id=o.phone_consent_id AND pc.store_id=$1
-           AND cp.user_id=$2 AND cp.status='ACTIVE')) LIMIT 1`,[id,target.uid])).rowCount)
+         if((await c.query(activeOffer('$2'),[id,target.uid])).rowCount)
            throw conflict('Um cliente selecionado já recebeu uma oferta neste período.');
          await c.query(`INSERT INTO retention_offers(store_id,user_id,approved_by,product_id,product_name,store_name,slug,first_name,percent,expires_at,dispatch)
            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now()+make_interval(days=>$10),CASE WHEN $11 AND EXISTS(
