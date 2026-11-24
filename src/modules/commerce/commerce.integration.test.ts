@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { retentionSql } from './retention.routes.js';
+import { retentionSql,specificBuyersSql } from './retention.routes.js';
 import {contactQuery,phoneReportSql,queuePhoneOffers} from './retention-contacts.routes.js';
 import {claimRetentionNotice} from '../communications/retention-whatsapp.js';
 import { financeReport,seedFinanceCategories,createFinanceEntry,settleFinanceEntry,reverseFinanceSettlement,cancelFinanceEntry,initializeFinanceCost,today } from './finance.service.js';
@@ -107,8 +107,10 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     expect(await report()).toMatchObject({registered:1,buyers:0,revenue:0});
     await pg.query("SELECT commerce_order_transition($1,$2,1,'CONFIRMED','')",[order.id,store]);
     await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
-    expect(await report()).toMatchObject({buyers:1,revenue:order.subtotalCents,rows:[{orders:1,cadence:null,favorites:[{units:2}]}]});
+    expect(await report()).toMatchObject({buyers:1,revenue:order.subtotalCents,rows:[{orders:1,cadence:null,lastOrderAt:expect.any(String),lastRevenue:order.subtotalCents,activeOffer:false,favorites:[{units:2}]}]});
     expect(await report(store,true)).toMatchObject({candidates:0,rows:[]});
+    expect((await pg.query(specificBuyersSql,[store,30,2,false,0,[manager]])).rows[0]).toMatchObject({total:1,rows:[{uid:manager}]});
+    expect((await pg.query(specificBuyersSql,[sibling,30,2,false,0,[manager]])).rows[0]).toMatchObject({total:0,rows:[]});
     expect(await report(sibling)).toMatchObject({buyers:0,rows:[]});
   }));
   it('redeems only one favorite unit, preserves freight and replays without a second discount',()=>context('manager',async()=>{
@@ -144,8 +146,14 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await privileged(`INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_name,recipient_phone,created_at)
       SELECT gen_random_uuid(),$1,$2,'DELIVERED','Cliente','3499999'||lpad(n::text,4,'0'),now()-interval '5 days' FROM generate_series(1,21) AS n`,[tenant,store]);
     type Row={id:string;phone:string;last_offer:{percent:number;dispatch:string;productName:string}|null};
-    const page=async(offset:number)=>(await pg.query<{entries:Row[];total:number}>(phoneReportSql,[store,offset])).rows[0]!;
+    const page=async(offset:number,filter='all')=>(await pg.query<{entries:Row[];total:number}>(phoneReportSql,[store,offset,filter,30,2])).rows[0]!;
+    const oldest='5534999990021';
+    await privileged("UPDATE deliveries SET created_at=now()-interval '60 days' WHERE store_id=$1 AND retention_phone(recipient_phone)=$2",[store,oldest]);
+    await privileged("INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_phone,created_at) VALUES($1,$2,$3,'DELIVERED',$4,now()-interval '80 days')",[randomUUID(),tenant,store,oldest]);
+    for(const filter of ['repeat','suggested'])expect(await page(0,filter)).toMatchObject({total:1,entries:[{phone:oldest,orders:2,last_order_at:expect.any(String),last_source:'MANUAL',last_revenue:null}]});
+    expect((await page(0,'first')).total).toBe(20);
     const first=await page(0),second=await page(20);expect(first.entries).toHaveLength(20);expect(second.entries).toHaveLength(1);
+    expect(first.entries[0]?.phone).toBe(oldest);
     expect(new Set([...first.entries,...second.entries].map(x=>x.id)).size).toBe(21);
     const contacts=[first.entries[0]!,second.entries[0]!];const key=(unit:string,phone:string)=>requestHash([unit,phone]);
     const body={kind:'offer' as const,productId:v.productId,validDays:7,percent:100,inactiveDays:1,minOrders:1,recipients:contacts.map(x=>({id:x.id,key:key(store,x.phone)}))};
@@ -178,7 +186,7 @@ describe('commerce catalog and live contracts with PGlite PostgreSQL RLS',()=>{
     await pg.query("SELECT commerce_order_transition($1,$2,2,'COMPLETED','')",[order.id,store]);
     await privileged("INSERT INTO deliveries(id,tenant_id,store_id,status,recipient_phone) VALUES($1,$2,$3,'DELIVERED','34999999999')",[id,tenant,store]);
     await privileged('UPDATE commerce_orders SET delivery_id=$2 WHERE id=$1',[order.id,id]);
-    expect((await pg.query(contactQuery,[store])).rows).toMatchObject([{orders:1,registered:true,revenue:order.subtotalCents}]);
+    expect((await pg.query(contactQuery,[store])).rows).toMatchObject([{orders:1,registered:true,catalog_buyer:manager,last_source:'CATALOG',last_revenue:order.subtotalCents,revenue:order.subtotalCents}]);
   }));
   for(const mode of ['valid','revoked','blocked','changed'] as const){
     it('rechecks guest consent and recipient before dispatch: '+mode,()=>context('manager',async()=>{

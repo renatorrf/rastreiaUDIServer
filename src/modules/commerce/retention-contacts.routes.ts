@@ -22,6 +22,7 @@ export const contactQuery=`WITH events AS (
  SELECT phone,(array_agg(id ORDER BY ordered DESC,id))[1] AS id,(array_agg(name ORDER BY ordered DESC,id))[1] AS name,
  (array_agg(delivery ORDER BY ordered DESC,id) FILTER(WHERE delivery IS NOT NULL))[1] AS delivery,
  count(*)::integer AS orders,sum(revenue)::float8 AS revenue,max(ordered) AS last_order_at,
+ CASE WHEN count(DISTINCT uid)=1 THEN (array_agg(uid) FILTER(WHERE source='CATALOG'))[1] END AS catalog_buyer,
  (array_agg(source ORDER BY ordered DESC,id))[1] AS last_source,(array_agg(revenue ORDER BY ordered DESC,id))[1]::float8 AS last_revenue,
  (now() AT TIME ZONE 'America/Sao_Paulo')::date-(max(ordered) AT TIME ZONE 'America/Sao_Paulo')::date AS days,
  round(((max(ordered) AT TIME ZONE 'America/Sao_Paulo')::date-(min(ordered) AT TIME ZONE 'America/Sao_Paulo')::date)::numeric/nullif(count(*)-1,0),1)::float8 AS cadence,
@@ -46,7 +47,7 @@ const issue=z.object({kind:z.literal('offer'),productId:z.uuid(),percent:z.numbe
 const recipient=z.object({id:z.uuid(),key:z.string().regex(/^[a-f0-9]{64}$/)});
 const batch=issue.extend({recipients:z.array(recipient).min(1).max(100),selection:z.literal('MANAGER_CONFIRMED_OPT_IN').optional()});
 interface PhoneRow{id:string;name:string|null;phone:string;orders:number;days:number;cadence:number|null;revenue:number|null;registered:boolean;permitted:boolean;blocked:boolean;revoked:boolean;recently_offered:boolean;delivery:string|null;consent:string|null}
-type ReportRow=PhoneRow&{last_order_at:string;last_source:string;last_revenue:number|null;last_offer:{productName:string;percent:number;createdAt:string;dispatch:string}|null};
+type ReportRow=PhoneRow&{catalog_buyer:string|null;last_order_at:string;last_source:string;last_revenue:number|null;last_offer:{productName:string;percent:number;createdAt:string;dispatch:string}|null};
 export const phoneReportSql=`WITH contacts_report AS (${contactQuery}), report AS (SELECT * FROM contacts_report
  WHERE CASE $3::text WHEN 'suggested' THEN days >= $4 AND orders >= $5 WHEN 'first' THEN orders=1 WHEN 'repeat' THEN orders>1 ELSE true END)
  SELECT (SELECT count(*)::int FROM report) AS total,
@@ -98,7 +99,7 @@ export async function retentionContactRoutes(app:FastifyInstance,db:Database,env
      const {rows}=await c.query<{total:number;guests:number;entries:ReportRow[]}>(phoneReportSql,[storeId,q.offset,q.filter,q.inactiveDays,q.minOrders]);
      const r=rows[0]!;return {total:r.total,guests:r.guests,enabled:env.WHATSAPP_OFFERS_ENABLED,data:r.entries.map(x=>({
        id:x.id,key:key(storeId,x.phone),name:x.name||'Cliente',ending:x.phone.slice(-4),orders:x.orders,days:x.days,cadence:x.cadence,revenue:x.revenue,registered:x.registered,
-       lastOrderAt:x.last_order_at,lastSource:x.last_source,lastRevenue:x.last_revenue,
+       lastOrderAt:x.last_order_at,lastSource:x.last_source,lastRevenue:x.last_revenue,catalogBuyer:x.catalog_buyer,
        permitted:x.permitted&&!x.blocked&&!x.revoked,blocked:x.blocked||x.revoked,manualSelectable:!!x.delivery&&!x.registered&&!x.blocked&&!x.revoked&&!x.recently_offered,
        recentlyOffered:x.recently_offered,lastOffer:x.last_offer,eligible:x.days>=q.inactiveDays&&x.orders>=q.minOrders
      }))};
